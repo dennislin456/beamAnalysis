@@ -16,8 +16,10 @@ import openpyxl
 from openpyxl.chart import LineChart, Reference
 
 # 💡 這裡將匯入共用的元件 (之後會統一放在 shared_components.py 中)
-from shared_components import (NoWheelSpinBox, NoWheelDoubleSpinBox, 
-                               HeatmapViewerWindow, CrossProfileViewerWindow)
+from shared_components import (NoWheelSpinBox, NoWheelDoubleSpinBox,
+                               HeatmapViewerWindow, CrossProfileViewerWindow,
+                               compute_auto_spot_center, build_robust_threshold_mask,
+                               split_y_index)
 
 class DataRayTab(QWidget):
     def __init__(self, parent=None):
@@ -317,6 +319,11 @@ class DataRayTab(QWidget):
         layout_p2_thresh.addWidget(self.lbl_p2_thresh_spin)
         layout_p2_thresh.addWidget(self.spin_p2_thresh_percent)
         left_layout.addLayout(layout_p2_thresh)
+
+        lbl_p2_algo_hint = QLabel("質心／門檻幾何：背景扣除＋最大連通區＋亞像素（預設門檻 50%）")
+        lbl_p2_algo_hint.setStyleSheet("color: #546E7A; font-size: 11px;")
+        lbl_p2_algo_hint.setWordWrap(True)
+        left_layout.addWidget(lbl_p2_algo_hint)
 
         self.chk_p2_show_thresh = QCheckBox("顯示門檻區域於 M2 圖（洋紅半透明，限 Y 以下）")
         self.chk_p2_show_thresh.setChecked(True)
@@ -822,24 +829,29 @@ class DataRayTab(QWidget):
             self.viewer_m2_win.draw_marker(self.m1_center_point, pt2=self._get_p2_display_point())
         self.update_m2_thresh_overlay()
 
-    def _build_threshold_mask(self, matrix, use_threshold, thresh_percent, y_below=None):
+    def _build_threshold_mask(self, matrix, use_threshold, thresh_percent, y_below=None,
+                              robust=True):
         matrix = np.asarray(matrix, dtype=np.float64)
         if matrix.size == 0:
             return None
         h, w = matrix.shape
         if y_below is not None:
-            y_below = int(y_below)
+            y_below = split_y_index(y_below)
             if y_below <= 0:
                 return np.zeros((h, w), dtype=bool)
             region = matrix[:y_below, :]
-            peak_val = float(np.max(region)) if region.size > 0 else 0.0
-            thresh_val = peak_val * (thresh_percent / 100.0) if use_threshold else peak_val * 0.5
+            region_mask = build_robust_threshold_mask(
+                region, use_threshold, thresh_percent,
+                bg_subtract=robust, largest_cc_only=robust,
+            )
             mask = np.zeros((h, w), dtype=bool)
-            mask[:y_below, :] = region >= thresh_val
+            if region_mask is not None:
+                mask[:y_below, :] = region_mask
             return mask
-        peak_val = float(np.max(matrix))
-        thresh_val = peak_val * (thresh_percent / 100.0) if use_threshold else peak_val * 0.5
-        return matrix >= thresh_val
+        return build_robust_threshold_mask(
+            matrix, use_threshold, thresh_percent,
+            bg_subtract=robust, largest_cc_only=robust,
+        )
 
     def update_m1_thresh_overlay(self, _checked=None):
         if not (self.viewer_m1_win and self.viewer_m1_win.isVisible()):
@@ -882,6 +894,7 @@ class DataRayTab(QWidget):
             self.result_matrix,
             self.chk_dr_use_threshold.isChecked(),
             self.spin_dr_thresh_percent.value(),
+            robust=False,
         )
         if mask is None:
             self.process_thresh_overlay_item.clear()
@@ -974,7 +987,7 @@ class DataRayTab(QWidget):
 
     def _find_min_below_y(self, matrix, y1):
         matrix = np.asarray(matrix)
-        y1 = int(y1)
+        y1 = split_y_index(y1)
         if y1 <= 0:
             return None
         region = matrix[:y1, :]
@@ -984,13 +997,13 @@ class DataRayTab(QWidget):
         ys, xs = np.where(region == min_val)
         if len(xs) == 0:
             return None
-        cx = int(round(np.mean(xs)))
-        cy = int(round(np.mean(ys)))
+        cx = float(np.mean(xs))
+        cy = float(np.mean(ys))
         return (cx, cy)
 
     def _find_center_below_y(self, matrix, y1, mode, use_thresh, thresh_percent):
         matrix = np.asarray(matrix)
-        y1 = int(y1)
+        y1 = split_y_index(y1)
         if y1 <= 0:
             return None
         region = matrix[:y1, :]
@@ -1117,40 +1130,13 @@ class DataRayTab(QWidget):
         self.update_m2_thresh_overlay()
 
     def _compute_auto_spot_center(self, matrix, mode, use_threshold=False, thresh_percent=50.0):
-        matrix = np.asarray(matrix, dtype=np.float64)
-        h, w = matrix.shape
-        peak_val = float(np.max(matrix)) if matrix.size > 0 else 0.0
-
-        if mode == "peak_geom":
-            max_y_indices, max_x_indices = np.where(matrix == peak_val)
-            if len(max_x_indices) > 0:
-                return int(round(np.mean(max_x_indices))), int(round(np.mean(max_y_indices)))
-            peak_idx = np.unravel_index(np.argmax(matrix, axis=None), matrix.shape)
-            return int(peak_idx[1]), int(peak_idx[0])
-
-        if use_threshold:
-            thresh_val = peak_val * (thresh_percent / 100.0)
-        else:
-            thresh_val = peak_val * 0.5
-
-        mask = matrix >= thresh_val
-        if not np.any(mask):
-            peak_idx = np.unravel_index(np.argmax(matrix, axis=None), matrix.shape)
-            return int(peak_idx[1]), int(peak_idx[0])
-
-        ys, xs = np.where(mask)
-        if mode == "thresh_geom":
-            return int(round(np.mean(xs))), int(round(np.mean(ys)))
-
-        weights = matrix[mask]
-        wsum = float(np.sum(weights))
-        if wsum <= 0:
-            return int(round(np.mean(xs))), int(round(np.mean(ys)))
-        cx = int(round(np.sum(xs * weights) / wsum))
-        cy = int(round(np.sum(ys * weights) / wsum))
-        cx = max(0, min(w - 1, cx))
-        cy = max(0, min(h - 1, cy))
-        return cx, cy
+        # 強化定位：背景扣除 + 最大連通區 + 亞像素（peak_geom 仍走峰值幾何）
+        return compute_auto_spot_center(
+            matrix, mode, use_threshold, thresh_percent,
+            bg_subtract=(mode != "peak_geom"),
+            largest_cc_only=(mode != "peak_geom"),
+            subpixel=True,
+        )
 
     def recalculate_dataray_spot(self):
         self.sync_dataray_spot_to_m1()
@@ -1194,10 +1180,10 @@ class DataRayTab(QWidget):
         is_ellipse = self.radio_dr_shape_ellipse.isChecked()
         pixel_pitch_um = 5.5
 
-        cy_clamped = max(0, min(h - 1, cy))
+        cy_clamped = max(0, min(h - 1, int(round(cy))))
         x_profile = self.result_matrix[cy_clamped, :]
 
-        cx_clamped = max(0, min(w - 1, cx))
+        cx_clamped = max(0, min(w - 1, int(round(cx))))
         y_profile = self.result_matrix[:, cx_clamped]
 
         x_width_px, y_width_px = 0, 0
@@ -1287,7 +1273,7 @@ class DataRayTab(QWidget):
         sum_intensity = np.sum(circle_pixels) if len(circle_pixels) > 0 else 0
         mean_intensity = np.mean(circle_pixels) if len(circle_pixels) > 0 else 0
 
-        self.lbl_dr_center.setText(f"中心座標: (X: {cx}, Y: {cy})")
+        self.lbl_dr_center.setText(f"中心座標: (X: {cx:.2f}, Y: {cy:.2f})")
         self.lbl_dr_peak.setText(f"最大強度 (Peak): {peak_value:.1f}")
         self.lbl_dr_area_um.setText(f"實際面積: {area_um2:.2f} μm²")
         self.lbl_dr_sum_intensity.setText(f"總光強度: {sum_intensity:.1f}")
@@ -1307,11 +1293,15 @@ class DataRayTab(QWidget):
             dx = p2[0] - p1[0]
             dy = p2[1] - p1[1]
             distance_px = np.sqrt(dx**2 + dy**2)
-            self.lbl_distance.setText(f"位置差距: ΔX: {abs(dx)} px, ΔY: {abs(dy)} px | 總距離: {distance_px:.2f} px")
+            self.lbl_distance.setText(
+                f"位置差距: ΔX: {abs(dx):.2f} px, ΔY: {abs(dy):.2f} px | 總距離: {distance_px:.2f} px"
+            )
             dx_real = abs(dx) * pixel_pitch_um
             dy_real = abs(dy) * pixel_pitch_um
             distance_real = distance_px * pixel_pitch_um
-            self.lbl_real_distance.setText(f"實際差距 (* 5.5): ΔX: {dx_real:.2f} μm, ΔY: {dy_real:.2f} μm | 總距離: {distance_real:.2f} μm")
+            self.lbl_real_distance.setText(
+                f"實際差距 (* 5.5): ΔX: {dx_real:.2f} μm, ΔY: {dy_real:.2f} μm | 總距離: {distance_real:.2f} μm"
+            )
 
     def clear_measure_points(self):
         self.click_points.clear()

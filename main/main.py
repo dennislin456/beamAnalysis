@@ -1,9 +1,10 @@
 import sys
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget
 
-# 匯入我們剛剛切好的三個獨立分頁
+# 匯入獨立分頁
 from tab_dataray import DataRayTab
 from tab_batch import DataRayBatchTab
+from tab_batch_m2 import DataRayBatchM2Tab
 from tab_basler import BaslerTab
 
 class ModularMatrixApp(QMainWindow):
@@ -22,11 +23,13 @@ class ModularMatrixApp(QMainWindow):
         # 實例化分頁
         self.tab_dataray = DataRayTab(self)
         self.tab_batch = DataRayBatchTab(self)
+        self.tab_batch_m2 = DataRayBatchM2Tab(self)
         self.tab_basler = BaslerTab(self)
         
-        # 將分頁加入 Tab 容器，大功告成！
+        # 將分頁加入 Tab 容器
         self.tabs.addTab(self.tab_dataray, "DataRay (單檔/雙檔)")
         self.tabs.addTab(self.tab_batch, "DataRay (Batch 批量)")
+        self.tabs.addTab(self.tab_batch_m2, "DataRay (M2 Batch)")
         self.tabs.addTab(self.tab_basler, "Basler")
 
 if __name__ == "__main__":

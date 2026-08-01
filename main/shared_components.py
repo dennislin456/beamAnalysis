@@ -1,7 +1,226 @@
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtWidgets import QSpinBox, QDoubleSpinBox, QMainWindow, QWidget, QVBoxLayout
+from scipy.ndimage import label as ndi_label
+from PyQt5.QtWidgets import QSpinBox, QDoubleSpinBox, QMainWindow, QWidget, QVBoxLayout, QCheckBox, QHBoxLayout
 from PyQt5.QtCore import Qt
+
+
+# =========================================================================
+# 光斑定位演算法（M1／M2 共用）
+# =========================================================================
+def estimate_border_background(matrix):
+    """以邊界像素中位數估計背景。"""
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.size == 0:
+        return 0.0
+    h, w = matrix.shape
+    if h < 2 or w < 2:
+        return float(np.median(matrix))
+    border = np.concatenate([matrix[0, :], matrix[-1, :], matrix[1:-1, 0], matrix[1:-1, -1]])
+    return float(np.median(border))
+
+
+def build_robust_threshold_mask(matrix, use_threshold=True, thresh_percent=50.0,
+                                bg_subtract=True, largest_cc_only=True):
+    """背景扣除後依門檻建 mask，可選擇只保留最大連通區。"""
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.size == 0:
+        return None
+
+    if bg_subtract:
+        bg = estimate_border_background(matrix)
+        work = np.clip(matrix - bg, 0.0, None)
+    else:
+        work = matrix
+
+    peak_val = float(np.max(work)) if work.size > 0 else 0.0
+    if not np.isfinite(peak_val) or peak_val <= 0:
+        return np.zeros(matrix.shape, dtype=bool)
+
+    frac = (thresh_percent / 100.0) if use_threshold else 0.5
+    mask = work >= (peak_val * frac)
+    if not np.any(mask):
+        return mask
+
+    if largest_cc_only:
+        labeled, num = ndi_label(mask)
+        if num > 1:
+            counts = np.bincount(labeled.ravel())
+            counts[0] = 0
+            mask = labeled == int(np.argmax(counts))
+        elif num == 0:
+            return np.zeros(matrix.shape, dtype=bool)
+    return mask
+
+
+def compute_auto_spot_center(matrix, mode, use_threshold=False, thresh_percent=50.0,
+                             bg_subtract=True, largest_cc_only=True, subpixel=True):
+    """計算光斑中心。centroid／thresh_geom 預設：背景扣除 + 最大連通區 + 亞像素。
+
+    Returns:
+        (cx, cy) — subpixel=True 時為 float，否則為 int
+    """
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.size == 0:
+        return 0, 0
+    h, w = matrix.shape
+    peak_val = float(np.max(matrix))
+
+    if mode == "peak_geom":
+        ys, xs = np.where(matrix == peak_val)
+        if len(xs) > 0:
+            cx, cy = float(np.mean(xs)), float(np.mean(ys))
+        else:
+            yi, xi = np.unravel_index(np.argmax(matrix), matrix.shape)
+            cx, cy = float(xi), float(yi)
+        if subpixel:
+            return cx, cy
+        return int(round(cx)), int(round(cy))
+
+    if bg_subtract:
+        bg = estimate_border_background(matrix)
+        work = np.clip(matrix - bg, 0.0, None)
+    else:
+        work = matrix
+
+    peak_work = float(np.max(work)) if work.size > 0 else 0.0
+    if not np.isfinite(peak_work) or peak_work <= 0:
+        yi, xi = np.unravel_index(np.argmax(matrix), matrix.shape)
+        return (float(xi), float(yi)) if subpixel else (int(xi), int(yi))
+
+    frac = (thresh_percent / 100.0) if use_threshold else 0.5
+    mask = work >= (peak_work * frac)
+    if not np.any(mask):
+        yi, xi = np.unravel_index(np.argmax(work), work.shape)
+        return (float(xi), float(yi)) if subpixel else (int(xi), int(yi))
+
+    if largest_cc_only:
+        labeled, num = ndi_label(mask)
+        if num > 1:
+            counts = np.bincount(labeled.ravel())
+            counts[0] = 0
+            mask = labeled == int(np.argmax(counts))
+        elif num == 0:
+            yi, xi = np.unravel_index(np.argmax(work), work.shape)
+            return (float(xi), float(yi)) if subpixel else (int(xi), int(yi))
+
+    ys, xs = np.where(mask)
+    if mode == "thresh_geom":
+        cx, cy = float(np.mean(xs)), float(np.mean(ys))
+    else:
+        weights = work[mask]
+        wsum = float(np.sum(weights))
+        if wsum <= 0:
+            cx, cy = float(np.mean(xs)), float(np.mean(ys))
+        else:
+            cx = float(np.sum(xs * weights) / wsum)
+            cy = float(np.sum(ys * weights) / wsum)
+
+    cx = min(max(cx, 0.0), w - 1.0)
+    cy = min(max(cy, 0.0), h - 1.0)
+    if subpixel:
+        return cx, cy
+    return int(round(cx)), int(round(cy))
+
+
+def split_y_index(y1):
+    """將（可能為亞像素的）Y 轉成整數切割列。"""
+    return int(round(float(y1)))
+
+
+def find_dual_peak_valley_y(matrix, cx=None, col_half_width=2, smooth_win=7,
+                            min_peak_distance=5):
+    """沿質心 X 縱切取 1D profile，找雙峰之間波谷的 Y（用來區分 above／below）。
+
+    流程：
+      1. 若未指定 cx，以整張圖質心（門檻 50%）估 X
+      2. 取 cx ± col_half_width 欄平均成垂直 profile
+      3. 背景扣除後平滑，找兩個主峰，取峰間最小值為波谷 Y
+
+    Returns:
+        dict: {
+            "valley_y": float,
+            "cx": float,
+            "peak_ys": (y_lo, y_hi) 或 None,
+            "profile": 1d ndarray,
+        }
+        失敗時 valley_y 回退為影像中線。
+    """
+    from scipy.ndimage import uniform_filter1d
+    from scipy.signal import find_peaks
+
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.size == 0:
+        return {"valley_y": 0.0, "cx": 0.0, "peak_ys": None, "profile": np.array([])}
+
+    h, w = matrix.shape
+    if cx is None:
+        try:
+            cx, _cy = compute_auto_spot_center(
+                matrix, "centroid", use_threshold=True, thresh_percent=50.0,
+                bg_subtract=True, largest_cc_only=True, subpixel=True,
+            )
+        except Exception:
+            cx = (w - 1) / 2.0
+    cx = float(np.clip(cx, 0.0, w - 1.0))
+    ci = int(round(cx))
+    c0 = max(0, ci - int(col_half_width))
+    c1 = min(w, ci + int(col_half_width) + 1)
+    profile = np.mean(matrix[:, c0:c1], axis=1)
+
+    bg = float(np.median(profile)) if profile.size else 0.0
+    work = np.clip(profile - bg, 0.0, None)
+    win = max(1, int(smooth_win))
+    if win % 2 == 0:
+        win += 1
+    if work.size >= win:
+        smooth = uniform_filter1d(work, size=win, mode="nearest")
+    else:
+        smooth = work
+
+    fallback_y = (h - 1) / 2.0
+    peak_ys = None
+    valley_y = fallback_y
+
+    if smooth.size >= 3 and float(np.max(smooth)) > 0:
+        prominence = max(float(np.max(smooth)) * 0.05, 1e-9)
+        peaks, props = find_peaks(
+            smooth,
+            distance=max(1, int(min_peak_distance)),
+            prominence=prominence,
+        )
+        if len(peaks) < 2:
+            # 放寬條件再試一次
+            peaks, props = find_peaks(
+                smooth,
+                distance=max(1, int(min_peak_distance)),
+            )
+        if len(peaks) >= 2:
+            # 取 prominence 最高的兩個峰（若無 prominence 則取高度最高）
+            if "prominences" in props and props["prominences"] is not None:
+                order = np.argsort(props["prominences"])[::-1]
+            else:
+                order = np.argsort(smooth[peaks])[::-1]
+            top2 = sorted(int(peaks[i]) for i in order[:2])
+            y_lo, y_hi = top2[0], top2[1]
+            if y_hi > y_lo:
+                seg = smooth[y_lo:y_hi + 1]
+                min_val = float(np.min(seg))
+                # 平坦波谷取最低平台中點，避免偏到單側
+                tol = max(abs(min_val) * 0.02, float(np.max(seg)) * 0.005, 1e-12)
+                cands = np.where(seg <= min_val + tol)[0]
+                valley_local = int(np.round(np.median(cands))) if cands.size else int(np.argmin(seg))
+                valley_y = float(y_lo + valley_local)
+                peak_ys = (float(y_lo), float(y_hi))
+
+    valley_y = float(np.clip(valley_y, 0.0, h - 1.0))
+    return {
+        "valley_y": valley_y,
+        "cx": cx,
+        "peak_ys": peak_ys,
+        "profile": profile,
+    }
+
 
 # =========================================================================
 # 基礎 UI 元件
@@ -25,11 +244,20 @@ class HeatmapViewerWindow(QMainWindow):
         self.app_parent = app_parent
         self.is_m1 = is_m1
         self.matrix_data = matrix_data
+        self._base_title = title
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
         layout.setContentsMargins(6, 6, 6, 6)
+
+        toolbar = QHBoxLayout()
+        self.chk_grayscale = QCheckBox("熱力圖改為黑白（方便對照十字／圓）")
+        self.chk_grayscale.setStyleSheet("font-weight: bold; color: #37474F;")
+        self.chk_grayscale.toggled.connect(self._on_grayscale_toggled)
+        toolbar.addWidget(self.chk_grayscale)
+        toolbar.addStretch(1)
+        layout.addLayout(toolbar)
 
         self.win = pg.GraphicsLayoutWidget()
         self.win.setStyleSheet("border: 1px solid #d0d0d0; background-color: black;")
@@ -37,7 +265,8 @@ class HeatmapViewerWindow(QMainWindow):
 
         colors = [(0, 0, 255), (0, 255, 255), (0, 255, 0), (255, 255, 0), (255, 0, 0)]
         pos = np.linspace(0.0, 1.0, len(colors))
-        jet_map = pg.ColorMap(pos, colors)
+        self.jet_map = pg.ColorMap(pos, colors)
+        self.gray_map = pg.ColorMap([0.0, 1.0], [(0, 0, 0), (255, 255, 255)])
 
         self.plot = self.win.addPlot(row=0, col=0, title=title)
         self.plot.getViewBox().invertY(False)
@@ -55,7 +284,7 @@ class HeatmapViewerWindow(QMainWindow):
 
         self.hist = pg.HistogramLUTItem()
         self.hist.setImageItem(self.image_item)
-        self.hist.gradient.setColorMap(jet_map)
+        self.hist.gradient.setColorMap(self.jet_map)
         self.win.addItem(self.hist, row=0, col=1)
 
         self.marker_items = []
@@ -69,6 +298,18 @@ class HeatmapViewerWindow(QMainWindow):
         if self.is_m1:
             self.plot.scene().sigMouseClicked.connect(self.on_m1_mouse_clicked)
 
+        # 若 parent 已勾選黑白，開啟時同步
+        parent_gray = False
+        if self.app_parent is not None:
+            chk = getattr(self.app_parent, "chk_batch_heatmap_gray", None)
+            if chk is not None:
+                parent_gray = chk.isChecked()
+        if parent_gray:
+            self.chk_grayscale.blockSignals(True)
+            self.chk_grayscale.setChecked(True)
+            self.chk_grayscale.blockSignals(False)
+            self.set_grayscale(True)
+
         # 這裡會安全地向 parent 請求座標，即使屬性不存在也不會崩潰
         p1 = getattr(self.app_parent, "m1_center_point", None) if self.app_parent else None
         
@@ -79,6 +320,25 @@ class HeatmapViewerWindow(QMainWindow):
             self.draw_marker(p1, pt2=p2)
         elif p1 is not None:
             self.draw_marker(p1)
+
+    def set_grayscale(self, enabled):
+        """外部同步黑白／彩色模式。"""
+        if self.chk_grayscale.isChecked() != bool(enabled):
+            self.chk_grayscale.blockSignals(True)
+            self.chk_grayscale.setChecked(bool(enabled))
+            self.chk_grayscale.blockSignals(False)
+        self._apply_colormap(bool(enabled))
+
+    def _on_grayscale_toggled(self, checked):
+        self._apply_colormap(checked)
+
+    def _apply_colormap(self, grayscale):
+        cmap = self.gray_map if grayscale else self.jet_map
+        levels = self.hist.getLevels()
+        self.hist.gradient.setColorMap(cmap)
+        self.hist.setLevels(*levels)
+        title = self._base_title + (" [Grayscale]" if grayscale else "")
+        self.plot.setTitle(title)
 
     def on_m1_mouse_clicked(self, evt):
         if self.matrix_data is None or self.app_parent is None:
@@ -119,14 +379,14 @@ class HeatmapViewerWindow(QMainWindow):
                         self.app_parent.update_all_m1_markers()
                         self.app_parent.sync_dual_points_after_m1_change()
 
-    def draw_marker(self, pt, pt2=None):
+    def draw_marker(self, pt, pt2=None, pt3=None, r2=None, r3=None):
         self.clear_marker()
         if self.matrix_data is None:
             return
         h, w = self.matrix_data.shape
         if pt is not None:
             cx, cy = pt
-            pen = pg.mkPen('#76FF03', width=1.5, style=Qt.DashLine)
+            pen = pg.mkPen('#00C853', width=2.5, style=Qt.DashLine)
             v_item = pg.PlotCurveItem(x=[cx, cx], y=[0, h], pen=pen)
             h_item = pg.PlotCurveItem(x=[0, w], y=[cy, cy], pen=pen)
             self.plot.addItem(v_item)
@@ -134,12 +394,36 @@ class HeatmapViewerWindow(QMainWindow):
             self.marker_items.extend([v_item, h_item])
         if pt2 is not None:
             cx2, cy2 = pt2
-            pen2 = pg.mkPen('#00E5FF', width=2)
+            pen2 = pg.mkPen('#2962FF', width=2.5)
             v2 = pg.PlotCurveItem(x=[cx2, cx2], y=[0, h], pen=pen2)
             h2 = pg.PlotCurveItem(x=[0, w], y=[cy2, cy2], pen=pen2)
             self.plot.addItem(v2)
             self.plot.addItem(h2)
             self.marker_items.extend([v2, h2])
+            if r2 is not None and r2 > 0:
+                circle2 = self._make_circle_curve(cx2, cy2, r2, pg.mkPen('#2962FF', width=2))
+                self.plot.addItem(circle2)
+                self.marker_items.append(circle2)
+        if pt3 is not None:
+            cx3, cy3 = pt3
+            pen3 = pg.mkPen('#D50000', width=2.5)
+            v3 = pg.PlotCurveItem(x=[cx3, cx3], y=[0, h], pen=pen3)
+            h3 = pg.PlotCurveItem(x=[0, w], y=[cy3, cy3], pen=pen3)
+            self.plot.addItem(v3)
+            self.plot.addItem(h3)
+            self.marker_items.extend([v3, h3])
+            if r3 is not None and r3 > 0:
+                circle3 = self._make_circle_curve(
+                    cx3, cy3, r3, pg.mkPen('#D50000', width=2))
+                self.plot.addItem(circle3)
+                self.marker_items.append(circle3)
+
+    @staticmethod
+    def _make_circle_curve(cx, cy, radius, pen, n=72):
+        theta = np.linspace(0, 2 * np.pi, n)
+        xs = cx + radius * np.cos(theta)
+        ys = cy + radius * np.sin(theta)
+        return pg.PlotCurveItem(x=xs, y=ys, pen=pen)
 
     def clear_marker(self):
         for item in self.marker_items:
