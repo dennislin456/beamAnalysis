@@ -1,0 +1,10 @@
+# BeamAnalysis — Python 依賴
+# 建議：conda create -n beam python=3.12
+
+PyQt5>=5.15
+numpy>=1.24
+pandas>=2.0
+pyqtgraph>=0.13
+scipy>=1.10
+openpyxl>=3.1
+Pillow>=10.0
