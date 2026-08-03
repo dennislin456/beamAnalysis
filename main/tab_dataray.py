@@ -201,11 +201,11 @@ class DataRayTab(QWidget):
         top_fixed_layout.addWidget(self.lbl_ratio)
         top_fixed_layout.addWidget(self.lbl_size)
         
-        self.lbl_distance = QLabel("位置差距: ΔX: --, ΔY: -- | 總距離: -- px")
+        self.lbl_distance = QLabel("位置差距: ΔX: --, ΔY: -- \n總距離: -- px")
         self.lbl_distance.setStyleSheet("font-weight: bold; color: #37474F; font-size: 12px;")
         top_fixed_layout.addWidget(self.lbl_distance)
         
-        self.lbl_real_distance = QLabel("實際差距 (* 5.5): ΔX: -- μm, ΔY: -- μm | 總距離: -- μm")
+        self.lbl_real_distance = QLabel("實際差距 (* 5.5): ΔX: -- μm, ΔY: -- μm \n總距離: -- μm")
         self.lbl_real_distance.setStyleSheet("font-weight: bold; color: #2E7D32; font-size: 12px;")
         top_fixed_layout.addWidget(self.lbl_real_distance)
 
@@ -1285,8 +1285,8 @@ class DataRayTab(QWidget):
         pixel_pitch_um = 5.5
         if len(self.click_points) == 1:
             p1 = self.click_points[0]
-            self.lbl_distance.setText("位置差距: ΔX: --, ΔY: -- | 總距離: -- px")
-            self.lbl_real_distance.setText("實際差距 (* 5.5): ΔX: -- μm, ΔY: -- μm | 總距離: -- μm")
+            self.lbl_distance.setText("位置差距: ΔX: --, ΔY: -- \n總距離: -- px")
+            self.lbl_real_distance.setText("實際差距 (* 5.5): ΔX: -- μm, ΔY: -- μm \n總距離: -- μm")
         elif len(self.click_points) == 2:
             p1 = self.click_points[0]
             p2 = self.click_points[1]
@@ -1294,20 +1294,20 @@ class DataRayTab(QWidget):
             dy = p2[1] - p1[1]
             distance_px = np.sqrt(dx**2 + dy**2)
             self.lbl_distance.setText(
-                f"位置差距: ΔX: {abs(dx):.2f} px, ΔY: {abs(dy):.2f} px | 總距離: {distance_px:.2f} px"
+                f"位置差距: ΔX: {abs(dx):.2f} px, ΔY: {abs(dy):.2f} px \n總距離: {distance_px:.2f} px"
             )
             dx_real = abs(dx) * pixel_pitch_um
             dy_real = abs(dy) * pixel_pitch_um
             distance_real = distance_px * pixel_pitch_um
             self.lbl_real_distance.setText(
-                f"實際差距 (* 5.5): ΔX: {dx_real:.2f} μm, ΔY: {dy_real:.2f} μm | 總距離: {distance_real:.2f} μm"
+                f"實際差距 (* 5.5): ΔX: {dx_real:.2f} μm, ΔY: {dy_real:.2f} μm \n總距離: {distance_real:.2f} μm"
             )
 
     def clear_measure_points(self):
         self.click_points.clear()
         self.clear_measure_items_only()
-        self.lbl_distance.setText("位置差距: ΔX: --, ΔY: -- | 總距離: -- px")
-        self.lbl_real_distance.setText("實際差距 (* 5.5): ΔX: -- μm, ΔY: -- μm | 總距離: -- μm")
+        self.lbl_distance.setText("位置差距: ΔX: --, ΔY: -- \n總距離: -- px")
+        self.lbl_real_distance.setText("實際差距 (* 5.5): ΔX: -- μm, ΔY: -- μm \n總距離: -- μm")
 
     def mouse_moved(self, evt):
         pos = evt
