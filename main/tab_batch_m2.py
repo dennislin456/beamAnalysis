@@ -1,4 +1,7 @@
-"""DataRay M2-only Batch：僅載入 M2 Excel，以質心縱切雙峰波谷 Y 區分 above／below。"""
+"""DataRay M2-only Batch：僅載入 M2 Excel，以質心縱切雙峰波谷 Y 區分 above／below。
+
+可選框選 ROI（X/Y/Width/Height）：僅在固定矩形內做縱切找波谷，避免散射雜點干擾。
+"""
 import os
 import json
 import numpy as np
@@ -9,6 +12,7 @@ from scipy.ndimage import uniform_filter
 
 from PyQt5.QtWidgets import (
     QLabel, QFileDialog, QMessageBox, QApplication, QDialog,
+    QHBoxLayout, QGridLayout, QCheckBox,
 )
 from PyQt5.QtCore import Qt
 
@@ -16,6 +20,7 @@ import openpyxl
 
 from shared_components import (
     HeatmapViewerWindow, find_dual_peak_valley_y, split_y_index,
+    NoWheelSpinBox, clip_roi_to_matrix,
 )
 from tab_batch import DataRayBatchTab, LocationConfigDialog
 
@@ -28,6 +33,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.batch_split_y = None          # 波谷 Y（取代 M1 Y）
         self.batch_split_cx = None         # 縱切所用質心 X
         self.batch_split_peak_ys = None    # (y_lo, y_hi)
+        self.batch_valley_roi_bounds = None  # 實際使用的 (x0,y0,x1,y1)
         self._adapt_ui_for_m2_only()
 
     # ------------------------------------------------------------------
@@ -93,6 +99,69 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                 w.setText("光斑定位（M2 Heatmap，依波谷 Y 切分）：")
                 w.setStyleSheet("font-weight: bold; color: #1565C0;")
 
+        left_layout = getattr(self, "batch_left_settings_layout", None)
+        if left_layout is None:
+            left_layout = self.radio_batch_p2_auto_min.parentWidget().layout()
+        insert_idx = left_layout.indexOf(self.radio_batch_p2_auto_min)
+
+        # 波谷搜尋框選：僅調整 XYWH 輸入排成緊湊 2×2
+        self.chk_batch_valley_roi = QCheckBox(
+            "啟用波谷搜尋框選（僅在框內縱切找低谷，區分 above／below）"
+        )
+        self.chk_batch_valley_roi.setChecked(False)
+        self.chk_batch_valley_roi.setStyleSheet("color: #6A1B9A; font-weight: bold;")
+        self.chk_batch_valley_roi.setToolTip(
+            "框住上下主光斑，避開上方散射雜點；切分後 above／below 仍對全圖計算。"
+        )
+        self.chk_batch_valley_roi.toggled.connect(self._on_valley_roi_toggled)
+        left_layout.insertWidget(insert_idx, self.chk_batch_valley_roi)
+        insert_idx += 1
+
+        roi_grid = QGridLayout()
+        roi_grid.setContentsMargins(0, 0, 0, 0)
+        roi_grid.setHorizontalSpacing(6)
+        roi_grid.setVerticalSpacing(4)
+        self.lbl_batch_valley_roi_x = QLabel("X")
+        self.spin_batch_valley_roi_x = NoWheelSpinBox()
+        self.spin_batch_valley_roi_x.setRange(0, 100000)
+        self.spin_batch_valley_roi_x.setValue(0)
+        self.spin_batch_valley_roi_x.setFixedWidth(72)
+        self.spin_batch_valley_roi_x.valueChanged.connect(self._on_valley_roi_changed)
+        self.lbl_batch_valley_roi_y = QLabel("Y")
+        self.spin_batch_valley_roi_y = NoWheelSpinBox()
+        self.spin_batch_valley_roi_y.setRange(0, 100000)
+        self.spin_batch_valley_roi_y.setValue(0)
+        self.spin_batch_valley_roi_y.setFixedWidth(72)
+        self.spin_batch_valley_roi_y.valueChanged.connect(self._on_valley_roi_changed)
+        self.lbl_batch_valley_roi_w = QLabel("W")
+        self.spin_batch_valley_roi_w = NoWheelSpinBox()
+        self.spin_batch_valley_roi_w.setRange(1, 100000)
+        self.spin_batch_valley_roi_w.setValue(200)
+        self.spin_batch_valley_roi_w.setFixedWidth(72)
+        self.spin_batch_valley_roi_w.valueChanged.connect(self._on_valley_roi_changed)
+        self.lbl_batch_valley_roi_h = QLabel("H")
+        self.spin_batch_valley_roi_h = NoWheelSpinBox()
+        self.spin_batch_valley_roi_h.setRange(1, 100000)
+        self.spin_batch_valley_roi_h.setValue(200)
+        self.spin_batch_valley_roi_h.setFixedWidth(72)
+        self.spin_batch_valley_roi_h.valueChanged.connect(self._on_valley_roi_changed)
+        roi_grid.addWidget(self.lbl_batch_valley_roi_x, 0, 0)
+        roi_grid.addWidget(self.spin_batch_valley_roi_x, 0, 1)
+        roi_grid.addWidget(self.lbl_batch_valley_roi_y, 0, 2)
+        roi_grid.addWidget(self.spin_batch_valley_roi_y, 0, 3)
+        roi_grid.addWidget(self.lbl_batch_valley_roi_w, 1, 0)
+        roi_grid.addWidget(self.spin_batch_valley_roi_w, 1, 1)
+        roi_grid.addWidget(self.lbl_batch_valley_roi_h, 1, 2)
+        roi_grid.addWidget(self.spin_batch_valley_roi_h, 1, 3)
+        left_layout.insertLayout(insert_idx, roi_grid)
+
+        self.lbl_batch_valley_roi_hint = QLabel("")
+        self.lbl_batch_valley_roi_hint.hide()
+        self._set_valley_roi_controls_enabled(False)
+
+        # 門檻：checkbox + 比例同一列、縮小輸入框
+        self._compact_threshold_row(left_layout)
+
         self.radio_batch_p2_auto_min.setText("自動抓取 (切分 Y 以下最小值)")
         self.radio_batch_p2_m2_thresh_geom.setText("自動抓取 (M2 切分 Y 以下門檻幾何中心)")
         self.radio_batch_p2_m2_centroid.setText("自動抓取 (M2 切分 Y 以下質心中心)")
@@ -100,17 +169,98 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             "自動抓取 (M2 門檻 contour 內切圓中心，Y 上／下)"
         )
         self.radio_batch_p2_manual.setText("手動抓取 (點擊 M2 影像)")
-        # 預設改為 M2 質心（M2-only 較合理）
         self.radio_batch_p2_m2_centroid.setChecked(True)
 
         self.chk_batch_show_cross.setText(
-            "顯示 切分線(紫) / M2-below(藍) / M2-above(紅) 十字"
+            "顯示 切分線(紫) / 框選(橙) / M2-below(藍) / M2-above(紅) 十字"
         )
 
         self.btn_batch_view_m1.hide()
         self.btn_batch_view_m2.setText("查看 M2 Heatmap（彈窗）")
         self.plot_batch_heat.setTitle("M2 Heatmap (Batch M2-only)")
         self.btn_batch_run.setText("載入已配置位置並運算（僅 M2）")
+
+    def _compact_threshold_row(self, left_layout):
+        """把門檻 checkbox 與 % 輸入排成同一列，縮小 spin 寬度。"""
+        # 移除原獨立列
+        left_layout.removeWidget(self.chk_batch_p2_use_threshold)
+        old_thresh_layout = None
+        for i in range(left_layout.count()):
+            item = left_layout.itemAt(i)
+            lay = item.layout() if item is not None else None
+            if lay is None:
+                continue
+            for j in range(lay.count()):
+                child = lay.itemAt(j)
+                w = child.widget() if child is not None else None
+                if w is self.spin_batch_p2_thresh_percent:
+                    old_thresh_layout = left_layout.takeAt(i)
+                    break
+            if old_thresh_layout is not None:
+                break
+
+        if old_thresh_layout is not None and old_thresh_layout.layout() is not None:
+            old_lay = old_thresh_layout.layout()
+            while old_lay.count():
+                old_lay.takeAt(0)
+
+        self.chk_batch_p2_use_threshold.setText("使用門檻（第二點／M2）")
+        self.lbl_batch_p2_thresh_spin.setText("%:")
+        self.spin_batch_p2_thresh_percent.setFixedWidth(72)
+
+        thresh_row = QHBoxLayout()
+        thresh_row.setContentsMargins(0, 0, 0, 0)
+        thresh_row.setSpacing(6)
+        thresh_row.addWidget(self.chk_batch_p2_use_threshold)
+        thresh_row.addWidget(self.lbl_batch_p2_thresh_spin)
+        thresh_row.addWidget(self.spin_batch_p2_thresh_percent)
+        thresh_row.addStretch(1)
+
+        show_idx = left_layout.indexOf(self.chk_batch_p2_show_thresh)
+        if show_idx < 0:
+            # 插在 manual radio 之後
+            show_idx = left_layout.indexOf(self.radio_batch_p2_manual)
+            if show_idx >= 0:
+                show_idx += 1
+            else:
+                show_idx = left_layout.count()
+        left_layout.insertLayout(show_idx, thresh_row)
+
+    def _set_valley_roi_controls_enabled(self, enabled):
+        for w in (
+            self.lbl_batch_valley_roi_x, self.spin_batch_valley_roi_x,
+            self.lbl_batch_valley_roi_y, self.spin_batch_valley_roi_y,
+            self.lbl_batch_valley_roi_w, self.spin_batch_valley_roi_w,
+            self.lbl_batch_valley_roi_h, self.spin_batch_valley_roi_h,
+        ):
+            w.setEnabled(enabled)
+            w.setVisible(enabled)
+
+    def _on_valley_roi_toggled(self, checked):
+        self._set_valley_roi_controls_enabled(checked)
+        if hasattr(self, "matrix2") and self.matrix2 is not None:
+            self.update_batch_calculations(silent=True)
+
+    def _on_valley_roi_changed(self, _value=None):
+        if not getattr(self, "chk_batch_valley_roi", None):
+            return
+        if not self.chk_batch_valley_roi.isChecked():
+            return
+        if hasattr(self, "matrix2") and self.matrix2 is not None:
+            self.update_batch_calculations(silent=True)
+
+    def _get_valley_roi_tuple(self):
+        """回傳使用者輸入的 (x, y, width, height)；未啟用則 None。"""
+        if not getattr(self, "chk_batch_valley_roi", None):
+            return None
+        if not self.chk_batch_valley_roi.isChecked():
+            return None
+        return (
+            self.spin_batch_valley_roi_x.value(),
+            self.spin_batch_valley_roi_y.value(),
+            self.spin_batch_valley_roi_w.value(),
+            self.spin_batch_valley_roi_h.value(),
+        )
 
     # ------------------------------------------------------------------
     # 資料掃描／載入（僅 M2）
@@ -433,11 +583,13 @@ class DataRayBatchM2Tab(DataRayBatchTab):
     # 核心：波谷切分 + M2 above／below
     # ------------------------------------------------------------------
     def _compute_split_y_from_m2(self):
-        """以 M2 質心 X 縱切，找雙峰波谷 Y。"""
-        info = find_dual_peak_valley_y(self.matrix2)
+        """以 M2 質心 X 縱切，找雙峰波谷 Y（可限於框選 ROI）。"""
+        roi = self._get_valley_roi_tuple()
+        info = find_dual_peak_valley_y(self.matrix2, roi=roi)
         self.batch_split_y = info["valley_y"]
         self.batch_split_cx = info["cx"]
         self.batch_split_peak_ys = info["peak_ys"]
+        self.batch_valley_roi_bounds = info.get("roi")
         # 相容：把「切分點」放在 batch_m1_center_point，供匯出／十字複用欄位語意
         self.batch_m1_center_point = (self.batch_split_cx, self.batch_split_y)
         return self.batch_split_y
@@ -568,6 +720,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             dist_ab = np.sqrt((m2a_x - m2_x) ** 2 + (m2a_y - m2_y) ** 2)
             print(
                 f"[Batch M2-only] splitY={split_y:.2f} cx={self.batch_split_cx:.2f} | "
+                f"roi={self.batch_valley_roi_bounds} | "
                 f"below({m2_x:.2f}, {m2_y:.2f}) | above({m2a_x:.2f}, {m2a_y:.2f}) | "
                 f"above→below: {dist_ab:.2f} px"
             )
@@ -611,8 +764,13 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             peak_txt = ""
             if peaks is not None:
                 peak_txt = f" ｜ 雙峰 Y: {peaks[0]:.1f}/{peaks[1]:.1f}"
+            roi_txt = ""
+            bounds = getattr(self, "batch_valley_roi_bounds", None)
+            if bounds is not None:
+                x0, y0, x1, y1 = bounds
+                roi_txt = f" ｜ 框選: ({x0},{y0})–({x1 - 1},{y1 - 1})"
             self.lbl_batch_split_info.setText(
-                f"切分波谷 Y: {sy:.2f} ｜ 縱切 X: {sx:.2f}{peak_txt}"
+                f"切分波谷 Y: {sy:.2f} ｜ 縱切 X: {sx:.2f}{peak_txt}{roi_txt}"
             )
         else:
             self.lbl_batch_split_info.setText("切分波谷 Y: -- ｜ 縱切 X: --")
@@ -671,18 +829,45 @@ class DataRayBatchM2Tab(DataRayBatchTab):
 
         h, w = self.batch_result_matrix.shape
 
+        # 橘色：波谷搜尋框選 ROI
+        bounds = getattr(self, "batch_valley_roi_bounds", None)
+        if bounds is None and getattr(self, "chk_batch_valley_roi", None):
+            if self.chk_batch_valley_roi.isChecked() and self.matrix2 is not None:
+                bounds = clip_roi_to_matrix(self.matrix2, self._get_valley_roi_tuple())
+        if bounds is not None:
+            x0, y0, x1, y1 = bounds
+            # 畫到像素外緣（半開區間右下角用 x1-ε）
+            xs = [x0 - 0.5, x1 - 0.5, x1 - 0.5, x0 - 0.5, x0 - 0.5]
+            ys = [y0 - 0.5, y0 - 0.5, y1 - 0.5, y1 - 0.5, y0 - 0.5]
+            pen_roi = pg.mkPen("#EF6C00", width=2.0, style=Qt.DashLine)
+            roi_item = pg.PlotCurveItem(x=xs, y=ys, pen=pen_roi)
+            self.plot_batch_heat.addItem(roi_item)
+            self.batch_cross_items.append(roi_item)
+
         # 紫色：波谷切分水平線 + 質心縱切線
         if self.batch_split_y is not None:
             sy = self.batch_split_y
             pen_split = pg.mkPen("#6A1B9A", width=2.5, style=Qt.DashLine)
-            h_item = pg.PlotCurveItem(x=[0, w], y=[sy, sy], pen=pen_split)
-            self.plot_batch_heat.addItem(h_item)
-            self.batch_cross_items.append(h_item)
-            if self.batch_split_cx is not None:
-                sx = self.batch_split_cx
-                v_item = pg.PlotCurveItem(x=[sx, sx], y=[0, h], pen=pen_split)
-                self.plot_batch_heat.addItem(v_item)
-                self.batch_cross_items.append(v_item)
+            # 縱切線／切分線若有框選，優先畫在框內較清楚
+            if bounds is not None:
+                x0, y0, x1, y1 = bounds
+                h_item = pg.PlotCurveItem(x=[x0, x1], y=[sy, sy], pen=pen_split)
+                self.plot_batch_heat.addItem(h_item)
+                self.batch_cross_items.append(h_item)
+                if self.batch_split_cx is not None:
+                    sx = self.batch_split_cx
+                    v_item = pg.PlotCurveItem(x=[sx, sx], y=[y0, y1], pen=pen_split)
+                    self.plot_batch_heat.addItem(v_item)
+                    self.batch_cross_items.append(v_item)
+            else:
+                h_item = pg.PlotCurveItem(x=[0, w], y=[sy, sy], pen=pen_split)
+                self.plot_batch_heat.addItem(h_item)
+                self.batch_cross_items.append(h_item)
+                if self.batch_split_cx is not None:
+                    sx = self.batch_split_cx
+                    v_item = pg.PlotCurveItem(x=[sx, sx], y=[0, h], pen=pen_split)
+                    self.plot_batch_heat.addItem(v_item)
+                    self.batch_cross_items.append(v_item)
 
         if self.batch_m2_center_point:
             cx2, cy2 = self.batch_m2_center_point
@@ -750,6 +935,11 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             "m2_above_point": getattr(self, "batch_m2_above_point", None),
             "split_y": getattr(self, "batch_split_y", None),
             "split_cx": getattr(self, "batch_split_cx", None),
+            "valley_roi_enabled": self.chk_batch_valley_roi.isChecked(),
+            "valley_roi_x": self.spin_batch_valley_roi_x.value(),
+            "valley_roi_y": self.spin_batch_valley_roi_y.value(),
+            "valley_roi_w": self.spin_batch_valley_roi_w.value(),
+            "valley_roi_h": self.spin_batch_valley_roi_h.value(),
         }
         QMessageBox.information(
             self, "暫存成功", f"第 {self.batch_current_idx + 1} 組參數與位置已暫存！"
@@ -781,6 +971,21 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.spin_batch_p2_thresh_percent.blockSignals(True)
         self.spin_batch_p2_thresh_percent.setValue(params.get("m2_thresh_percent", 70.0))
         self.spin_batch_p2_thresh_percent.blockSignals(False)
+
+        if hasattr(self, "chk_batch_valley_roi"):
+            self.chk_batch_valley_roi.blockSignals(True)
+            self.chk_batch_valley_roi.setChecked(bool(params.get("valley_roi_enabled", False)))
+            self.chk_batch_valley_roi.blockSignals(False)
+            self._set_valley_roi_controls_enabled(self.chk_batch_valley_roi.isChecked())
+            for spin, key, default in (
+                (self.spin_batch_valley_roi_x, "valley_roi_x", 0),
+                (self.spin_batch_valley_roi_y, "valley_roi_y", 0),
+                (self.spin_batch_valley_roi_w, "valley_roi_w", 200),
+                (self.spin_batch_valley_roi_h, "valley_roi_h", 200),
+            ):
+                spin.blockSignals(True)
+                spin.setValue(int(params.get(key, default)))
+                spin.blockSignals(False)
 
         self.batch_m2_center_point = params.get("m2_center_point")
         self.batch_m2_above_point = params.get("m2_above_point")
@@ -916,6 +1121,12 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             "split_valley_y_px": self.batch_split_y,
             "split_centroid_x_px": self.batch_split_cx,
             "split_peak_ys": list(self.batch_split_peak_ys) if self.batch_split_peak_ys else None,
+            "valley_roi_enabled": self.chk_batch_valley_roi.isChecked(),
+            "valley_roi_x": self.spin_batch_valley_roi_x.value() if self.chk_batch_valley_roi.isChecked() else None,
+            "valley_roi_y": self.spin_batch_valley_roi_y.value() if self.chk_batch_valley_roi.isChecked() else None,
+            "valley_roi_w": self.spin_batch_valley_roi_w.value() if self.chk_batch_valley_roi.isChecked() else None,
+            "valley_roi_h": self.spin_batch_valley_roi_h.value() if self.chk_batch_valley_roi.isChecked() else None,
+            "valley_roi_bounds": list(self.batch_valley_roi_bounds) if self.batch_valley_roi_bounds else None,
             "m2_below_x_px": m2_pt[0] if m2_pt else None,
             "m2_below_y_px": m2_pt[1] if m2_pt else None,
             "m2_above_x_px": m2a_pt[0] if m2a_pt else None,
@@ -970,6 +1181,11 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             ["Split Centroid X", self.batch_split_cx if self.batch_split_cx is not None else "--", "px"],
             ["Split Peak Y Lo", self.batch_split_peak_ys[0] if self.batch_split_peak_ys else "--", "px"],
             ["Split Peak Y Hi", self.batch_split_peak_ys[1] if self.batch_split_peak_ys else "--", "px"],
+            ["Valley ROI Enabled", "Yes" if self.chk_batch_valley_roi.isChecked() else "No", ""],
+            ["Valley ROI X", self.spin_batch_valley_roi_x.value() if self.chk_batch_valley_roi.isChecked() else "--", "px"],
+            ["Valley ROI Y", self.spin_batch_valley_roi_y.value() if self.chk_batch_valley_roi.isChecked() else "--", "px"],
+            ["Valley ROI Width", self.spin_batch_valley_roi_w.value() if self.chk_batch_valley_roi.isChecked() else "--", "px"],
+            ["Valley ROI Height", self.spin_batch_valley_roi_h.value() if self.chk_batch_valley_roi.isChecked() else "--", "px"],
             ["P2 Point Mode", self._get_p2_point_mode_name(), ""],
             ["Use P2 Point Threshold", "Yes" if self.chk_batch_p2_use_threshold.isChecked() else "No", ""],
             ["P2 Point Threshold Percent", self.spin_batch_p2_thresh_percent.value(), "%"],
