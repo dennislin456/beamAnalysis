@@ -128,36 +128,90 @@ def split_y_index(y1):
     return int(round(float(y1)))
 
 
+def clip_roi_to_matrix(matrix, roi):
+    """將 (x, y, width, height) 裁切到矩陣範圍，回傳 (x0, y0, x1, y1) 半開區間。
+
+    x1/y1 保證至少比 x0/y0 大 1（若矩陣非空）。無效 roi 回傳 None。
+    """
+    matrix = np.asarray(matrix)
+    if matrix.size == 0 or roi is None:
+        return None
+    h, w = matrix.shape
+    try:
+        x, y, rw, rh = roi
+        x0 = int(round(float(x)))
+        y0 = int(round(float(y)))
+        rw = int(round(float(rw)))
+        rh = int(round(float(rh)))
+    except (TypeError, ValueError):
+        return None
+    if rw <= 0 or rh <= 0:
+        return None
+    x0 = int(np.clip(x0, 0, max(0, w - 1)))
+    y0 = int(np.clip(y0, 0, max(0, h - 1)))
+    x1 = int(np.clip(x0 + rw, x0 + 1, w))
+    y1 = int(np.clip(y0 + rh, y0 + 1, h))
+    return (x0, y0, x1, y1)
+
+
 def find_dual_peak_valley_y(matrix, cx=None, col_half_width=2, smooth_win=7,
-                            min_peak_distance=5):
+                            min_peak_distance=5, roi=None):
     """沿質心 X 縱切取 1D profile，找雙峰之間波谷的 Y（用來區分 above／below）。
 
     流程：
-      1. 若未指定 cx，以整張圖質心（門檻 50%）估 X
-      2. 取 cx ± col_half_width 欄平均成垂直 profile
-      3. 背景扣除後平滑，找兩個主峰，取峰間最小值為波谷 Y
+      1. 若指定 roi=(x, y, width, height)，僅在該矩形內搜尋（可排除散射雜點）
+      2. 若未指定 cx，以（ROI 或全圖）質心（門檻 50%）估 X
+      3. 取 cx ± col_half_width 欄平均成垂直 profile
+      4. 背景扣除後平滑，找兩個主峰，取峰間最小值為波谷 Y
 
     Returns:
         dict: {
-            "valley_y": float,
-            "cx": float,
-            "peak_ys": (y_lo, y_hi) 或 None,
-            "profile": 1d ndarray,
+            "valley_y": float,   # 全圖座標
+            "cx": float,         # 全圖座標
+            "peak_ys": (y_lo, y_hi) 或 None,  # 全圖座標
+            "profile": 1d ndarray,  # ROI／全圖高度的原始縱切
+            "roi": (x0, y0, x1, y1) 或 None,  # 實際使用的半開裁切
         }
-        失敗時 valley_y 回退為影像中線。
+        失敗時 valley_y 回退為搜尋區中線。
     """
     from scipy.ndimage import uniform_filter1d
     from scipy.signal import find_peaks
 
     matrix = np.asarray(matrix, dtype=np.float64)
     if matrix.size == 0:
-        return {"valley_y": 0.0, "cx": 0.0, "peak_ys": None, "profile": np.array([])}
+        return {
+            "valley_y": 0.0, "cx": 0.0, "peak_ys": None,
+            "profile": np.array([]), "roi": None,
+        }
 
-    h, w = matrix.shape
+    full_h, full_w = matrix.shape
+    roi_bounds = clip_roi_to_matrix(matrix, roi)
+    if roi_bounds is not None:
+        x0, y0, x1, y1 = roi_bounds
+        work_mat = matrix[y0:y1, x0:x1]
+        y_offset = float(y0)
+        x_offset = float(x0)
+        if cx is not None:
+            cx = float(cx) - x_offset
+    else:
+        work_mat = matrix
+        y_offset = 0.0
+        x_offset = 0.0
+        roi_bounds = None
+
+    h, w = work_mat.shape
+    if h < 1 or w < 1:
+        mid_y = (full_h - 1) / 2.0
+        mid_x = (full_w - 1) / 2.0
+        return {
+            "valley_y": mid_y, "cx": mid_x, "peak_ys": None,
+            "profile": np.array([]), "roi": roi_bounds,
+        }
+
     if cx is None:
         try:
             cx, _cy = compute_auto_spot_center(
-                matrix, "centroid", use_threshold=True, thresh_percent=50.0,
+                work_mat, "centroid", use_threshold=True, thresh_percent=50.0,
                 bg_subtract=True, largest_cc_only=True, subpixel=True,
             )
         except Exception:
@@ -166,7 +220,7 @@ def find_dual_peak_valley_y(matrix, cx=None, col_half_width=2, smooth_win=7,
     ci = int(round(cx))
     c0 = max(0, ci - int(col_half_width))
     c1 = min(w, ci + int(col_half_width) + 1)
-    profile = np.mean(matrix[:, c0:c1], axis=1)
+    profile = np.mean(work_mat[:, c0:c1], axis=1)
 
     bg = float(np.median(profile)) if profile.size else 0.0
     work = np.clip(profile - bg, 0.0, None)
@@ -214,11 +268,18 @@ def find_dual_peak_valley_y(matrix, cx=None, col_half_width=2, smooth_win=7,
                 peak_ys = (float(y_lo), float(y_hi))
 
     valley_y = float(np.clip(valley_y, 0.0, h - 1.0))
+    # 轉回全圖座標
+    valley_y = float(np.clip(valley_y + y_offset, 0.0, full_h - 1.0))
+    cx_full = float(np.clip(cx + x_offset, 0.0, full_w - 1.0))
+    if peak_ys is not None:
+        peak_ys = (float(peak_ys[0] + y_offset), float(peak_ys[1] + y_offset))
+
     return {
         "valley_y": valley_y,
-        "cx": cx,
+        "cx": cx_full,
         "peak_ys": peak_ys,
         "profile": profile,
+        "roi": roi_bounds,
     }
 
 

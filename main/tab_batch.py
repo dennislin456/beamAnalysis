@@ -463,12 +463,14 @@ class DataRayBatchTab(QWidget):
             app.focusChanged.connect(self._on_batch_focus_changed)
 
         # 下方捲動設定區
-        left_scroll_panel = QScrollArea()
-        left_scroll_panel.setWidgetResizable(True)
+        self.batch_left_scroll = QScrollArea()
+        self.batch_left_scroll.setWidgetResizable(True)
         left_content = QWidget()
         left_layout = QVBoxLayout(left_content)
         left_layout.setContentsMargins(12, 12, 12, 12)
         left_layout.setSpacing(10)
+        self.batch_left_settings_layout = left_layout
+        self.batch_left_settings_widget = left_content
 
         left_layout.addWidget(self._create_hline())
 
@@ -617,8 +619,8 @@ class DataRayBatchTab(QWidget):
         left_layout.addWidget(self.btn_batch_save_params)
 
         left_layout.addStretch()
-        left_scroll_panel.setWidget(left_content)
-        left_outer_layout.addWidget(left_scroll_panel)
+        self.batch_left_scroll.setWidget(left_content)
+        left_outer_layout.addWidget(self.batch_left_scroll)
         splitter.addWidget(left_container)
 
         # ---------------------------------------------------------
