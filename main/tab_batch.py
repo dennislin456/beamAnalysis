@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
                              QSplitter, QSizePolicy, QRadioButton, QButtonGroup, 
                              QScrollArea, QCheckBox, QComboBox, QApplication,
                              QShortcut, QDialog, QDialogButtonBox, QGroupBox)
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QObject, QEvent
 from PyQt5.QtGui import QKeySequence
 
 import openpyxl
@@ -24,12 +24,33 @@ from shared_components import (NoWheelSpinBox, NoWheelDoubleSpinBox,
                                HeatmapViewerWindow, ContourBatchViewerWindow, 
                                CrossProfileViewerWindow,
                                compute_auto_spot_center, build_robust_threshold_mask,
-                               estimate_border_background, split_y_index)
+                               estimate_border_background, split_y_index,
+                               apply_readable_plot_theme, configure_stable_plot_item,
+                               lock_plot_ranges, set_heatmap_view_transparent,
+                               configure_equal_profile_strips,
+                               enforce_square_heatmap_cell,
+                               PROFILE_SIDE_AXIS_PX, PROFILE_EDGE_AXIS_PX)
 
 
 def _natural_sort_key(name):
     import re
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', str(name))]
+
+
+class _BatchSquareHeatLayoutFilter(QObject):
+    """視窗縮放時強制熱圖格子寬＝高。"""
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        self._owner = owner
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Resize and self._owner is not None:
+            try:
+                self._owner.sync_batch_heatmap_square_layout()
+            except Exception:
+                pass
+        return False
 
 
 class LocationConfigDialog(QDialog):
@@ -240,6 +261,8 @@ class DataRayBatchTab(QWidget):
         self.batch_m2_below_circle_r = None    # 內切圓半徑（below），僅 inscribed 模式
         self.batch_m2_above_circle_r = None    # 內切圓半徑（above），僅 inscribed 模式
         self.batch_cross_items = [] # 用來存放畫在 Heatmap 上的十字線
+        self.batch_profile_point = None  # 點擊像素剖面座標 (cx, cy)
+        self.batch_profile_cross_items = []  # 剖面十字（與光斑十字分開）
         self.batch_scale_info = None  # {max1_val, match2_val, scale_ratio, max1_idx}
 
         # 建立 UI
@@ -436,6 +459,8 @@ class DataRayBatchTab(QWidget):
             "font-size: 13px; font-weight: bold; color: #D81B60; padding: 0 6px;")
         self.lbl_batch_group_nav.setAlignment(Qt.AlignCenter)
         nav_row.addWidget(self.lbl_batch_group_nav)
+        # 相容舊右側群組標籤參照（下方切換列已移除）
+        self.lbl_batch_group_num = self.lbl_batch_group_nav
 
         self.btn_batch_next_left = QPushButton("下一組 ▶")
         self.btn_batch_next_left.setStyleSheet(
@@ -602,6 +627,12 @@ class DataRayBatchTab(QWidget):
         self.chk_batch_show_cross.toggled.connect(self.redraw_batch_crosses)
         left_layout.addWidget(self.chk_batch_show_cross)
 
+        self.chk_batch_pixel_profile = QCheckBox("啟用點擊像素剖面（左＝垂直、下＝水平；雙擊還原）")
+        self.chk_batch_pixel_profile.setChecked(True)
+        self.chk_batch_pixel_profile.setStyleSheet("font-weight: bold; color: #00897B;")
+        self.chk_batch_pixel_profile.toggled.connect(self.on_batch_pixel_profile_toggled)
+        left_layout.addWidget(self.chk_batch_pixel_profile)
+
         self.chk_batch_heatmap_gray = QCheckBox("熱力圖改為黑白（方便對照十字／圓）")
         self.chk_batch_heatmap_gray.setChecked(False)
         self.chk_batch_heatmap_gray.setStyleSheet("font-weight: bold; color: #37474F;")
@@ -684,17 +715,32 @@ class DataRayBatchTab(QWidget):
         right_layout.addLayout(top_bar)
 
         self.win_batch_top = pg.GraphicsLayoutWidget()
-        self.win_batch_top.setStyleSheet("border: 1px solid #d0d0d0; background-color: black;")
         colors = [(0, 0, 255), (0, 255, 255), (0, 255, 0), (255, 255, 0), (255, 0, 0)]
         pos = np.linspace(0.0, 1.0, len(colors))
         self.batch_jet_map = pg.ColorMap(pos, colors)
         self.batch_gray_map = pg.ColorMap([0.0, 1.0], [(0, 0, 0), (255, 255, 255)])
 
-        self.plot_batch_heat = self.win_batch_top.addPlot(row=0, col=0, title='Processed Matrix Result Heatmap (Batch)')
+        # 左側垂直像素剖面（與熱圖 Y 軸／可視區對齊）
+        self.plot_batch_y_profile = self.win_batch_top.addPlot(row=0, col=0)
+        self.plot_batch_y_profile.setLabel("top", "Intensity")
+        self.plot_batch_y_profile.setLabel("left", "Y Pixels")
+        self.plot_batch_y_profile.showAxis("bottom", show=False)
+        self.plot_batch_y_profile.showAxis("top", show=True)
+        self.plot_batch_y_profile.showGrid(x=True, y=True, alpha=0.25)
+        self.plot_batch_y_profile.invertX(False)
+        self.plot_batch_y_profile.titleLabel.hide()
+        configure_stable_plot_item(self.plot_batch_y_profile, mouse_enabled=True)
+
+        self.plot_batch_heat = self.win_batch_top.addPlot(
+            row=0, col=1, title="Processed Matrix Result Heatmap (Batch)"
+        )
         self.plot_batch_heat.getViewBox().invertY(False)
-        self.plot_batch_heat.setAspectLocked(True)
-        self.plot_batch_heat.setLabel('bottom', 'X Pixels')
-        self.plot_batch_heat.setLabel('left', 'Y Pixels')
+        # 正方形像素：資料 X/Y 尺度永遠 1:1，避免正方檔被拉寬
+        self.plot_batch_heat.getViewBox().setAspectLocked(lock=True, ratio=1.0)
+        self.plot_batch_heat.showAxis("bottom", show=False)
+        self.plot_batch_heat.showAxis("left", show=False)
+        # 允許滾輪縮放；A 鈕仍隱藏；點擊由 scene 接收
+        configure_stable_plot_item(self.plot_batch_heat, mouse_enabled=True)
 
         self.batch_image_item = pg.ImageItem()
         self.plot_batch_heat.addItem(self.batch_image_item)
@@ -704,60 +750,75 @@ class DataRayBatchTab(QWidget):
         self.batch_hist.setImageItem(self.batch_image_item)
         self.batch_hist.gradient.setColorMap(self.batch_jet_map)
         self.batch_hist.sigLevelsChanged.connect(self.on_colorbar_levels_changed)
-        self.win_batch_top.addItem(self.batch_hist, row=0, col=1)
+        self.win_batch_top.addItem(self.batch_hist, row=0, col=2)
 
-        right_layout.addWidget(self.win_batch_top, 3)
+        # 下方水平像素剖面（與熱圖 X 軸／可視區對齊）
+        self.plot_batch_x_profile = self.win_batch_top.addPlot(row=1, col=1)
+        self.plot_batch_x_profile.setLabel("bottom", "X Pixels")
+        self.plot_batch_x_profile.setLabel("right", "Intensity")
+        self.plot_batch_x_profile.showAxis("left", show=False)
+        self.plot_batch_x_profile.showAxis("right", show=True)
+        self.plot_batch_x_profile.showGrid(x=True, y=True, alpha=0.25)
+        self.plot_batch_x_profile.titleLabel.hide()
+        configure_stable_plot_item(self.plot_batch_x_profile, mouse_enabled=True)
 
-        bottom_layout_container = QWidget()
-        bottom_layout = QHBoxLayout(bottom_layout_container)
-        bottom_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.win_batch_sub = pg.GraphicsLayoutWidget()
-        self.win_batch_sub.setStyleSheet("border: 1px solid #d0d0d0; background-color: black;")
-        
-        # 子圖 1: 顏色分布
-        self.plot_batch_hist = self.win_batch_sub.addPlot(row=0, col=0, title="Peak Color / Value Distribution")
-        self.plot_batch_hist.setLabel('bottom', 'Intensity Value')
-        self.plot_batch_hist.setLabel('left', 'Pixel Count')
-        self.plot_batch_hist.showGrid(x=True, y=True, alpha=0.3)
-        
-        # 子圖 2: Peak Row 趨勢
-        self.plot_batch_trend = self.win_batch_sub.addPlot(row=0, col=1, title="Peak Row Trend")
-        self.plot_batch_trend.setLabel('bottom', 'X Position (px)')
-        self.plot_batch_trend.setLabel('left', 'Intensity')
-        self.plot_batch_trend.showGrid(x=True, y=True, alpha=0.3)
-        
-        bottom_layout.addWidget(self.win_batch_sub, 4)
+        # 左下角空白格：佔位使欄寬與上方縱剖面對齊
+        corner = self.win_batch_top.addPlot(row=1, col=0)
+        corner.hideAxis("left")
+        corner.hideAxis("bottom")
+        corner.hideAxis("top")
+        corner.hideAxis("right")
+        corner.titleLabel.hide()
+        configure_stable_plot_item(corner, mouse_enabled=False)
+        self.plot_batch_corner = corner
 
-        group_switch_widget = QWidget()
-        group_switch_layout = QVBoxLayout(group_switch_widget)
-        group_switch_layout.setAlignment(Qt.AlignCenter)
+        self.plot_batch_y_profile.setYLink(self.plot_batch_heat)
+        self.plot_batch_x_profile.setXLink(self.plot_batch_heat)
 
-        lbl_switch_title = QLabel("資料群組切換")
-        lbl_switch_title.setStyleSheet("font-weight: bold; font-size: 12px; color: #37474F;")
-        group_switch_layout.addWidget(lbl_switch_title, alignment=Qt.AlignCenter)
+        # 右側 spacer 欄：吸收多餘寬度，讓熱圖欄可固定為正方形
+        heat_spacer = self.win_batch_top.addPlot(row=0, col=3)
+        heat_spacer.hideAxis("left")
+        heat_spacer.hideAxis("bottom")
+        heat_spacer.hideAxis("top")
+        heat_spacer.hideAxis("right")
+        heat_spacer.titleLabel.hide()
+        configure_stable_plot_item(heat_spacer, mouse_enabled=False)
+        self.plot_batch_heat_spacer = heat_spacer
 
-        h_switch = QHBoxLayout()
-        self.btn_batch_prev = QPushButton("◀")
-        self.btn_batch_prev.setFixedSize(40, 40)
-        self.btn_batch_prev.setStyleSheet("QPushButton { font-size: 14px; font-weight: bold; background-color: #E0E0E0; border-radius: 4px; } QPushButton:hover { background-color: #BDBDBD; }")
-        self.btn_batch_prev.clicked.connect(self.batch_go_prev)
-        h_switch.addWidget(self.btn_batch_prev)
+        # 剖面條等寬等高；熱圖格子改由 resize 強制 1:1（勿再用 stretch 拉寬）
+        configure_equal_profile_strips(self.win_batch_top, profile_col=0, profile_row=1)
+        self.win_batch_top.ci.layout.setColumnStretchFactor(1, 0)
+        self.win_batch_top.ci.layout.setColumnStretchFactor(2, 0)
+        self.win_batch_top.ci.layout.setColumnStretchFactor(3, 1)
+        self.win_batch_top.ci.layout.setRowStretchFactor(0, 0)
 
-        self.lbl_batch_group_num = QLabel("0 / 0")
-        self.lbl_batch_group_num.setStyleSheet("font-size: 16px; font-weight: bold; color: #D81B60; padding: 0 10px;")
-        h_switch.addWidget(self.lbl_batch_group_num)
+        # 軸寬固定，讓剖面 ViewBox 邊長一致
+        self.plot_batch_y_profile.getAxis("left").setWidth(PROFILE_SIDE_AXIS_PX)
+        self.plot_batch_y_profile.getAxis("top").setHeight(PROFILE_EDGE_AXIS_PX)
+        self.plot_batch_x_profile.getAxis("right").setWidth(PROFILE_SIDE_AXIS_PX)
+        self.plot_batch_x_profile.getAxis("bottom").setHeight(PROFILE_EDGE_AXIS_PX)
+        self.plot_batch_heat.getAxis("left").setWidth(0)
+        self.plot_batch_heat.getAxis("bottom").setHeight(0)
 
-        self.btn_batch_next = QPushButton("▶")
-        self.btn_batch_next.setFixedSize(40, 40)
-        self.btn_batch_next.setStyleSheet("QPushButton { font-size: 14px; font-weight: bold; background-color: #E0E0E0; border-radius: 4px; } QPushButton:hover { background-color: #BDBDBD; }")
-        self.btn_batch_next.clicked.connect(self.batch_go_next)
-        h_switch.addWidget(self.btn_batch_next)
+        apply_readable_plot_theme(
+            self.win_batch_top,
+            [self.plot_batch_heat, self.plot_batch_x_profile, self.plot_batch_y_profile],
+            transparent_view_plots=[
+                self.plot_batch_heat,
+                self.plot_batch_corner,
+                self.plot_batch_heat_spacer,
+            ],
+        )
+        set_heatmap_view_transparent(self.plot_batch_heat)
+        set_heatmap_view_transparent(self.plot_batch_corner)
+        set_heatmap_view_transparent(self.plot_batch_heat_spacer)
 
-        group_switch_layout.addLayout(h_switch)
-        bottom_layout.addWidget(group_switch_widget, 1)
+        # 視窗縮放時同步熱圖正方形外框
+        self._batch_square_layout_filter = _BatchSquareHeatLayoutFilter(self)
+        self.win_batch_top.installEventFilter(self._batch_square_layout_filter)
+        self.sync_batch_heatmap_square_layout()
 
-        right_layout.addWidget(bottom_layout_container, 2)
+        right_layout.addWidget(self.win_batch_top, 1)
         splitter.addWidget(right_panel)
 
     # ---------------------------------------------------------
@@ -1160,12 +1221,29 @@ class DataRayBatchTab(QWidget):
                 float(np.max(self.batch_result_matrix)),
             )
 
+            # 載入後強制對齊檔案 XY 範圍（避免卡在 0,0 邊緣）
+            self._batch_profile_view_ready = False
+            if self.chk_batch_pixel_profile.isChecked():
+                h, w = self.batch_result_matrix.shape
+                if self.batch_profile_point is None:
+                    self.set_batch_profile_point(w // 2, h // 2, reset_view=True)
+                else:
+                    cx, cy = self.batch_profile_point
+                    self.set_batch_profile_point(
+                        min(cx, w - 1), min(cy, h - 1), reset_view=True
+                    )
+            else:
+                self.fit_batch_heatmap_to_data()
+
             self.lbl_batch_status.setText(f"狀態: 已載入第 {idx + 1}/{self.batch_total_count} 組")
             self.lbl_batch_status.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 12px;")
 
             self._apply_saved_batch_params(idx)
             self.update_batch_calculations(silent=True)
             self.render_sub_plots_fast(self.batch_result_matrix)
+            self.fit_batch_heatmap_to_data()
+            if self.chk_batch_pixel_profile.isChecked() and self.batch_profile_point is not None:
+                self.update_batch_inline_profiles(reset_view=True)
 
             # 若 M1/M2 視窗已開，同步換成當前組資料
             self._refresh_open_batch_viewers()
@@ -1182,6 +1260,7 @@ class DataRayBatchTab(QWidget):
                     self.viewer_batch_m1_win.image_item.setImage(self.matrix1.T, autoLevels=False)
                     min_v, max_v = float(np.min(self.matrix1)), float(np.max(self.matrix1))
                     self.viewer_batch_m1_win.hist.setLevels(min_v, max_v)
+                    self.viewer_batch_m1_win.reset_view_to_data()
             except RuntimeError:
                 self.viewer_batch_m1_win = None
         if self.matrix2 is not None and getattr(self, "viewer_batch_m2_win", None) is not None:
@@ -1191,6 +1270,7 @@ class DataRayBatchTab(QWidget):
                     self.viewer_batch_m2_win.image_item.setImage(self.matrix2.T, autoLevels=False)
                     min_v, max_v = float(np.min(self.matrix2)), float(np.max(self.matrix2))
                     self.viewer_batch_m2_win.hist.setLevels(min_v, max_v)
+                    self.viewer_batch_m2_win.reset_view_to_data()
             except RuntimeError:
                 self.viewer_batch_m2_win = None
     def batch_go_prev(self):
@@ -1333,6 +1413,9 @@ class DataRayBatchTab(QWidget):
                 f"• Result_Result.xlsx\n"
                 f"• Result_Spot_Analysis.xlsx\n"
                 f"• Result_Heatmap.png\n"
+                f"• Result_V_Profile.png（縱剖面）\n"
+                f"• Result_H_Profile.png（橫剖面）\n"
+                f"• Result_Heatmap_With_Profiles.png（熱圖＋剖面合成）\n"
                 f"• Result_Contour.png"
             )
         except Exception as e:
@@ -1540,6 +1623,9 @@ class DataRayBatchTab(QWidget):
         heatmap_img_path = f"{base_path}_Heatmap.png"
         pg_export.ImageExporter(self.plot_batch_heat).export(heatmap_img_path)
 
+        # 一併匯出當下點選的縱／橫剖面與合成圖
+        self._export_batch_profile_images(base_path)
+
         contour_img_path = f"{base_path}_Contour.png"
         smoothed = uniform_filter(self.batch_result_matrix, size=31, mode='nearest')
         temp_win = pg.GraphicsLayoutWidget()
@@ -1560,44 +1646,53 @@ class DataRayBatchTab(QWidget):
         temp_win.deleteLater()
         return spot_rows
 
+    def _export_batch_profile_images(self, base_path):
+        """匯出當下點選座標的 V／H 剖面圖，以及熱圖＋剖面合成圖。"""
+        if self.batch_result_matrix is None:
+            return
+
+        # 確保有剖面點並刷新曲線
+        if self.chk_batch_pixel_profile.isChecked():
+            h, w = self.batch_result_matrix.shape
+            if self.batch_profile_point is None:
+                self.set_batch_profile_point(w // 2, h // 2, reset_view=True)
+            else:
+                cx, cy = self.batch_profile_point
+                self.set_batch_profile_point(cx, cy, reset_view=False)
+                # 匯出前對齊視野，畫面與檔案一致
+                self.fit_batch_heatmap_to_data()
+                self.update_batch_inline_profiles(reset_view=True)
+
+        QApplication.processEvents()
+
+        v_path = f"{base_path}_V_Profile.png"
+        h_path = f"{base_path}_H_Profile.png"
+        composite_path = f"{base_path}_Heatmap_With_Profiles.png"
+
+        try:
+            pg_export.ImageExporter(self.plot_batch_y_profile).export(v_path)
+        except Exception:
+            pass
+        try:
+            pg_export.ImageExporter(self.plot_batch_x_profile).export(h_path)
+        except Exception:
+            pass
+        try:
+            # 合成：熱圖 + 左／下剖面 + 色條（與畫面所見一致）
+            pix = self.win_batch_top.grab()
+            if not pix.isNull():
+                pix.save(composite_path, "PNG")
+        except Exception:
+            pass
+
     # ================== 子圖表與 UI 連動 ==================
     def on_colorbar_levels_changed(self):
-        if self.batch_result_matrix is not None:
-            min_lvl, max_lvl = self.batch_hist.getLevels()
-            self.plot_batch_hist.setXRange(min_lvl, max_lvl, padding=0)
+        """色條範圍變更；下方直方圖已移除，保留 hook 供 HistogramLUT 連線。"""
+        return
 
     def render_sub_plots_fast(self, matrix):
-        self.plot_batch_hist.clear()
-        self.plot_batch_trend.clear()
-        if matrix is None: return
-
-        total_pixels = matrix.size
-        sample_data = matrix.ravel()[::10] if total_pixels > 1000000 else matrix.ravel()
-        y_counts, x_edges = np.histogram(sample_data, bins=40)
-        
-        bar_item = pg.BarGraphItem(x0=x_edges[:-1], x1=x_edges[1:], height=y_counts, brush='#E91E63', pen=None)
-        self.plot_batch_hist.addItem(bar_item)
-        
-        peak_val = np.max(matrix)
-        v_line_peak = pg.InfiniteLine(pos=peak_val, angle=90, pen=pg.mkPen('r', width=2, style=Qt.DashLine))
-        self.plot_batch_hist.addItem(v_line_peak)
-        
-        min_lvl, max_lvl = self.batch_hist.getLevels()
-        self.plot_batch_hist.setXRange(min_lvl, max_lvl, padding=0)
-        
-        peak_idx = np.unravel_index(np.argmax(matrix, axis=None), matrix.shape)
-        peak_row = peak_idx[0]
-
-        row_profile = matrix[peak_row, :]
-        x_axis = np.arange(len(row_profile))
-        
-        trend_curve = pg.PlotCurveItem(x_axis, row_profile, pen=pg.mkPen('#00E5FF', width=1.5))
-        peak_col = np.argmax(row_profile)
-        peak_spot = pg.ScatterPlotItem(x=[peak_col], y=[row_profile[peak_col]], symbol='o', size=8, brush='y', pen='r')
-        
-        self.plot_batch_trend.addItem(trend_curve)
-        self.plot_batch_trend.addItem(peak_spot)
-        self.plot_batch_trend.setTitle(f"Peak Row Trend (Row Index: {peak_row})")
+        """舊版 Peak 分布／Row Trend 子圖已移除；保留空實作以免呼叫端報錯。"""
+        return
 
     def redraw_batch_crosses(self):
         for item in self.batch_cross_items:
@@ -2081,12 +2176,19 @@ class DataRayBatchTab(QWidget):
             self.lbl_batch_group_nav.setText("0 / 0")
 
     def on_batch_process_mouse_clicked(self, evt):
-        """手動第二點：對齊單次模式，點擊 Process Result Heatmap。"""
+        """點擊主熱圖：更新像素剖面；雙擊座標圖／熱圖：還原剖面與視野。"""
         if self.batch_result_matrix is None:
             return
-        if not self.radio_batch_p2_manual.isChecked():
-            return
         pos = evt.scenePos()
+
+        # 雙擊左／下剖面座標圖 → 還原到影像中心與完整視野
+        on_x_profile = self.plot_batch_x_profile.sceneBoundingRect().contains(pos)
+        on_y_profile = self.plot_batch_y_profile.sceneBoundingRect().contains(pos)
+        if on_x_profile or on_y_profile:
+            if evt.double() and self.chk_batch_pixel_profile.isChecked():
+                self.reset_batch_profile_view()
+            return
+
         if not self.plot_batch_heat.sceneBoundingRect().contains(pos):
             return
         mouse_point = self.plot_batch_heat.getViewBox().mapSceneToView(pos)
@@ -2095,11 +2197,257 @@ class DataRayBatchTab(QWidget):
         h, w = self.batch_result_matrix.shape
         if not (0 <= cx < w and 0 <= cy < h):
             return
+
+        # 雙擊熱圖 → 還原剖面
         if evt.double():
-            self.batch_m2_center_point = None
-        else:
-            self.batch_m2_center_point = (cx, cy)
+            if self.chk_batch_pixel_profile.isChecked():
+                self.reset_batch_profile_view()
+            if self.radio_batch_p2_manual.isChecked():
+                self.batch_m2_center_point = None
+                self.update_batch_calculations()
+            return
+
+        if self.chk_batch_pixel_profile.isChecked():
+            self.set_batch_profile_point(cx, cy)
+
+        if not self.radio_batch_p2_manual.isChecked():
+            return
+        self.batch_m2_center_point = (cx, cy)
         self.update_batch_calculations()
+
+    def on_batch_pixel_profile_toggled(self, checked):
+        if not checked:
+            self.clear_batch_profile_cross()
+            self.plot_batch_x_profile.clear()
+            self.plot_batch_y_profile.clear()
+            # 標題保持隱藏，避免跑版
+            self.plot_batch_x_profile.titleLabel.hide()
+            self.plot_batch_y_profile.titleLabel.hide()
+            configure_stable_plot_item(self.plot_batch_x_profile, mouse_enabled=True)
+            configure_stable_plot_item(self.plot_batch_y_profile, mouse_enabled=True)
+            return
+        if self.batch_profile_point is not None:
+            cx, cy = self.batch_profile_point
+            self.set_batch_profile_point(cx, cy, reset_view=True)
+
+    def reset_batch_profile_view(self):
+        """雙擊還原：剖面點回到影像中心，視野回到完整影像範圍。"""
+        if self.batch_result_matrix is None:
+            return
+        h, w = self.batch_result_matrix.shape
+        self.set_batch_profile_point(w // 2, h // 2, reset_view=True)
+
+    def sync_batch_heatmap_square_layout(self):
+        """縮短熱圖欄寬，使中間座標／影像外框為正方形。"""
+        if not hasattr(self, "win_batch_top") or not hasattr(self, "plot_batch_heat"):
+            return
+        try:
+            enforce_square_heatmap_cell(
+                self.win_batch_top,
+                self.plot_batch_heat,
+                heat_col=1,
+                heat_row=0,
+                profile_col=0,
+                profile_row=1,
+                hist_col=2,
+                spacer_col=3,
+            )
+        except Exception:
+            pass
+
+    def fit_batch_heatmap_to_data(self):
+        """依目前矩陣尺寸對齊 XY，並強制 1:1 像素長寬比（正方形像素，不變形）。"""
+        if self.batch_result_matrix is None:
+            return
+        # 先固定外框為正方形，再對齊資料範圍
+        self.sync_batch_heatmap_square_layout()
+        h, w = self.batch_result_matrix.shape
+        x1, y1 = float(max(w, 1)), float(max(h, 1))
+
+        # 暫時解除連結，避免強度軸範圍污染空間軸
+        try:
+            self.plot_batch_y_profile.setYLink(None)
+            self.plot_batch_x_profile.setXLink(None)
+        except Exception:
+            pass
+
+        heat_vb = self.plot_batch_heat.getViewBox()
+        if heat_vb is not None:
+            try:
+                heat_vb.enableAutoRange(x=False, y=False)
+                # 強制資料座標 X/Y 尺度相等（正方形像素）
+                heat_vb.setAspectLocked(lock=True, ratio=1.0)
+                if self.batch_image_item is not None:
+                    heat_vb.autoRange(items=[self.batch_image_item], padding=0.0)
+                else:
+                    heat_vb.setRange(xRange=(0.0, x1), yRange=(0.0, y1), padding=0.0)
+                heat_vb.enableAutoRange(x=False, y=False)
+                heat_vb.setLimits(
+                    xMin=-x1 * 0.05, xMax=x1 * 1.05, yMin=-y1 * 0.05, yMax=y1 * 1.05
+                )
+                # 再次鎖定，防止後續連結更新把比例拉開
+                heat_vb.setAspectLocked(lock=True, ratio=1.0)
+            except Exception:
+                lock_plot_ranges(self.plot_batch_heat, x_range=(0.0, x1), y_range=(0.0, y1))
+                try:
+                    heat_vb.setAspectLocked(lock=True, ratio=1.0)
+                except Exception:
+                    pass
+
+        # 剖面：空間軸對齊影像；強度軸另設
+        try:
+            self.plot_batch_x_profile.setXRange(0.0, x1, padding=0)
+            self.plot_batch_y_profile.setYRange(0.0, y1, padding=0)
+        except Exception:
+            pass
+
+        try:
+            self.plot_batch_y_profile.setYLink(self.plot_batch_heat)
+            self.plot_batch_x_profile.setXLink(self.plot_batch_heat)
+        except Exception:
+            pass
+
+        configure_stable_plot_item(self.plot_batch_heat, mouse_enabled=True)
+        configure_stable_plot_item(self.plot_batch_x_profile, mouse_enabled=True)
+        configure_stable_plot_item(self.plot_batch_y_profile, mouse_enabled=True)
+        # 縮放互動後仍維持正方形像素與外框
+        try:
+            self.plot_batch_heat.getViewBox().setAspectLocked(lock=True, ratio=1.0)
+        except Exception:
+            pass
+        set_heatmap_view_transparent(self.plot_batch_heat)
+        self.sync_batch_heatmap_square_layout()
+        self._batch_profile_view_ready = True
+
+    def set_batch_profile_point(self, cx, cy, reset_view=False):
+        """在點擊處畫剖面十字，並更新左／下像素剖面。"""
+        if self.batch_result_matrix is None:
+            return
+        h, w = self.batch_result_matrix.shape
+        cx = int(max(0, min(w - 1, cx)))
+        cy = int(max(0, min(h - 1, cy)))
+        self.batch_profile_point = (cx, cy)
+        self.redraw_batch_profile_cross()
+        self.update_batch_inline_profiles(reset_view=reset_view)
+        if hasattr(self, "btn_batch_view_cross"):
+            self.btn_batch_view_cross.setEnabled(True)
+        # 同步獨立十字波形視窗（若已開啟）
+        if getattr(self, "cross_batch_profile_win", None) is not None:
+            try:
+                if self.cross_batch_profile_win.isVisible():
+                    self.cross_batch_profile_win.update_profiles(
+                        self.batch_result_matrix, cx, cy
+                    )
+            except Exception:
+                pass
+
+    def clear_batch_profile_cross(self):
+        for item in self.batch_profile_cross_items:
+            self.plot_batch_heat.removeItem(item)
+        self.batch_profile_cross_items.clear()
+
+    def redraw_batch_profile_cross(self):
+        self.clear_batch_profile_cross()
+        if (
+            not self.chk_batch_pixel_profile.isChecked()
+            or self.batch_profile_point is None
+            or self.batch_result_matrix is None
+        ):
+            return
+        cx, cy = self.batch_profile_point
+        h, w = self.batch_result_matrix.shape
+        pen = pg.mkPen("#FF1744", width=1.5)
+        v_item = pg.PlotCurveItem(x=[cx, cx], y=[0, h], pen=pen)
+        h_item = pg.PlotCurveItem(x=[0, w], y=[cy, cy], pen=pen)
+        self.plot_batch_heat.addItem(v_item)
+        self.plot_batch_heat.addItem(h_item)
+        self.batch_profile_cross_items.extend([v_item, h_item])
+
+    def update_batch_inline_profiles(self, reset_view=False):
+        if self.batch_result_matrix is None or self.batch_profile_point is None:
+            return
+        if not self.chk_batch_pixel_profile.isChecked():
+            return
+        cx, cy = self.batch_profile_point
+        h, w = self.batch_result_matrix.shape
+        x_profile = self.batch_result_matrix[cy, :]
+        y_profile = self.batch_result_matrix[:, cx]
+        x_axis = np.arange(w)
+        y_axis = np.arange(h)
+
+        # 更新曲線時暫時斷開連結，避免 clear/add 觸發錯誤 auto-range 污染熱圖
+        try:
+            self.plot_batch_y_profile.setYLink(None)
+            self.plot_batch_x_profile.setXLink(None)
+        except Exception:
+            pass
+
+        self.plot_batch_x_profile.clear()
+        self.plot_batch_y_profile.clear()
+
+        self.plot_batch_x_profile.addItem(
+            pg.PlotCurveItem(x_axis, x_profile, pen=pg.mkPen("#00ACC1", width=1.5))
+        )
+        self.plot_batch_x_profile.addItem(
+            pg.InfiniteLine(
+                pos=cx, angle=90, pen=pg.mkPen("#FF1744", width=1, style=Qt.DashLine)
+            )
+        )
+
+        self.plot_batch_y_profile.addItem(
+            pg.PlotCurveItem(y_profile, y_axis, pen=pg.mkPen("#FF5722", width=1.5))
+        )
+        self.plot_batch_y_profile.addItem(
+            pg.InfiniteLine(
+                pos=cy, angle=0, pen=pg.mkPen("#FF1744", width=1, style=Qt.DashLine)
+            )
+        )
+
+        self.plot_batch_x_profile.titleLabel.hide()
+        self.plot_batch_y_profile.titleLabel.hide()
+        self.plot_batch_x_profile.setToolTip(f"Horizontal profile at Y = {cy}")
+        self.plot_batch_y_profile.setToolTip(f"Vertical profile at X = {cx}")
+
+        intensity_max = float(max(np.max(x_profile), np.max(y_profile), 1.0))
+        x1, y1 = float(max(w, 1)), float(max(h, 1))
+
+        if reset_view or not getattr(self, "_batch_profile_view_ready", False):
+            self.fit_batch_heatmap_to_data()
+            lock_plot_ranges(
+                self.plot_batch_x_profile,
+                x_range=(0.0, x1),
+                y_range=(0.0, intensity_max * 1.05),
+            )
+            lock_plot_ranges(
+                self.plot_batch_y_profile,
+                x_range=(0.0, intensity_max * 1.05),
+                y_range=(0.0, y1),
+            )
+            self._batch_profile_view_ready = True
+        else:
+            # 僅更新強度軸，保留使用者滾輪縮放後的空間座標視野
+            self.plot_batch_x_profile.setYRange(0.0, intensity_max * 1.05, padding=0)
+            self.plot_batch_y_profile.setXRange(0.0, intensity_max * 1.05, padding=0)
+            try:
+                self.plot_batch_x_profile.getViewBox().enableAutoRange(x=False, y=False)
+                self.plot_batch_y_profile.getViewBox().enableAutoRange(x=False, y=False)
+            except Exception:
+                pass
+
+        try:
+            self.plot_batch_y_profile.setYLink(self.plot_batch_heat)
+            self.plot_batch_x_profile.setXLink(self.plot_batch_heat)
+        except Exception:
+            pass
+
+        configure_stable_plot_item(self.plot_batch_x_profile, mouse_enabled=True)
+        configure_stable_plot_item(self.plot_batch_y_profile, mouse_enabled=True)
+        configure_stable_plot_item(self.plot_batch_heat, mouse_enabled=True)
+        try:
+            self.plot_batch_heat.getViewBox().setAspectLocked(lock=True, ratio=1.0)
+        except Exception:
+            pass
+        set_heatmap_view_transparent(self.plot_batch_heat)
 
     def update_batch_calculations(self, silent=False):
         if not hasattr(self, 'matrix1') or self.matrix1 is None:

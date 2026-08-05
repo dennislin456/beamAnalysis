@@ -6,6 +6,185 @@ from PyQt5.QtCore import Qt
 
 
 # =========================================================================
+# 座標／繪圖可讀性主題（淺底＋深色軸，避免黑底看不清）
+# =========================================================================
+PLOT_WIDGET_BG = "#E8EEF2"
+PLOT_VIEW_BG = "#FAFBFC"
+PLOT_AXIS_COLOR = "#263238"
+PLOT_WIDGET_STYLE = (
+    f"border: 1px solid #90A4AE; background-color: {PLOT_WIDGET_BG};"
+)
+# 剖面訊號區目標邊長（縱剖面寬 ≈ 橫剖面高）
+PROFILE_VIEW_PX = 130
+PROFILE_SIDE_AXIS_PX = 48   # V 左軸／H 右軸
+PROFILE_EDGE_AXIS_PX = 28   # V 上軸／H 下軸
+
+
+def apply_readable_plot_theme(widget, plots=None, transparent_view_plots=None):
+    """套用淺色背景與深色座標軸；可指定透明 ViewBox（去除白底）。"""
+    if widget is not None:
+        widget.setStyleSheet(PLOT_WIDGET_STYLE)
+        if hasattr(widget, "setBackground"):
+            widget.setBackground(PLOT_WIDGET_BG)
+
+    pen = pg.mkPen(PLOT_AXIS_COLOR, width=1)
+    transparent = set(transparent_view_plots or [])
+    for plot in (plots or []):
+        if plot is None:
+            continue
+        for axis_name in ("left", "bottom", "top", "right"):
+            try:
+                ax = plot.getAxis(axis_name)
+            except Exception:
+                continue
+            ax.setPen(pen)
+            ax.setTextPen(pen)
+        vb = plot.getViewBox()
+        if vb is not None:
+            if plot in transparent:
+                vb.setBackgroundColor(None)
+            else:
+                vb.setBackgroundColor(PLOT_VIEW_BG)
+
+
+def set_heatmap_view_transparent(plot):
+    """完全移除熱圖座標區白色背景（ViewBox 透明，不留白邊）。"""
+    if plot is None:
+        return
+    vb = plot.getViewBox()
+    if vb is not None:
+        vb.setBackgroundColor(None)
+    # 避免 PlotItem 本身再鋪一層底色
+    try:
+        plot.setContentsMargins(0, 0, 0, 0)
+    except Exception:
+        pass
+
+
+def configure_equal_profile_strips(layout_widget, profile_col=0, profile_row=1):
+    """讓縱剖面欄寬與橫剖面列高一致，訊號 ViewBox 視覺尺寸相同。"""
+    if layout_widget is None or not hasattr(layout_widget, "ci"):
+        return
+    col_w = PROFILE_VIEW_PX + PROFILE_SIDE_AXIS_PX
+    row_h = PROFILE_VIEW_PX + PROFILE_EDGE_AXIS_PX
+    layout = layout_widget.ci.layout
+    layout.setColumnFixedWidth(profile_col, col_w)
+    layout.setRowFixedHeight(profile_row, row_h)
+    layout.setColumnStretchFactor(profile_col, 0)
+    layout.setRowStretchFactor(profile_row, 0)
+
+
+def enforce_square_heatmap_cell(
+    layout_widget,
+    heat_plot,
+    heat_col=1,
+    heat_row=0,
+    profile_col=0,
+    profile_row=1,
+    hist_col=2,
+    spacer_col=3,
+    hist_width=110,
+    margin_px=8,
+):
+    """
+    將熱圖格子強制為正方形（寬＝高），多餘寬度留給右側 spacer。
+    若有標題列，列高會加上標題高度，讓實際 ViewBox 接近 1:1。
+    """
+    if layout_widget is None or heat_plot is None or not hasattr(layout_widget, "ci"):
+        return 0
+    layout = layout_widget.ci.layout
+    profile_col_w = PROFILE_VIEW_PX + PROFILE_SIDE_AXIS_PX
+    profile_row_h = PROFILE_VIEW_PX + PROFILE_EDGE_AXIS_PX
+
+    title_h = 0
+    try:
+        if hasattr(heat_plot, "titleLabel") and heat_plot.titleLabel is not None:
+            if heat_plot.titleLabel.isVisible():
+                title_h = int(max(0.0, heat_plot.titleLabel.boundingRect().height()))
+    except Exception:
+        title_h = 0
+
+    avail_w = int(layout_widget.width()) - profile_col_w - int(hist_width) - int(margin_px) * 2
+    avail_h = int(layout_widget.height()) - profile_row_h - int(margin_px) * 2 - title_h
+    side = max(80, min(avail_w, avail_h))
+
+    # 熱圖欄／列固定為正方形（列含標題）
+    layout.setColumnFixedWidth(heat_col, side)
+    layout.setRowFixedHeight(heat_row, side + title_h)
+    layout.setColumnStretchFactor(heat_col, 0)
+    layout.setRowStretchFactor(heat_row, 0)
+
+    # 色條欄固定寬，避免把熱圖拉開
+    try:
+        layout.setColumnFixedWidth(hist_col, int(hist_width))
+        layout.setColumnStretchFactor(hist_col, 0)
+    except Exception:
+        pass
+
+    # 右側剩餘空間給 spacer 欄（可無 item，僅佔伸縮）
+    try:
+        layout.setColumnStretchFactor(spacer_col, 1)
+        layout.setColumnMinimumWidth(spacer_col, 0)
+    except Exception:
+        pass
+
+    # 剖面條維持等寬等高
+    configure_equal_profile_strips(
+        layout_widget, profile_col=profile_col, profile_row=profile_row
+    )
+    return side
+
+
+def configure_stable_plot_item(plot, mouse_enabled=False):
+    """穩定座標圖：隱藏 Auto(A) 鈕與右鍵選單；可開啟滾輪／拖曳縮放。"""
+    if plot is None:
+        return
+    try:
+        plot.hideButtons()
+    except Exception:
+        pass
+    try:
+        plot.setMenuEnabled(False)
+    except Exception:
+        pass
+    plot.setDefaultPadding(0)
+    vb = plot.getViewBox()
+    if vb is not None:
+        vb.setMouseEnabled(x=bool(mouse_enabled), y=bool(mouse_enabled))
+        vb.setMenuEnabled(False)
+        # 關閉自動範圍，避免縮放後外框被拉動；仍可用滾輪手動縮放
+        try:
+            vb.enableAutoRange(x=False, y=False)
+        except Exception:
+            pass
+        if hasattr(vb, "autoBtn"):
+            try:
+                vb.autoBtn.hide()
+            except Exception:
+                pass
+
+
+def lock_plot_ranges(plot, x_range=None, y_range=None):
+    """設定範圍並關閉 auto-range，避免外框被自動縮放拉動。"""
+    if plot is None:
+        return
+    vb = plot.getViewBox()
+    if x_range is not None:
+        plot.setXRange(x_range[0], x_range[1], padding=0)
+    if y_range is not None:
+        plot.setYRange(y_range[0], y_range[1], padding=0)
+    if vb is not None:
+        try:
+            vb.enableAutoRange(x=False, y=False)
+        except Exception:
+            pass
+    try:
+        plot.hideButtons()
+    except Exception:
+        pass
+
+
+# =========================================================================
 # 光斑定位演算法（M1／M2 共用）
 # =========================================================================
 def estimate_border_background(matrix):
@@ -295,7 +474,7 @@ class NoWheelDoubleSpinBox(QDoubleSpinBox):
         event.ignore()
 
 # =========================================================================
-# 共用彈出視窗：M1 / M2 熱圖檢視
+# 共用彈出視窗：M1 / M2 熱圖檢視（純熱圖，不含剖面）
 # =========================================================================
 class HeatmapViewerWindow(QMainWindow):
     def __init__(self, title, matrix_data, app_parent=None, is_m1=False):
@@ -321,7 +500,6 @@ class HeatmapViewerWindow(QMainWindow):
         layout.addLayout(toolbar)
 
         self.win = pg.GraphicsLayoutWidget()
-        self.win.setStyleSheet("border: 1px solid #d0d0d0; background-color: black;")
         layout.addWidget(self.win)
 
         colors = [(0, 0, 255), (0, 255, 255), (0, 255, 0), (255, 255, 0), (255, 0, 0)]
@@ -332,8 +510,9 @@ class HeatmapViewerWindow(QMainWindow):
         self.plot = self.win.addPlot(row=0, col=0, title=title)
         self.plot.getViewBox().invertY(False)
         self.plot.setAspectLocked(True)
-        self.plot.setLabel('bottom', 'X Pixels')
-        self.plot.setLabel('left', 'Y Pixels')
+        self.plot.setLabel("bottom", "X Pixels")
+        self.plot.setLabel("left", "Y Pixels")
+        configure_stable_plot_item(self.plot, mouse_enabled=True)
 
         self.image_item = pg.ImageItem()
         self.plot.addItem(self.image_item)
@@ -350,14 +529,20 @@ class HeatmapViewerWindow(QMainWindow):
 
         self.marker_items = []
 
+        apply_readable_plot_theme(
+            self.win, [self.plot], transparent_view_plots=[self.plot]
+        )
+        set_heatmap_view_transparent(self.plot)
+
         if matrix_data is not None:
             self.image_item.setImage(matrix_data.T)
             min_v, max_v = float(np.min(matrix_data)), float(np.max(matrix_data))
             self.hist.setHistogramRange(min_v, max_v)
             self.hist.setLevels(min_v, max_v)
+            self.reset_view_to_data()
 
-        if self.is_m1:
-            self.plot.scene().sigMouseClicked.connect(self.on_m1_mouse_clicked)
+        # 雙擊復原視野；M1 手動模式另處理單擊
+        self.plot.scene().sigMouseClicked.connect(self.on_viewer_mouse_clicked)
 
         # 若 parent 已勾選黑白，開啟時同步
         parent_gray = False
@@ -371,16 +556,70 @@ class HeatmapViewerWindow(QMainWindow):
             self.chk_grayscale.blockSignals(False)
             self.set_grayscale(True)
 
-        # 這裡會安全地向 parent 請求座標，即使屬性不存在也不會崩潰
         p1 = getattr(self.app_parent, "m1_center_point", None) if self.app_parent else None
-        
-        click_pts = getattr(self.app_parent, "click_points", [])
+        if p1 is None and self.app_parent is not None:
+            p1 = getattr(self.app_parent, "batch_m1_center_point", None)
+
+        click_pts = getattr(self.app_parent, "click_points", []) if self.app_parent else []
         p2 = click_pts[1] if (self.app_parent and len(click_pts) >= 2) else None
-        
+        if p2 is None and self.app_parent is not None:
+            p2 = getattr(self.app_parent, "batch_m2_center_point", None)
+
+        pt3 = None
+        r2 = r3 = None
+        if self.app_parent is not None and not self.is_m1:
+            pt3 = getattr(self.app_parent, "batch_m2_above_point", None)
+            r2 = getattr(self.app_parent, "batch_m2_below_circle_r", None)
+            r3 = getattr(self.app_parent, "batch_m2_above_circle_r", None)
+
         if not self.is_m1:
-            self.draw_marker(p1, pt2=p2)
+            self.draw_marker(p1, pt2=p2, pt3=pt3, r2=r2, r3=r3)
         elif p1 is not None:
             self.draw_marker(p1)
+
+        # 標記線加完後再鎖一次範圍，避免被線段拉大
+        self.reset_view_to_data()
+
+    def showEvent(self, event):
+        """視窗真正顯示後再套一次資料範圍（此時才有正確長寬比）。"""
+        super().showEvent(event)
+        self.reset_view_to_data()
+
+    def reset_view_to_data(self):
+        """將視野復原到影像完整 XY 範圍（對應檔案矩陣尺寸）。"""
+        if self.matrix_data is None:
+            return
+        h, w = self.matrix_data.shape
+        x1, y1 = float(max(w, 1)), float(max(h, 1))
+        vb = self.plot.getViewBox()
+        if vb is not None:
+            try:
+                # 以 ImageItem 實際邊界為準（避免十字線把範圍拉大）
+                vb.enableAutoRange(x=False, y=False)
+                if self.image_item is not None:
+                    vb.setAspectLocked(True)
+                    vb.autoRange(items=[self.image_item], padding=0.0)
+                else:
+                    vb.setAspectLocked(False)
+                    vb.setRange(xRange=(0.0, x1), yRange=(0.0, y1), padding=0.0)
+                    vb.setAspectLocked(True)
+            except Exception:
+                lock_plot_ranges(self.plot, x_range=(0.0, x1), y_range=(0.0, y1))
+            try:
+                vb.setLimits(xMin=-x1 * 0.05, xMax=x1 * 1.05, yMin=-y1 * 0.05, yMax=y1 * 1.05)
+            except Exception:
+                pass
+            try:
+                vb.enableAutoRange(x=False, y=False)
+            except Exception:
+                pass
+        else:
+            lock_plot_ranges(self.plot, x_range=(0.0, x1), y_range=(0.0, y1))
+        try:
+            self.plot.hideButtons()
+        except Exception:
+            pass
+        set_heatmap_view_transparent(self.plot)
 
     def set_grayscale(self, enabled):
         """外部同步黑白／彩色模式。"""
@@ -401,44 +640,57 @@ class HeatmapViewerWindow(QMainWindow):
         title = self._base_title + (" [Grayscale]" if grayscale else "")
         self.plot.setTitle(title)
 
-    def on_m1_mouse_clicked(self, evt):
-        if self.matrix_data is None or self.app_parent is None:
+    def on_viewer_mouse_clicked(self, evt):
+        """雙擊：復原 XY 視野；M1 手動模式單擊：設定中心點。"""
+        if self.matrix_data is None:
             return
-        
-        # 兼容 DataRay 單檔與 Batch 兩種命名
-        radio_manual = getattr(self.app_parent, "radio_m1_manual", None)
-        if not radio_manual:
-            radio_manual = getattr(self.app_parent, "radio_batch_m1_manual", None)
-            
-        if not radio_manual or not radio_manual.isChecked():
-            return
-        
         pos = evt.scenePos()
-        if self.plot.sceneBoundingRect().contains(pos):
+        if not self.plot.sceneBoundingRect().contains(pos):
+            return
+
+        if evt.double():
+            self.reset_view_to_data()
+            # M1 手動：雙擊仍可清除中心點
+            if self.is_m1:
+                self._apply_m1_manual_click(None, clear=True)
+            return
+
+        if self.is_m1:
             mouse_point = self.plot.getViewBox().mapSceneToView(pos)
             cx = int(round(mouse_point.x()))
             cy = int(round(mouse_point.y()))
             h, w = self.matrix_data.shape
-            
             if 0 <= cx < w and 0 <= cy < h:
-                is_batch = hasattr(self.app_parent, "batch_m1_center_point")
-                
-                if evt.double():
-                    if is_batch:
-                        self.app_parent.batch_m1_center_point = None
-                        self.app_parent.update_batch_calculations()
-                    else:
-                        self.app_parent.m1_center_point = None
-                        self.app_parent.update_all_m1_markers()
-                        self.app_parent.sync_dual_points_after_m1_change()
-                else:
-                    if is_batch:
-                        self.app_parent.batch_m1_center_point = (cx, cy)
-                        self.app_parent.update_batch_calculations()
-                    else:
-                        self.app_parent.m1_center_point = (cx, cy)
-                        self.app_parent.update_all_m1_markers()
-                        self.app_parent.sync_dual_points_after_m1_change()
+                self._apply_m1_manual_click((cx, cy), clear=False)
+
+    def _apply_m1_manual_click(self, point, clear=False):
+        if self.app_parent is None:
+            return
+        radio_manual = getattr(self.app_parent, "radio_m1_manual", None)
+        if not radio_manual:
+            radio_manual = getattr(self.app_parent, "radio_batch_m1_manual", None)
+        if not radio_manual or not radio_manual.isChecked():
+            return
+
+        is_batch = hasattr(self.app_parent, "batch_m1_center_point")
+        if clear:
+            if is_batch:
+                self.app_parent.batch_m1_center_point = None
+                self.app_parent.update_batch_calculations()
+            else:
+                self.app_parent.m1_center_point = None
+                self.app_parent.update_all_m1_markers()
+                self.app_parent.sync_dual_points_after_m1_change()
+            return
+
+        cx, cy = point
+        if is_batch:
+            self.app_parent.batch_m1_center_point = (cx, cy)
+            self.app_parent.update_batch_calculations()
+        else:
+            self.app_parent.m1_center_point = (cx, cy)
+            self.app_parent.update_all_m1_markers()
+            self.app_parent.sync_dual_points_after_m1_change()
 
     def draw_marker(self, pt, pt2=None, pt3=None, r2=None, r3=None):
         self.clear_marker()
@@ -529,7 +781,6 @@ class CrossProfileViewerWindow(QMainWindow):
         layout.setContentsMargins(6, 6, 6, 6)
 
         self.win = pg.GraphicsLayoutWidget()
-        self.win.setStyleSheet("border: 1px solid #d0d0d0; background-color: black;")
         layout.addWidget(self.win)
 
         self.plot_x = self.win.addPlot(row=0, col=0, title="X-Axis Cross Profile (Row Intensity)")
@@ -541,6 +792,8 @@ class CrossProfileViewerWindow(QMainWindow):
         self.plot_y.setLabel('bottom', 'Y Position (px)')
         self.plot_y.setLabel('left', 'Intensity')
         self.plot_y.showGrid(x=True, y=True, alpha=0.3)
+
+        apply_readable_plot_theme(self.win, [self.plot_x, self.plot_y])
 
     def update_profiles(self, matrix, cx, cy, y_range=None):
         if matrix is None:
@@ -595,10 +848,12 @@ class ContourBatchViewerWindow(QMainWindow):
         
         self.img_item = pg.ImageItem(self.matrix_data.T)
         self.plot.addItem(self.img_item)
+
+        apply_readable_plot_theme(self.win, [self.plot])
         
         # 產生等高線
         min_v, max_v = float(np.min(matrix_data)), float(np.max(matrix_data))
         levels = np.linspace(min_v, max_v, 10)
         for level in levels:
-            iso = pg.IsocurveItem(data=self.matrix_data.T, level=level, pen=pg.mkPen('w', width=0.8))
+            iso = pg.IsocurveItem(data=self.matrix_data.T, level=level, pen=pg.mkPen('#263238', width=0.8))
             self.plot.addItem(iso)

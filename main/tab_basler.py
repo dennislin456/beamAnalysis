@@ -15,7 +15,10 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
 from PyQt5.QtCore import Qt
 
 # 💡 匯入共用的元件 (稍後會在 shared_components.py 提供)
-from shared_components import NoWheelSpinBox, NoWheelDoubleSpinBox, CrossProfileViewerWindow
+from shared_components import (
+    NoWheelSpinBox, NoWheelDoubleSpinBox, CrossProfileViewerWindow,
+    apply_readable_plot_theme,
+)
 
 class BaslerTab(QWidget):
     def __init__(self, parent=None):
@@ -390,7 +393,6 @@ class BaslerTab(QWidget):
         right_splitter = QSplitter(Qt.Vertical)
         
         self.win_basler = pg.GraphicsLayoutWidget()
-        self.win_basler.setStyleSheet("border: 1px solid #d0d0d0; background-color: black;")
         
         colors = [(0, 0, 255), (0, 255, 255), (0, 255, 0), (255, 255, 0), (255, 0, 0)]
         pos = np.linspace(0.0, 1.0, len(colors))
@@ -405,8 +407,8 @@ class BaslerTab(QWidget):
         self.basler_image_item = pg.ImageItem()
         self.plot_basler.addItem(self.basler_image_item)
 
-        self.basler_v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('w', width=1, style=Qt.DashLine))
-        self.basler_h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('w', width=1, style=Qt.DashLine))
+        self.basler_v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#37474F', width=1, style=Qt.DashLine))
+        self.basler_h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('#37474F', width=1, style=Qt.DashLine))
         self.plot_basler.addItem(self.basler_v_line, ignoreBounds=True)
         self.plot_basler.addItem(self.basler_h_line, ignoreBounds=True)
         self.basler_v_line.hide()
@@ -417,6 +419,8 @@ class BaslerTab(QWidget):
         self.basler_hist.gradient.setColorMap(jet_map)
         self.basler_hist.sigLevelsChanged.connect(self.on_basler_colorbar_changed)
         self.win_basler.addItem(self.basler_hist, row=0, col=1)
+
+        apply_readable_plot_theme(self.win_basler, [self.plot_basler])
         
         self.plot_basler.scene().sigMouseMoved.connect(self.on_basler_mouse_moved)
         self.plot_basler.scene().sigMouseClicked.connect(self.on_basler_scene_clicked)
@@ -426,10 +430,9 @@ class BaslerTab(QWidget):
 
         scroll_x_column = QScrollArea()
         scroll_x_column.setWidgetResizable(True)
-        scroll_x_column.setStyleSheet("QScrollArea { border: 1px solid #d0d0d0; background-color: black; }")
+        scroll_x_column.setStyleSheet("QScrollArea { border: 1px solid #90A4AE; background-color: #E8EEF2; }")
 
         self.win_basler_x_col = pg.GraphicsLayoutWidget()
-        self.win_basler_x_col.setStyleSheet("background-color: black;")
         self.win_basler_x_col.setMinimumHeight(480)
 
         self.plot_basler_x_profile = self.win_basler_x_col.addPlot(row=0, col=0, title="X-Axis Intensity Profile (Linear Scale)")
@@ -442,14 +445,17 @@ class BaslerTab(QWidget):
         self.plot_basler_x_log_profile.setLabel('left', 'Log10(Intensity)')
         self.plot_basler_x_log_profile.showGrid(x=True, y=True, alpha=0.3)
 
+        apply_readable_plot_theme(
+            self.win_basler_x_col,
+            [self.plot_basler_x_profile, self.plot_basler_x_log_profile],
+        )
         scroll_x_column.setWidget(self.win_basler_x_col)
 
         scroll_y_column = QScrollArea()
         scroll_y_column.setWidgetResizable(True)
-        scroll_y_column.setStyleSheet("QScrollArea { border: 1px solid #d0d0d0; background-color: black; }")
+        scroll_y_column.setStyleSheet("QScrollArea { border: 1px solid #90A4AE; background-color: #E8EEF2; }")
 
         self.win_basler_y_col = pg.GraphicsLayoutWidget()
-        self.win_basler_y_col.setStyleSheet("background-color: black;")
         self.win_basler_y_col.setMinimumHeight(480)
 
         self.plot_basler_y_profile = self.win_basler_y_col.addPlot(row=0, col=0, title="Y-Axis Intensity Profile (Linear Scale)")
@@ -462,6 +468,10 @@ class BaslerTab(QWidget):
         self.plot_basler_y_log_profile.setLabel('left', 'Log10(Intensity)')
         self.plot_basler_y_log_profile.showGrid(x=True, y=True, alpha=0.3)
 
+        apply_readable_plot_theme(
+            self.win_basler_y_col,
+            [self.plot_basler_y_profile, self.plot_basler_y_log_profile],
+        )
         scroll_y_column.setWidget(self.win_basler_y_col)
 
         bottom_horizontal_splitter.addWidget(scroll_x_column)
