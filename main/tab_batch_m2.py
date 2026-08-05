@@ -12,7 +12,7 @@ from scipy.ndimage import uniform_filter
 
 from PyQt5.QtWidgets import (
     QLabel, QFileDialog, QMessageBox, QApplication, QDialog,
-    QHBoxLayout, QGridLayout, QCheckBox,
+    QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QCheckBox,
 )
 from PyQt5.QtCore import Qt
 
@@ -104,6 +104,13 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             left_layout = self.radio_batch_p2_auto_min.parentWidget().layout()
         insert_idx = left_layout.indexOf(self.radio_batch_p2_auto_min)
 
+        if hasattr(self, "batch_left_scroll"):
+            self.batch_left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        if hasattr(self, "batch_left_settings_widget"):
+            self.batch_left_settings_widget.setStyleSheet(
+                "QLabel, QCheckBox, QRadioButton, QSpinBox, QDoubleSpinBox { font-size: 11px; }"
+            )
+
         # 波谷搜尋框選：僅調整 XYWH 輸入排成緊湊 2×2
         self.chk_batch_valley_roi = QCheckBox(
             "啟用波谷搜尋框選（僅在框內縱切找低谷，區分 above／below）"
@@ -117,43 +124,60 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         left_layout.insertWidget(insert_idx, self.chk_batch_valley_roi)
         insert_idx += 1
 
-        roi_grid = QGridLayout()
-        roi_grid.setContentsMargins(0, 0, 0, 0)
-        roi_grid.setHorizontalSpacing(6)
-        roi_grid.setVerticalSpacing(4)
+        roi_widget = QWidget()
+        roi_h_layout = QHBoxLayout(roi_widget)
+        roi_h_layout.setContentsMargins(0, 0, 0, 0)
+        roi_h_layout.setSpacing(6)
+
+        left_col = QWidget()
+        left_col_layout = QVBoxLayout(left_col)
+        left_col_layout.setContentsMargins(0, 0, 0, 0)
+        left_col_layout.setSpacing(2)
         self.lbl_batch_valley_roi_x = QLabel("X")
+        self.lbl_batch_valley_roi_x.setStyleSheet("font-size: 11px;")
         self.spin_batch_valley_roi_x = NoWheelSpinBox()
         self.spin_batch_valley_roi_x.setRange(0, 100000)
         self.spin_batch_valley_roi_x.setValue(0)
-        self.spin_batch_valley_roi_x.setFixedWidth(72)
+        self.spin_batch_valley_roi_x.setFixedWidth(64)
         self.spin_batch_valley_roi_x.valueChanged.connect(self._on_valley_roi_changed)
-        self.lbl_batch_valley_roi_y = QLabel("Y")
-        self.spin_batch_valley_roi_y = NoWheelSpinBox()
-        self.spin_batch_valley_roi_y.setRange(0, 100000)
-        self.spin_batch_valley_roi_y.setValue(0)
-        self.spin_batch_valley_roi_y.setFixedWidth(72)
-        self.spin_batch_valley_roi_y.valueChanged.connect(self._on_valley_roi_changed)
         self.lbl_batch_valley_roi_w = QLabel("W")
+        self.lbl_batch_valley_roi_w.setStyleSheet("font-size: 11px;")
         self.spin_batch_valley_roi_w = NoWheelSpinBox()
         self.spin_batch_valley_roi_w.setRange(1, 100000)
         self.spin_batch_valley_roi_w.setValue(200)
-        self.spin_batch_valley_roi_w.setFixedWidth(72)
+        self.spin_batch_valley_roi_w.setFixedWidth(64)
         self.spin_batch_valley_roi_w.valueChanged.connect(self._on_valley_roi_changed)
+        left_col_layout.addWidget(self.lbl_batch_valley_roi_x)
+        left_col_layout.addWidget(self.spin_batch_valley_roi_x)
+        left_col_layout.addWidget(self.lbl_batch_valley_roi_w)
+        left_col_layout.addWidget(self.spin_batch_valley_roi_w)
+
+        right_col = QWidget()
+        right_col_layout = QVBoxLayout(right_col)
+        right_col_layout.setContentsMargins(0, 0, 0, 0)
+        right_col_layout.setSpacing(2)
+        self.lbl_batch_valley_roi_y = QLabel("Y")
+        self.lbl_batch_valley_roi_y.setStyleSheet("font-size: 11px;")
+        self.spin_batch_valley_roi_y = NoWheelSpinBox()
+        self.spin_batch_valley_roi_y.setRange(0, 100000)
+        self.spin_batch_valley_roi_y.setValue(0)
+        self.spin_batch_valley_roi_y.setFixedWidth(64)
+        self.spin_batch_valley_roi_y.valueChanged.connect(self._on_valley_roi_changed)
         self.lbl_batch_valley_roi_h = QLabel("H")
+        self.lbl_batch_valley_roi_h.setStyleSheet("font-size: 11px;")
         self.spin_batch_valley_roi_h = NoWheelSpinBox()
         self.spin_batch_valley_roi_h.setRange(1, 100000)
         self.spin_batch_valley_roi_h.setValue(200)
-        self.spin_batch_valley_roi_h.setFixedWidth(72)
+        self.spin_batch_valley_roi_h.setFixedWidth(64)
         self.spin_batch_valley_roi_h.valueChanged.connect(self._on_valley_roi_changed)
-        roi_grid.addWidget(self.lbl_batch_valley_roi_x, 0, 0)
-        roi_grid.addWidget(self.spin_batch_valley_roi_x, 0, 1)
-        roi_grid.addWidget(self.lbl_batch_valley_roi_y, 0, 2)
-        roi_grid.addWidget(self.spin_batch_valley_roi_y, 0, 3)
-        roi_grid.addWidget(self.lbl_batch_valley_roi_w, 1, 0)
-        roi_grid.addWidget(self.spin_batch_valley_roi_w, 1, 1)
-        roi_grid.addWidget(self.lbl_batch_valley_roi_h, 1, 2)
-        roi_grid.addWidget(self.spin_batch_valley_roi_h, 1, 3)
-        left_layout.insertLayout(insert_idx, roi_grid)
+        right_col_layout.addWidget(self.lbl_batch_valley_roi_y)
+        right_col_layout.addWidget(self.spin_batch_valley_roi_y)
+        right_col_layout.addWidget(self.lbl_batch_valley_roi_h)
+        right_col_layout.addWidget(self.spin_batch_valley_roi_h)
+
+        roi_h_layout.addWidget(left_col)
+        roi_h_layout.addWidget(right_col)
+        left_layout.insertWidget(insert_idx, roi_widget)
 
         self.lbl_batch_valley_roi_hint = QLabel("")
         self.lbl_batch_valley_roi_hint.hide()
