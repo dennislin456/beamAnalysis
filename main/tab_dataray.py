@@ -19,7 +19,7 @@ from openpyxl.chart import LineChart, Reference
 from shared_components import (NoWheelSpinBox, NoWheelDoubleSpinBox,
                                HeatmapViewerWindow, CrossProfileViewerWindow,
                                compute_auto_spot_center, build_robust_threshold_mask,
-                               split_y_index)
+                               split_y_index, apply_readable_plot_theme)
 
 class DataRayTab(QWidget):
     def __init__(self, parent=None):
@@ -573,7 +573,6 @@ class DataRayTab(QWidget):
         left_sub_splitter = QSplitter(Qt.Vertical)
         
         self.win_top = pg.GraphicsLayoutWidget()
-        self.win_top.setStyleSheet("border: 1px solid #d0d0d0; background-color: black;")
         
         colors = [(0, 0, 255), (0, 255, 255), (0, 255, 0), (255, 255, 0), (255, 0, 0)]
         pos = np.linspace(0.0, 1.0, len(colors))
@@ -592,8 +591,8 @@ class DataRayTab(QWidget):
         self.process_thresh_overlay_item.setZValue(5)
         self.plot_heat.addItem(self.process_thresh_overlay_item)
 
-        self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('w', width=1, style=Qt.DashLine))
-        self.h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('w', width=1, style=Qt.DashLine))
+        self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#37474F', width=1, style=Qt.DashLine))
+        self.h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('#37474F', width=1, style=Qt.DashLine))
         self.plot_heat.addItem(self.v_line, ignoreBounds=True)
         self.plot_heat.addItem(self.h_line, ignoreBounds=True)
         
@@ -608,15 +607,16 @@ class DataRayTab(QWidget):
         self.hist.gradient.setColorMap(jet_map)
         self.hist.sigLevelsChanged.connect(self.on_colorbar_levels_changed)
         self.win_top.addItem(self.hist, row=0, col=1)
+
+        apply_readable_plot_theme(self.win_top, [self.plot_heat])
         
         left_sub_splitter.addWidget(self.win_top)
         
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
-        left_scroll.setStyleSheet("QScrollArea { border: 1px solid #d0d0d0; background-color: black; }")
+        left_scroll.setStyleSheet("QScrollArea { border: 1px solid #90A4AE; background-color: #E8EEF2; }")
         
         self.win_sub = pg.GraphicsLayoutWidget()
-        self.win_sub.setStyleSheet("background-color: black;")
         self.win_sub.setMinimumHeight(400)
         
         self.plot_hist = self.win_sub.addPlot(row=0, col=0, title="Peak Color / Value Distribution")
@@ -628,6 +628,8 @@ class DataRayTab(QWidget):
         self.plot_trend.setLabel('bottom', 'X Position (px)')
         self.plot_trend.setLabel('left', 'Intensity')
         self.plot_trend.showGrid(x=True, y=True, alpha=0.3)
+
+        apply_readable_plot_theme(self.win_sub, [self.plot_hist, self.plot_trend])
         
         left_scroll.setWidget(self.win_sub)
         left_sub_splitter.addWidget(left_scroll)
@@ -640,7 +642,6 @@ class DataRayTab(QWidget):
         right_sub_splitter = QSplitter(Qt.Vertical)
         
         self.win_contour_top = pg.GraphicsLayoutWidget()
-        self.win_contour_top.setStyleSheet("border: 1px solid #d0d0d0; background-color: black;")
         
         self.plot_contour = self.win_contour_top.addPlot(row=0, col=0, title='Moving Average Contour Map')
         self.plot_contour.getViewBox().invertY(False)
@@ -656,19 +657,22 @@ class DataRayTab(QWidget):
         self.contour_hist.gradient.setColorMap(jet_map)
         self.contour_hist.sigLevelsChanged.connect(self.on_contour_colorbar_levels_changed)
         self.win_contour_top.addItem(self.contour_hist, row=0, col=1)
+
+        apply_readable_plot_theme(self.win_contour_top, [self.plot_contour])
         
         self.plot_contour.scene().sigMouseClicked.connect(self.on_contour_scene_clicked)
         
         right_sub_splitter.addWidget(self.win_contour_top)
         
         self.win_contour_profile = pg.GraphicsLayoutWidget()
-        self.win_contour_profile.setStyleSheet("border: 1px solid #d0d0d0; background-color: black;")
         
         self.plot_contour_profile = self.win_contour_profile.addPlot(title="Contour Profile Waveform (Point 1 -> Point 2)")
         self.plot_contour_profile.setLabel('bottom', 'Distance along line (px)')
         self.plot_contour_profile.setLabel('left', 'Intensity')
         self.plot_contour_profile.showGrid(x=True, y=True, alpha=0.3)
         self.plot_contour_profile.getAxis('left').setWidth(50)
+
+        apply_readable_plot_theme(self.win_contour_profile, [self.plot_contour_profile])
         
         right_sub_splitter.addWidget(self.win_contour_profile)
         right_sub_splitter.setStretchFactor(0, 2)

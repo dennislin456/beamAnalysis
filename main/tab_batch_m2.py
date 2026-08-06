@@ -525,6 +525,20 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                 float(np.max(self.batch_result_matrix)),
             )
 
+            # 載入後強制對齊檔案 XY 範圍（避免卡在 0,0 邊緣）
+            self._batch_profile_view_ready = False
+            if self.chk_batch_pixel_profile.isChecked():
+                h, w = self.batch_result_matrix.shape
+                if self.batch_profile_point is None:
+                    self.set_batch_profile_point(w // 2, h // 2, reset_view=True)
+                else:
+                    cx, cy = self.batch_profile_point
+                    self.set_batch_profile_point(
+                        min(cx, w - 1), min(cy, h - 1), reset_view=True
+                    )
+            else:
+                self.fit_batch_heatmap_to_data()
+
             self.lbl_batch_status.setText(
                 f"狀態: 已載入第 {idx + 1}/{self.batch_total_count} 組（M2-only）"
             )
@@ -535,6 +549,10 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             self._apply_saved_batch_params(idx)
             self.update_batch_calculations(silent=True)
             self.render_sub_plots_fast(self.batch_result_matrix)
+            # 計算／標記完成後再對齊一次視野
+            self.fit_batch_heatmap_to_data()
+            if self.chk_batch_pixel_profile.isChecked() and self.batch_profile_point is not None:
+                self.update_batch_inline_profiles(reset_view=True)
             self._refresh_open_batch_viewers()
         except Exception as e:
             self.lbl_batch_status.setText("狀態: 載入失敗")
@@ -902,25 +920,9 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             self.batch_cross_items.append(circle3)
 
     def on_batch_process_mouse_clicked(self, evt):
-        """手動 below：點擊主圖（即 M2）。"""
-        if self.batch_result_matrix is None:
-            return
-        if not self.radio_batch_p2_manual.isChecked():
-            return
-        pos = evt.scenePos()
-        if not self.plot_batch_heat.sceneBoundingRect().contains(pos):
-            return
-        mouse_point = self.plot_batch_heat.getViewBox().mapSceneToView(pos)
-        cx = int(round(mouse_point.x()))
-        cy = int(round(mouse_point.y()))
-        h, w = self.batch_result_matrix.shape
-        if not (0 <= cx < w and 0 <= cy < h):
-            return
-        if evt.double():
-            self.batch_m2_center_point = None
-        else:
-            self.batch_m2_center_point = (cx, cy)
-        self.update_batch_calculations()
+        """點擊主圖（M2）：更新像素剖面；雙擊座標圖／熱圖：還原。"""
+        # 與父類相同的穩定互動邏輯（含剖面雙擊還原）
+        super().on_batch_process_mouse_clicked(evt)
 
     def save_current_batch_params(self):
         if self.batch_total_count == 0:
@@ -1070,7 +1072,8 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             self.btn_batch_export.setEnabled(True)
             QMessageBox.information(
                 self, "成功",
-                f"匯出完成！\n\nZIP：\n{zip_path}\n\n彙整統計 CSV：\n{summary_csv_path}"
+                f"匯出完成！\n\nZIP：\n{zip_path}\n\n彙整統計 CSV：\n{summary_csv_path}\n\n"
+                f"每組含：Heatmap／V_Profile／H_Profile／Heatmap_With_Profiles／Contour 等"
             )
         except Exception as e:
             try:
@@ -1209,6 +1212,9 @@ class DataRayBatchM2Tab(DataRayBatchTab):
 
         heatmap_img_path = f"{base_path}_Heatmap.png"
         pg_export.ImageExporter(self.plot_batch_heat).export(heatmap_img_path)
+
+        # 一併匯出當下點選的縱／橫剖面與合成圖
+        self._export_batch_profile_images(base_path)
 
         contour_img_path = f"{base_path}_Contour.png"
         smoothed = uniform_filter(self.batch_result_matrix, size=31, mode="nearest")
