@@ -311,6 +311,7 @@ class DataRayBatchTab(QWidget):
 
         # 上方固定控制區
         top_fixed_widget = QWidget()
+        top_fixed_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         top_fixed_layout = QVBoxLayout(top_fixed_widget)
         top_fixed_layout.setContentsMargins(12, 12, 12, 12)
 
@@ -490,6 +491,7 @@ class DataRayBatchTab(QWidget):
         # 下方捲動設定區
         self.batch_left_scroll = QScrollArea()
         self.batch_left_scroll.setWidgetResizable(True)
+        self.batch_left_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         left_content = QWidget()
         left_layout = QVBoxLayout(left_content)
         left_layout.setContentsMargins(12, 12, 12, 12)

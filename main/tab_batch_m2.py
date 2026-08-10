@@ -4,6 +4,7 @@
 """
 import os
 import json
+import csv
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
@@ -53,7 +54,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.lbl_batch_m1_info.hide()
 
         self.btn_batch_m2_dir.setText("I. 選擇 M2 主資料夾（含位置子資料夾）")
-        self.lbl_batch_m2_info.setText("未選擇 M2 主資料夾\n格式: M2/<位置>/<檔名>.xlsx")
+        self.lbl_batch_m2_info.setText("未選擇 M2 主資料夾\n格式: M2/<位置>/<檔名>.xlsx/.csv")
         self.lbl_batch_pair_info.setText("掃描結果: 尚未選擇 M2 主資料夾")
 
         # 隱藏 M1→below 距離列
@@ -368,9 +369,9 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         if not loc_map:
             QMessageBox.warning(
                 self, "警告",
-                "此資料夾下找不到「位置子資料夾／Excel」結構。\n"
-                "預期格式：M2/<位置名>/<檔名>.xlsx\n"
-                "或如 beamImage/… 下各位置資料夾內的 .xlsx"
+                "此資料夾下找不到「位置子資料夾／Excel 或 CSV」結構。\n"
+                "預期格式：M2/<位置名>/<檔名>.xlsx/.csv\n"
+                "或如 beamImage/… 下各位置資料夾內的 .xlsx/.csv"
             )
             return
         self.batch_m2_root = dir_path
@@ -395,8 +396,8 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         if not self.batch_available_locations:
             QMessageBox.warning(
                 self, "警告",
-                "找不到任何位置子資料夾內的 Excel！\n"
-                "請確認結構為 M2/<位置>/<檔名>.xlsx"
+                "找不到任何位置子資料夾內的 Excel 或 CSV！\n"
+                "請確認結構為 M2/<位置>/<檔名>.xlsx/.csv"
             )
             return
 
@@ -465,6 +466,106 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         # 與父類相容：cache 仍為 (m1, m2)，此處 m1=None
         self.batch_matrix_cache[idx] = (None, m2)
         return None, m2
+
+    def _scan_location_files(self, root_dir):
+        """掃描主資料夾 → {位置名: {檔名: 完整路徑}}，M2-only 也支援 CSV。"""
+        result = {}
+        if not root_dir or not os.path.isdir(root_dir):
+            return result
+        try:
+            entries = os.listdir(root_dir)
+        except OSError:
+            return result
+        for entry in entries:
+            loc_path = os.path.join(root_dir, entry)
+            if not os.path.isdir(loc_path):
+                continue
+            files = {}
+            try:
+                for fname in os.listdir(loc_path):
+                    if fname.startswith("~$"):
+                        continue
+                    lower = fname.lower()
+                    if lower.endswith((".xlsx", ".xls", ".csv")):
+                        files[fname] = os.path.join(loc_path, fname)
+            except OSError:
+                continue
+            if files:
+                result[entry] = files
+        return result
+
+    def _read_csv_matrix(self, path):
+        def is_numeric(cell):
+            if cell is None:
+                return False
+            s = str(cell).strip()
+            if s == "":
+                return False
+            try:
+                float(s)
+                return True
+            except ValueError:
+                return False
+
+        data_start = None
+        with open(path, newline="", encoding="utf-8", errors="replace") as f:
+            reader = csv.reader(f)
+            for idx, row in enumerate(reader):
+                if not row:
+                    continue
+                numeric_count = sum(1 for cell in row if is_numeric(cell))
+                if numeric_count >= max(3, len(row) // 2):
+                    data_start = idx
+                    break
+        if data_start is None:
+            raise ValueError(f"找不到可解析的矩陣資料：{path}")
+
+        df = pd.read_csv(path, header=None, skiprows=data_start, encoding="utf-8-sig")
+        df = df.apply(lambda col: pd.to_numeric(col, errors="coerce"))
+        df = df.dropna(how="all").dropna(how="all", axis=1)
+
+        # 偵測並移除 CSV 檔案中的標題列或座標軸欄。
+        if self._is_header_row(df.iloc[0]):
+            df = df.iloc[1:]
+        if self._is_coordinate_column(df.iloc[:, 0]):
+            df = df.iloc[:, 1:]
+
+        return df.astype(float).values
+
+    def _is_header_row(self, row):
+        if row.isna().all():
+            return False
+
+        values = [v for v in row.tolist() if pd.notna(v)]
+        if len(values) < 3:
+            return False
+
+        try:
+            ints = [int(v) for v in values]
+        except (ValueError, TypeError):
+            return False
+
+        if ints == list(range(1, len(ints) + 1)):
+            return True
+
+        return False
+
+    def _is_coordinate_column(self, col):
+        values = col.dropna().tolist()
+        if len(values) < 3:
+            return False
+        if not all(isinstance(v, (int, float, np.integer, np.floating)) for v in values):
+            return False
+
+        increasing = all(values[i] < values[i + 1] for i in range(len(values) - 1))
+        decreasing = all(values[i] > values[i + 1] for i in range(len(values) - 1))
+        return increasing or decreasing
+
+    def _read_excel_matrix(self, path):
+        lower = path.lower()
+        if lower.endswith(".csv"):
+            return self._read_csv_matrix(path)
+        return super()._read_excel_matrix(path)
 
     def _result_cache_key(self, idx):
         return (idx, "m2_only")
