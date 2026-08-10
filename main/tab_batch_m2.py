@@ -54,7 +54,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.lbl_batch_m1_info.hide()
 
         self.btn_batch_m2_dir.setText("I. 選擇 M2 主資料夾（含位置子資料夾）")
-        self.lbl_batch_m2_info.setText("未選擇 M2 主資料夾\n格式: M2/<位置>/<檔名>.xlsx 或 <檔名>.csv")
+        self.lbl_batch_m2_info.setText("未選擇 M2 主資料夾\n格式: M2/<位置>/<檔名>.xlsx / .csv / .npy")
         self.lbl_batch_pair_info.setText("掃描結果: 尚未選擇 M2 主資料夾")
 
         # 隱藏 M1→below 距離列

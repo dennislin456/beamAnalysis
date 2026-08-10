@@ -1388,6 +1388,8 @@ class DataRayBatchTab(QWidget):
                 f"每組內容：\n"
                 f"• Result.json\n"
                 f"• Result_Result.xlsx\n"
+                f"• Result_Result.csv\n"
+                f"• Result_Result.npy\n"
                 f"• Result_Spot_Analysis.xlsx\n"
                 f"• Result_Heatmap.png\n"
                 f"• Result_V_Profile.png（縱剖面）\n"
@@ -1503,6 +1505,12 @@ class DataRayBatchTab(QWidget):
 
         excel_img_path = f"{base_path}_Result.xlsx"
         pd.DataFrame(self.batch_result_matrix).to_excel(excel_img_path, index=False, header=False)
+
+        csv_img_path = f"{base_path}_Result.csv"
+        pd.DataFrame(self.batch_result_matrix).to_csv(csv_img_path, index=False, header=False)
+
+        npy_img_path = f"{base_path}_Result.npy"
+        np.save(npy_img_path, self.batch_result_matrix)
 
         spot_analysis_excel_path = f"{base_path}_Spot_Analysis.xlsx"
         wb_spot = openpyxl.Workbook()

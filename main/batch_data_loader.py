@@ -31,7 +31,7 @@ def scan_location_files(root_dir):
                 if fname.startswith("~$"):
                     continue
                 lower = fname.lower()
-                if lower.endswith((".xlsx", ".xls", ".csv")):
+                if lower.endswith((".xlsx", ".xls", ".csv", ".npy")):
                     files[fname] = os.path.join(loc_path, fname)
         except OSError:
             continue
@@ -43,19 +43,28 @@ def scan_location_files(root_dir):
 
 
 def load_numeric_matrix(path):
-    """載入 CSV 或 Excel，回傳數值矩陣。"""
+    """載入 CSV / Excel / NPY，回傳數值矩陣。"""
     if not path:
         raise ValueError("No file path provided")
 
     lower = str(path).lower()
     if lower.endswith(".csv"):
         return _read_csv_matrix(path)
+    if lower.endswith(".npy"):
+        return _read_npy_matrix(path)
     return _read_excel_matrix(path)
 
 
 def _read_excel_matrix(path):
     df = pd.read_excel(path, header=None, skiprows=4)
     return df.dropna(how="all").astype(float).to_numpy()
+
+
+def _read_npy_matrix(path):
+    arr = np.load(path)
+    if isinstance(arr, np.ndarray):
+        return np.asarray(arr, dtype=float)
+    raise ValueError(f"NPY content is not a numeric array: {path}")
 
 
 def _read_csv_matrix(path):
