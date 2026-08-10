@@ -34,3 +34,16 @@ def test_load_numeric_matrix_reads_csv_block(tmp_path):
 
     assert matrix.shape == (3, 2)
     np.testing.assert_array_equal(matrix, np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))
+
+
+def test_scan_and_load_npy_matrix(tmp_path):
+    loc_dir = tmp_path / "siteB"
+    loc_dir.mkdir()
+    npy_path = loc_dir / "sample.npy"
+    np.save(npy_path, np.array([[1.0, 2.0], [3.0, 4.0]]))
+
+    result = scan_location_files(str(tmp_path))
+    assert "sample.npy" in result["siteB"]
+
+    matrix = load_numeric_matrix(str(npy_path))
+    np.testing.assert_array_equal(matrix, np.array([[1.0, 2.0], [3.0, 4.0]]))

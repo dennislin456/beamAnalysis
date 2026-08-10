@@ -15,6 +15,8 @@ from PyQt5.QtCore import Qt, QTimer
 import openpyxl
 from openpyxl.chart import LineChart, Reference
 
+from batch_data_loader import load_numeric_matrix
+
 # 💡 這裡將匯入共用的元件 (之後會統一放在 shared_components.py 中)
 from shared_components import (NoWheelSpinBox, NoWheelDoubleSpinBox,
                                HeatmapViewerWindow, CrossProfileViewerWindow,
@@ -1574,7 +1576,12 @@ class DataRayTab(QWidget):
         self.update_isocurves_and_waveform()
 
     def load_file1(self):
-        path, _ = QFileDialog.getOpenFileName(self, "選擇 Excel 數據檔案", "", "Excel Files (*.xlsx *.xls)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "選擇數據檔案",
+            "",
+            "Data Files (*.xlsx *.xls *.csv *.npy)"
+        )
         if path:
             self.file1_path = path
             self.lbl_file1.setText(os.path.basename(path))
@@ -1594,7 +1601,12 @@ class DataRayTab(QWidget):
                 self.lbl_file2.setText(os.path.basename(path))
                 self.lbl_file2.setStyleSheet("color: #212121; font-size: 11px;")
         else:
-            path, _ = QFileDialog.getOpenFileName(self, "選擇第二個 Excel 檔案", "", "Excel Files (*.xlsx *.xls)")
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "選擇第二個數據檔案",
+                "",
+                "Data Files (*.xlsx *.xls *.csv *.npy)"
+            )
             if path:
                 self.file2_path = path
                 self.lbl_file2.setText(os.path.basename(path))
@@ -1687,7 +1699,15 @@ class DataRayTab(QWidget):
             if is_dual_file_mode:
                 excel_img_path = f"{base_path}_Result.xlsx"
                 pd.DataFrame(self.result_matrix).to_excel(excel_img_path, index=False, header=False)
-                excel_saved_msg = f"算完數據檔: {os.path.basename(excel_img_path)}\n"
+                excel_saved_msg = f"算完數據 Excel: {os.path.basename(excel_img_path)}\n"
+
+                csv_img_path = f"{base_path}_Result.csv"
+                pd.DataFrame(self.result_matrix).to_csv(csv_img_path, index=False, header=False)
+                excel_saved_msg += f"算完數據 CSV: {os.path.basename(csv_img_path)}\n"
+
+                npy_img_path = f"{base_path}_Result.npy"
+                np.save(npy_img_path, self.result_matrix)
+                excel_saved_msg += f"算完數據 NPY: {os.path.basename(npy_img_path)}\n"
 
             spot_analysis_excel_path = f"{base_path}_Spot_Analysis.xlsx"
             wb_spot = openpyxl.Workbook()
@@ -1786,7 +1806,7 @@ class DataRayTab(QWidget):
 
             QMessageBox.information(
                 self, "成功", 
-                f"匯出完成！已儲存至：\n\n{excel_saved_msg}"
+                f"匯出完成！已儲存至：\n\n{result_export_msg}"
                 f"{spot_analysis_msg}"
                 f"JSON 參數檔: {os.path.basename(path)}\n"
                 f"Contour 圖: {os.path.basename(contour_img_path)}\n"
@@ -1808,8 +1828,7 @@ class DataRayTab(QWidget):
             self.lbl_status.setStyleSheet("color: #F57C00; font-weight: bold;")
             QApplication.processEvents()
 
-            df1 = pd.read_excel(self.file1_path, header=None, skiprows=4)
-            self.matrix1 = df1.dropna(how='all').astype(float).values
+            self.matrix1 = load_numeric_matrix(self.file1_path)
             self.matrix2 = None
             self.result_matrix = self.matrix1
 
@@ -1938,8 +1957,7 @@ class DataRayTab(QWidget):
             self.lbl_status.setStyleSheet("color: #F57C00; font-weight: bold;")
             self.repaint() # 取代 QApplication.processEvents()
             
-            df1 = pd.read_excel(self.file1_path, header=None, skiprows=4)
-            self.matrix1 = df1.dropna(how='all').astype(float).values
+            self.matrix1 = load_numeric_matrix(self.file1_path)
             self.matrix2 = None
             self.result_matrix = self.matrix1
 
@@ -1978,10 +1996,8 @@ class DataRayTab(QWidget):
             self.lbl_status.setStyleSheet("color: #F57C00; font-weight: bold;")
             self.repaint()
             
-            df1 = pd.read_excel(self.file1_path, header=None, skiprows=4)
-            df2 = pd.read_excel(self.file2_path, header=None, skiprows=4)
-            m1 = df1.dropna(how='all').astype(float).values
-            m2 = df2.dropna(how='all').astype(float).values
+            m1 = load_numeric_matrix(self.file1_path)
+            m2 = load_numeric_matrix(self.file2_path)
             
             if m1.shape != m2.shape:
                 raise ValueError(f"兩個檔案的數據矩陣大小不一致！\n({m1.shape} vs {m2.shape})")
@@ -2037,10 +2053,8 @@ class DataRayTab(QWidget):
             self.lbl_status.setStyleSheet("color: #F57C00; font-weight: bold;")
             self.repaint()
             
-            df1 = pd.read_excel(self.file1_path, header=None, skiprows=4)
-            df2 = pd.read_excel(self.file2_path, header=None, skiprows=4)
-            m1 = df1.dropna(how='all').astype(float).values
-            m2 = df2.dropna(how='all').astype(float).values
+            m1 = load_numeric_matrix(self.file1_path)
+            m2 = load_numeric_matrix(self.file2_path)
             
             if m1.shape != m2.shape:
                 raise ValueError(f"兩個檔案的數據矩陣大小不一致！\n({m1.shape} vs {m2.shape})")
@@ -2097,10 +2111,8 @@ class DataRayTab(QWidget):
             self.lbl_status.setStyleSheet("color: #F57C00; font-weight: bold;")
             self.repaint()
             
-            df1 = pd.read_excel(self.file1_path, header=None, skiprows=4)
-            df2 = pd.read_excel(self.file2_path, header=None, skiprows=4)
-            self.matrix1 = df1.dropna(how='all').astype(float).values
-            self.matrix2 = df2.dropna(how='all').astype(float).values
+            self.matrix1 = load_numeric_matrix(self.file1_path)
+            self.matrix2 = load_numeric_matrix(self.file2_path)
             
             if self.matrix1.shape != self.matrix2.shape:
                 raise ValueError(f"兩個檔案的數據矩陣大小不一致！\n({self.matrix1.shape} vs {self.matrix2.shape})")
