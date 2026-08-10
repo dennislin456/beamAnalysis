@@ -22,6 +22,7 @@ from shared_components import (
     HeatmapViewerWindow, find_dual_peak_valley_y, split_y_index,
     NoWheelSpinBox, clip_roi_to_matrix,
 )
+from batch_data_loader import load_numeric_matrix
 from tab_batch import DataRayBatchTab, LocationConfigDialog
 
 
@@ -53,7 +54,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.lbl_batch_m1_info.hide()
 
         self.btn_batch_m2_dir.setText("I. 選擇 M2 主資料夾（含位置子資料夾）")
-        self.lbl_batch_m2_info.setText("未選擇 M2 主資料夾\n格式: M2/<位置>/<檔名>.xlsx")
+        self.lbl_batch_m2_info.setText("未選擇 M2 主資料夾\n格式: M2/<位置>/<檔名>.xlsx 或 <檔名>.csv")
         self.lbl_batch_pair_info.setText("掃描結果: 尚未選擇 M2 主資料夾")
 
         # 隱藏 M1→below 距離列
@@ -368,9 +369,9 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         if not loc_map:
             QMessageBox.warning(
                 self, "警告",
-                "此資料夾下找不到「位置子資料夾／Excel」結構。\n"
-                "預期格式：M2/<位置名>/<檔名>.xlsx\n"
-                "或如 beamImage/… 下各位置資料夾內的 .xlsx"
+                "此資料夾下找不到「位置子資料夾／Excel或CSV」結構。\n"
+                "預期格式：M2/<位置名>/<檔名>.xlsx 或 <檔名>.csv\n"
+                "或如 beamImage/… 下各位置資料夾內的 .xlsx/.csv"
             )
             return
         self.batch_m2_root = dir_path
@@ -395,8 +396,8 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         if not self.batch_available_locations:
             QMessageBox.warning(
                 self, "警告",
-                "找不到任何位置子資料夾內的 Excel！\n"
-                "請確認結構為 M2/<位置>/<檔名>.xlsx"
+                "找不到任何位置子資料夾內的 Excel/CSV！\n"
+                "請確認結構為 M2/<位置>/<檔名>.xlsx 或 <檔名>.csv"
             )
             return
 
@@ -465,6 +466,9 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         # 與父類相容：cache 仍為 (m1, m2)，此處 m1=None
         self.batch_matrix_cache[idx] = (None, m2)
         return None, m2
+
+    def _read_excel_matrix(self, path):
+        return load_numeric_matrix(path)
 
     def _result_cache_key(self, idx):
         return (idx, "m2_only")

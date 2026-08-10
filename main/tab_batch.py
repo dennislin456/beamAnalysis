@@ -30,6 +30,7 @@ from shared_components import (NoWheelSpinBox, NoWheelDoubleSpinBox,
                                configure_equal_profile_strips,
                                enforce_square_heatmap_cell,
                                PROFILE_SIDE_AXIS_PX, PROFILE_EDGE_AXIS_PX)
+from batch_data_loader import load_numeric_matrix, scan_location_files
 
 
 def _natural_sort_key(name):
@@ -842,30 +843,7 @@ class DataRayBatchTab(QWidget):
 
     def _scan_location_files(self, root_dir):
         """掃描主資料夾 → {位置名: {檔名: 完整路徑}}。"""
-        result = {}
-        if not root_dir or not os.path.isdir(root_dir):
-            return result
-        try:
-            entries = os.listdir(root_dir)
-        except OSError:
-            return result
-        for entry in entries:
-            loc_path = os.path.join(root_dir, entry)
-            if not os.path.isdir(loc_path):
-                continue
-            files = {}
-            try:
-                for fname in os.listdir(loc_path):
-                    if fname.startswith("~$"):
-                        continue
-                    lower = fname.lower()
-                    if lower.endswith(".xlsx") or lower.endswith(".xls"):
-                        files[fname] = os.path.join(loc_path, fname)
-            except OSError:
-                continue
-            if files:
-                result[entry] = files
-        return result
+        return scan_location_files(root_dir)
 
     def _rebuild_batch_pairs(self):
         """掃描並辨識共同位置；實際運算清單由位置配置決定。"""
@@ -1005,8 +983,8 @@ class DataRayBatchTab(QWidget):
         if not loc_map:
             QMessageBox.warning(
                 self, "警告",
-                "此資料夾下找不到「位置子資料夾／Excel」結構。\n"
-                "預期格式：M1/<位置名>/<檔名>.xlsx"
+                "此資料夾下找不到「位置子資料夾／Excel或CSV」結構。\n"
+                "預期格式：M1/<位置名>/<檔名>.xlsx 或 <檔名>.csv"
             )
             return
         self.batch_m1_root = dir_path
@@ -1029,8 +1007,8 @@ class DataRayBatchTab(QWidget):
         if not loc_map:
             QMessageBox.warning(
                 self, "警告",
-                "此資料夾下找不到「位置子資料夾／Excel」結構。\n"
-                "預期格式：M2/<位置名>/<檔名>.xlsx"
+                "此資料夾下找不到「位置子資料夾／Excel或CSV」結構。\n"
+                "預期格式：M2/<位置名>/<檔名>.xlsx 或 <檔名>.csv"
             )
             return
         self.batch_m2_root = dir_path
@@ -1109,8 +1087,7 @@ class DataRayBatchTab(QWidget):
             QMessageBox.critical(self, "錯誤", f"預載失敗: {str(e)}")
 
     def _read_excel_matrix(self, path):
-        df = pd.read_excel(path, header=None, skiprows=4)
-        return df.dropna(how='all').astype(float).values
+        return load_numeric_matrix(path)
 
     def _ensure_matrix_cached(self, idx):
         if idx in self.batch_matrix_cache:
