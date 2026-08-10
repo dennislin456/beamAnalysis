@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QIntValidator
 from PyQt5.QtCore import Qt, QRectF
 
-from shared_components import apply_readable_plot_theme
+from shared_components import InteractiveHeatmapPanel
 
 
 class MappingTab(QWidget):
@@ -21,7 +21,10 @@ class MappingTab(QWidget):
         self.export_dir = ""
         self.mapping_path = ""
         self.mapping_matrix = None
+        self.x_coords = None
+        self.y_coords = None
         self.plot_drawn = False
+        self.contour_line_items = []
         self._setup_ui()
 
     def _setup_ui(self):
@@ -124,53 +127,33 @@ class MappingTab(QWidget):
         right_layout.setContentsMargins(12, 12, 12, 12)
         right_layout.setSpacing(6)
 
-        self.win = pg.GraphicsLayoutWidget()
-        self.win.setStyleSheet("background-color: #E8EEF2;")
-        self.plot = self.win.addPlot(row=0, col=0, title='Mapping Heatmap')
-        self.plot.getViewBox().invertY(False)
-        self.plot.setAspectLocked(True)
-        self.plot.showGrid(x=True, y=True, alpha=0.4)
-        self.plot.setLabel('bottom', 'X Pixels')
-        self.plot.setLabel('left', 'Y Pixels')
-        self.image_item = pg.ImageItem()
-        self.plot.addItem(self.image_item)
+        self.heatmap_panel = InteractiveHeatmapPanel(
+            title="Mapping Heatmap",
+            x_label="X Pixels",
+            y_label="Y Pixels",
+        )
+        self.contour_panel = InteractiveHeatmapPanel(
+            title="Contour Plot",
+            x_label="X (mm)",
+            y_label="Y (mm)",
+        )
 
-        self.proxy = pg.SignalProxy(self.win.scene().sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved)
+        # 相容舊屬性名稱，供匯出與等高線邏輯使用
+        self.plot = self.heatmap_panel.plot
+        self.image_item = self.heatmap_panel.image_item
+        self.hist = self.heatmap_panel.hist
+        self.contour_plot = self.contour_panel.plot
+        self.contour_image_item = self.contour_panel.image_item
+        self.contour_hist = self.contour_panel.hist
 
-        self.hist = pg.HistogramLUTItem()
-        self.hist.setImageItem(self.image_item)
-        pos = np.linspace(0.0, 1.0, 6)
-        colors = [(0, 0, 255), (0, 255, 255), (0, 255, 0), (255, 255, 0), (255, 0, 0), (255, 0, 255)]
-        self.hist.gradient.setColorMap(pg.ColorMap(pos, colors))
-        self.win.addItem(self.hist, row=0, col=1)
+        self.heatmap_panel.mouseMoved.connect(self._on_heatmap_mouse_moved)
 
-        self.contour_win = pg.GraphicsLayoutWidget()
-        self.contour_win.setStyleSheet("background-color: #E8EEF2;")
-        self.contour_plot = self.contour_win.addPlot(row=0, col=0, title='Contour Plot')
-        vb = self.contour_plot.getViewBox()
-        vb.invertY(False)
-        vb.setAspectLocked(True)
-        vb.enableAutoRange(True)
-        self.contour_plot.showGrid(x=True, y=True, alpha=0.4)
-        self.contour_plot.setLabel('bottom', 'X (mm)')
-        self.contour_plot.setLabel('left', 'Y (mm)')
-        self.contour_image_item = pg.ImageItem()
-        self.contour_plot.addItem(self.contour_image_item)
-        self.contour_line_items = []
-
-        self.contour_hist = pg.HistogramLUTItem()
-        self.contour_hist.setImageItem(self.contour_image_item)
-        self.contour_hist.gradient.setColorMap(pg.ColorMap(pos, colors))
-        self.contour_win.addItem(self.contour_hist, row=0, col=1)
-
-        right_layout.addWidget(self.win, 1)
-        right_layout.addWidget(self.contour_win, 1)
+        right_layout.addWidget(self.heatmap_panel, 1)
+        right_layout.addWidget(self.contour_panel, 1)
         self.right_panel = right_panel
         splitter.addWidget(right_panel)
 
         self.setLayout(layout)
-        apply_readable_plot_theme(self.win, [self.plot])
-        apply_readable_plot_theme(self.contour_win, [self.contour_plot])
 
     def _create_hline(self):
         frame = QFrame()
@@ -179,6 +162,26 @@ class MappingTab(QWidget):
         frame.setStyleSheet("color: #c0c0c0;")
         frame.setFixedHeight(1)
         return frame
+
+    def _build_image_rect(self, matrix):
+        if self.x_coords is None or self.y_coords is None:
+            return None
+        x0, x1 = float(self.x_coords[0]), float(self.x_coords[-1])
+        y0, y1 = float(self.y_coords[0]), float(self.y_coords[-1])
+        dx = (x1 - x0) / max(1, len(self.x_coords) - 1)
+        dy = (y1 - y0) / max(1, len(self.y_coords) - 1)
+        return QRectF(x0 - dx / 2, y0 - dy / 2, dx * matrix.shape[1], dy * matrix.shape[0])
+
+    def _finite_minmax(self, matrix):
+        finite = np.asarray(matrix, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            return 0.0, 1.0
+        vmin, vmax = float(np.min(finite)), float(np.max(finite))
+        if vmin == vmax:
+            vmin -= 1.0
+            vmax += 1.0
+        return vmin, vmax
 
     def load_mapping_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -241,41 +244,24 @@ class MappingTab(QWidget):
 
         raw_matrix = self.mapping_matrix
         processed_matrix = self._get_processed_matrix()
-        
-        # 1. 先設定 Heatmap 影像
-        self.image_item.setImage(raw_matrix.T, autoLevels=False)
-        if hasattr(self, 'x_coords') and hasattr(self, 'y_coords') and self.x_coords is not None and self.y_coords is not None:
-            x0, x1 = float(self.x_coords[0]), float(self.x_coords[-1])
-            y0, y1 = float(self.y_coords[0]), float(self.y_coords[-1])
-            dx = (x1 - x0) / max(1, len(self.x_coords) - 1)
-            dy = (y1 - y0) / max(1, len(self.y_coords) - 1)
-            self.image_item.setRect(QRectF(x0 - dx / 2, y0 - dy / 2, dx * raw_matrix.shape[1], dy * raw_matrix.shape[0]))
-            self.plot.setLabel('bottom', 'X (mm)')
-            self.plot.setLabel('left', 'Y (mm)')
-            self.plot.setTitle('Mapping Heatmap (mm)')
+        rect = self._build_image_rect(raw_matrix)
+        raw_min, raw_max = self._finite_minmax(raw_matrix)
+
+        if rect is not None:
+            self.heatmap_panel.set_axis_labels("X (mm)", "Y (mm)")
+            self.heatmap_panel.set_plot_title("Mapping Heatmap (mm)")
         else:
-            self.plot.setTitle('Mapping Heatmap')
+            self.heatmap_panel.set_axis_labels("X Pixels", "Y Pixels")
+            self.heatmap_panel.set_plot_title("Mapping Heatmap")
 
-        # 2. 設定 Heatmap 色階與直方圖範圍
-        raw_min = float(np.nanmin(raw_matrix))
-        raw_max = float(np.nanmax(raw_matrix))
-        if raw_min == raw_max:
-            raw_min -= 1
-            raw_max += 1
-        self.hist.setLevels(raw_min, raw_max)
-        self.hist.setHistogramRange(raw_min, raw_max)
+        self.heatmap_panel.set_image(
+            raw_matrix.T,
+            rect=rect,
+            levels=(raw_min, raw_max),
+            reset_view=True,
+        )
 
-        # 3. 更新等高線圖（內部會對 contour_image_item 執行 setImage）
-        self._update_contour_plot(processed_matrix)
-
-        # 4. 設定等高線圖（右圖）的色階與直方圖範圍
-        contour_min = float(np.nanmin(processed_matrix))
-        contour_max = float(np.nanmax(processed_matrix))
-        if contour_min == contour_max:
-            contour_min -= 1
-            contour_max += 1
-        self.contour_hist.setLevels(contour_min, contour_max)
-        self.contour_hist.setHistogramRange(contour_min, contour_max)
+        self._update_contour_plot(processed_matrix, reset_view=True)
 
         self.lbl_status.setText("狀態: Mapping 圖已繪製")
         self.plot_drawn = True
@@ -297,7 +283,7 @@ class MappingTab(QWidget):
             avg_text = '1'
         avg_value = max(1, int(avg_text))
         self.edit_avg_size.setText(str(avg_value))
-        self._update_contour_plot(self._get_processed_matrix())
+        self._update_contour_plot(self._get_processed_matrix(), reset_view=False)
         self.lbl_status.setText(f"狀態: 已套用 {avg_value} 點平均至 contour")
 
     def _get_processed_matrix(self):
@@ -319,7 +305,6 @@ class MappingTab(QWidget):
         for yi in range(matrix.shape[0]):
             for xi in range(matrix.shape[1]):
                 block = padded[yi:yi + kernel_size, xi:xi + kernel_size]
-                # 檢查區塊是否全部都是 NaN，避免發出 RuntimeWarning
                 if np.isnan(block).all():
                     smoothed[yi, xi] = np.nan
                 else:
@@ -331,32 +316,26 @@ class MappingTab(QWidget):
             self.contour_plot.removeItem(line)
         self.contour_line_items = []
 
-    def _update_contour_plot(self, matrix):
+    def _update_contour_plot(self, matrix, reset_view=False):
         if matrix is None:
             return
 
-        if hasattr(self, 'x_coords') and hasattr(self, 'y_coords') and self.x_coords is not None and self.y_coords is not None:
-            x0, x1 = float(self.x_coords[0]), float(self.x_coords[-1])
-            y0, y1 = float(self.y_coords[0]), float(self.y_coords[-1])
-            dx = (x1 - x0) / max(1, len(self.x_coords) - 1)
-            dy = (y1 - y0) / max(1, len(self.y_coords) - 1)
-            
-            # 確保圖片對齊真實 mm 座標（與左圖完全相同的做法）
-            self.contour_image_item.setImage(matrix.T, autoLevels=False)
-            self.contour_image_item.setRect(QRectF(x0 - dx / 2, y0 - dy / 2, dx * matrix.shape[1], dy * matrix.shape[0]))
-            
-            # 同步更新 Contour Plot 的軸標籤與顯示範圍
-            self.contour_plot.setLabel('bottom', 'X (mm)')
-            self.contour_plot.setLabel('left', 'Y (mm)')
-        else:
-            self.contour_image_item.setImage(matrix.T, autoLevels=False)
-            
+        rect = self._build_image_rect(matrix)
+        contour_min, contour_max = self._finite_minmax(matrix)
         avg_text = self.edit_avg_size.text().strip() or '1'
         avg_size = int(avg_text)
-        self.contour_plot.setTitle(f"Contour Plot ({avg_size} x {avg_size} average)")
+
+        self.contour_panel.set_axis_labels("X (mm)", "Y (mm)")
+        self.contour_panel.set_plot_title(f"Contour Plot ({avg_size} x {avg_size} average)")
+        self.contour_panel.set_image(
+            matrix.T,
+            rect=rect,
+            levels=(contour_min, contour_max),
+            reset_view=reset_view,
+        )
 
         self._clear_contour_lines()
-        levels = np.linspace(np.nanmin(matrix), np.nanmax(matrix), 8)
+        levels = np.linspace(contour_min, contour_max, 8)
         for level in levels:
             segments = self._marching_squares(matrix, level)
             for seg in segments:
@@ -365,6 +344,9 @@ class MappingTab(QWidget):
                 line = pg.PlotDataItem(seg[:, 0], seg[:, 1], pen=pg.mkPen(color=(50, 50, 50), width=1))
                 self.contour_plot.addItem(line)
                 self.contour_line_items.append(line)
+
+        if reset_view:
+            self.contour_panel.reset_view()
 
     def _marching_squares(self, matrix, level):
         ny, nx = matrix.shape
@@ -389,10 +371,10 @@ class MappingTab(QWidget):
                 y0, y1 = self.y_coords[iy], self.y_coords[iy + 1]
                 points = []
 
-                def interp(p1, p2, v1, v2):
-                    if v2 == v1:
+                def interp(p1, p2, vv1, vv2):
+                    if vv2 == vv1:
                         return p1
-                    t = (level - v1) / (v2 - v1)
+                    t = (level - vv1) / (vv2 - vv1)
                     return (p1[0] + t * (p2[0] - p1[0]), p1[1] + t * (p2[1] - p1[1]))
 
                 b0 = v0 >= level
@@ -420,23 +402,27 @@ class MappingTab(QWidget):
                         segments.append(np.array([points[1], points[2]]))
         return segments
 
-    def _on_mouse_moved(self, evt):
-        pos = evt[0]
-        if self.plot.sceneBoundingRect().contains(pos):
-            mouse_point = self.plot.getViewBox().mapSceneToView(pos)
-            x = mouse_point.x()
-            y = mouse_point.y()
-
-            if self.mapping_matrix is not None and hasattr(self, 'x_coords') and hasattr(self, 'y_coords') and self.x_coords is not None and self.y_coords is not None:
-                ix = int(np.clip(np.abs(self.x_coords - x).argmin(), 0, self.mapping_matrix.shape[1] - 1))
-                iy = int(np.clip(np.abs(self.y_coords - y).argmin(), 0, self.mapping_matrix.shape[0] - 1))
-                value = self.mapping_matrix[iy, ix]
-                value_text = 'NaN' if np.isnan(value) else f'{value:.6f}'
-                self.lbl_mouse_info.setText(f"滑鼠位置: X={x:.3f} mm, Y={y:.3f} mm, Value={value_text}")
-            else:
-                self.lbl_mouse_info.setText(f"滑鼠位置: X={x:.3f} mm, Y={y:.3f} mm, Value=--")
-        else:
+    def _on_heatmap_mouse_moved(self, mouse_point):
+        if mouse_point is None:
             self.lbl_mouse_info.setText("滑鼠位置: X=--, Y=--, Value=--")
+            return
+
+        x = mouse_point.x()
+        y = mouse_point.y()
+        if (
+            self.mapping_matrix is not None
+            and self.x_coords is not None
+            and self.y_coords is not None
+        ):
+            ix = int(np.clip(np.abs(self.x_coords - x).argmin(), 0, self.mapping_matrix.shape[1] - 1))
+            iy = int(np.clip(np.abs(self.y_coords - y).argmin(), 0, self.mapping_matrix.shape[0] - 1))
+            value = self.mapping_matrix[iy, ix]
+            value_text = 'NaN' if np.isnan(value) else f'{value:.6f}'
+            self.lbl_mouse_info.setText(
+                f"滑鼠位置: X={x:.3f} mm, Y={y:.3f} mm, Value={value_text}"
+            )
+        else:
+            self.lbl_mouse_info.setText(f"滑鼠位置: X={x:.3f} mm, Y={y:.3f} mm, Value=--")
 
     def export_mapping(self):
         if self.mapping_matrix is None:
@@ -462,20 +448,20 @@ class MappingTab(QWidget):
             heatmap_path = save_path
             contour_path = os.path.join(self.export_dir, f"{base_name}_contour{ext}")
 
-            heatmap_exporter = pg_export.ImageExporter(self.plot)
-            heatmap_exporter.parameters()["width"] = int(self.plot.width())
-            heatmap_exporter.parameters()["height"] = int(self.plot.height())
-            heatmap_exporter.export(heatmap_path)
-
-            contour_exporter = pg_export.ImageExporter(self.contour_plot)
-            contour_exporter.parameters()["width"] = int(self.contour_plot.width())
-            contour_exporter.parameters()["height"] = int(self.contour_plot.height())
-            contour_exporter.export(contour_path)
+            for panel, out_path in (
+                (self.heatmap_panel, heatmap_path),
+                (self.contour_panel, contour_path),
+            ):
+                target = getattr(panel.win, "ci", None) or panel.plot
+                exporter = pg_export.ImageExporter(target)
+                exporter.parameters()["width"] = max(int(panel.win.width()), 400)
+                exporter.parameters()["height"] = max(int(panel.win.height()), 300)
+                exporter.export(out_path)
 
             csv_path = os.path.join(self.export_dir, f"{base_name}.csv")
             with open(csv_path, 'w', encoding='utf-8') as f:
                 f.write('x,y,value\n')
-                if hasattr(self, 'x_coords') and hasattr(self, 'y_coords') and self.x_coords is not None and self.y_coords is not None:
+                if self.x_coords is not None and self.y_coords is not None:
                     for iy, y in enumerate(self.y_coords):
                         for ix, x in enumerate(self.x_coords):
                             value = avg_matrix[iy, ix]

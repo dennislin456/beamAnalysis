@@ -1,8 +1,14 @@
 import numpy as np
 import pyqtgraph as pg
+import pyqtgraph.exporters as pg_export
 from scipy.ndimage import label as ndi_label
-from PyQt5.QtWidgets import QSpinBox, QDoubleSpinBox, QMainWindow, QWidget, QVBoxLayout, QCheckBox, QHBoxLayout
-from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import (
+    QSpinBox, QDoubleSpinBox, QMainWindow, QWidget, QVBoxLayout, QCheckBox,
+    QHBoxLayout, QPushButton, QLabel, QFileDialog, QMessageBox, QInputDialog,
+    QSizePolicy,
+)
+from PyQt5.QtCore import Qt, pyqtSignal, QRectF
+from PyQt5.QtGui import QCursor
 
 
 # =========================================================================
@@ -824,6 +830,403 @@ class CrossProfileViewerWindow(QMainWindow):
         if y_range is not None:
             self.plot_x.setYRange(y_range[0], y_range[1], padding=0)
             self.plot_y.setYRange(y_range[0], y_range[1], padding=0)
+
+# =========================================================================
+# 互動式熱力圖面板（滾輪縮放／拖曳／雙擊復原／色條上下限／匯出）
+# =========================================================================
+_JET_POS = np.linspace(0.0, 1.0, 6)
+_JET_COLORS = [
+    (0, 0, 255), (0, 255, 255), (0, 255, 0),
+    (255, 255, 0), (255, 0, 0), (255, 0, 255),
+]
+
+
+class InteractiveHeatmapPanel(QWidget):
+    """自訂座標熱力圖：滾輪縮放、拖曳平移、雙擊復原視野；
+    色條可直接拖曳紫框上下緣調整上下限（亦可點擊數值精調）；上方可匯出當前圖檔。"""
+
+    levelsChanged = pyqtSignal(float, float)
+    mouseMoved = pyqtSignal(object)  # QPointF in view coords, or None
+    _HIST_RANGE_PAD = 0.18  # 色條可視範圍相對上下限的外擴，方便拖曳拉柄
+
+    def __init__(self, title="Heatmap", parent=None, x_label="X", y_label="Y"):
+        super().__init__(parent)
+        self._title = title
+        self._default_levels = None  # (min, max)
+        self._data_rect = None  # QRectF in data/view coordinates (e.g. mm)
+        self._level_updating = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(4)
+
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(0, 0, 0, 0)
+        toolbar.setSpacing(8)
+
+        self.btn_export = QPushButton("匯出當前圖檔")
+        self.btn_export.setStyleSheet(
+            "QPushButton { font-size: 12px; font-weight: bold; color: white; "
+            "background-color: #0288D1; border: none; border-radius: 4px; "
+            "padding: 5px 12px; }"
+            "QPushButton:hover { background-color: #039BE5; }"
+            "QPushButton:pressed { background-color: #01579B; }"
+            "QPushButton:disabled { background-color: #B0BEC5; }"
+        )
+        self.btn_export.setCursor(QCursor(Qt.PointingHandCursor))
+        self.btn_export.clicked.connect(self.export_current_image)
+        toolbar.addWidget(self.btn_export)
+
+        tip = QLabel("滾輪縮放 · 拖曳平移 · 雙擊圖面復原 · 色條拖曳紫框上下緣調上下限 · 雙擊色條復原")
+        tip.setStyleSheet("color: #607D8B; font-size: 11px;")
+        toolbar.addWidget(tip, 1)
+
+        self.lbl_level_max = QLabel("上限: --")
+        self.lbl_level_min = QLabel("下限: --")
+        for lbl in (self.lbl_level_max, self.lbl_level_min):
+            lbl.setStyleSheet(
+                "QLabel { color: #37474F; font-size: 12px; font-weight: bold; "
+                "padding: 3px 8px; border: 1px solid #B0BEC5; border-radius: 3px; "
+                "background-color: #ECEFF1; }"
+                "QLabel:hover { background-color: #CFD8DC; }"
+            )
+            lbl.setCursor(QCursor(Qt.PointingHandCursor))
+            lbl.setToolTip("主要請直接拖曳右側色條紫框上下緣；點此可精準輸入數值")
+        self.lbl_level_max.mousePressEvent = self._on_max_label_clicked
+        self.lbl_level_min.mousePressEvent = self._on_min_label_clicked
+        toolbar.addWidget(self.lbl_level_max)
+        toolbar.addWidget(self.lbl_level_min)
+        root.addLayout(toolbar)
+
+        self.win = pg.GraphicsLayoutWidget()
+        self.win.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        root.addWidget(self.win, 1)
+
+        self.plot = self.win.addPlot(row=0, col=0, title=title)
+        self.plot.getViewBox().invertY(False)
+        # 強制 X/Y 同比例，圓形資料才不會被拉成橢圓／長條
+        self.plot.getViewBox().setAspectLocked(lock=True, ratio=1.0)
+        self.plot.showGrid(x=True, y=True, alpha=0.4)
+        self.plot.setLabel("bottom", x_label)
+        self.plot.setLabel("left", y_label)
+        configure_stable_plot_item(self.plot, mouse_enabled=True)
+
+        self.image_item = pg.ImageItem()
+        self.plot.addItem(self.image_item)
+
+        self.hist = pg.HistogramLUTItem()
+        self.hist.setImageItem(self.image_item)
+        self.hist.gradient.setColorMap(pg.ColorMap(_JET_POS, _JET_COLORS))
+        self._enable_level_drag()
+        self.win.addItem(self.hist, row=0, col=1)
+
+        apply_readable_plot_theme(self.win, [self.plot])
+
+        self.hist.sigLevelsChanged.connect(self._on_hist_levels_changed)
+        self.plot.scene().sigMouseClicked.connect(self._on_scene_clicked)
+        self._mouse_proxy = pg.SignalProxy(
+            self.win.scene().sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved
+        )
+
+    def _level_region(self):
+        """取得 HistogramLUT 的上下限 LinearRegionItem。"""
+        if hasattr(self.hist, "region") and self.hist.region is not None:
+            return self.hist.region
+        regions = getattr(self.hist, "regions", None)
+        if regions:
+            return regions[0]
+        return None
+
+    def _enable_level_drag(self):
+        """開啟並強化色條上下限拖曳（對齊原本 HistogramLUT 操作）。"""
+        region = self._level_region()
+        if region is None:
+            return
+        try:
+            region.setMovable(True)
+        except Exception:
+            pass
+        try:
+            # 加粗上下限線，較容易抓取拉扯
+            region.setPen(pg.mkPen((80, 80, 200), width=3))
+            region.setHoverPen(pg.mkPen((30, 30, 180), width=4))
+        except Exception:
+            pass
+        try:
+            lines = region.lines if hasattr(region, "lines") else ()
+            for line in lines:
+                line.setMovable(True)
+                if hasattr(line, "setPen"):
+                    line.setPen(pg.mkPen((80, 80, 200), width=3))
+                if hasattr(line, "setHoverPen"):
+                    line.setHoverPen(pg.mkPen((30, 30, 180), width=4))
+        except Exception:
+            pass
+        # 允許在色條上滾動／平移直方圖範圍，方便對準拉柄
+        try:
+            if self.hist.orientation == "vertical":
+                self.hist.vb.setMouseEnabled(x=False, y=True)
+            else:
+                self.hist.vb.setMouseEnabled(x=True, y=False)
+        except Exception:
+            pass
+
+    def _padded_hist_range(self, vmin, vmax):
+        span = max(float(vmax) - float(vmin), 1e-12)
+        pad = self._HIST_RANGE_PAD * span
+        return float(vmin) - pad, float(vmax) + pad
+
+    # ----- public API -------------------------------------------------
+    def set_plot_title(self, title):
+        self._title = title
+        self.plot.setTitle(title)
+
+    def set_axis_labels(self, x_label=None, y_label=None):
+        if x_label is not None:
+            self.plot.setLabel("bottom", x_label)
+        if y_label is not None:
+            self.plot.setLabel("left", y_label)
+
+    def set_image(self, image, rect=None, levels=None, reset_view=True):
+        """image: 已轉置後給 ImageItem 的陣列；levels=(min,max) 可選。"""
+        self.image_item.setImage(image, autoLevels=False)
+        self._apply_data_rect(rect)
+        if levels is not None:
+            self.set_default_levels(levels[0], levels[1], apply=True)
+        elif image is not None:
+            finite = np.asarray(image, dtype=float)
+            finite = finite[np.isfinite(finite)]
+            if finite.size:
+                vmin, vmax = float(np.min(finite)), float(np.max(finite))
+                if vmin == vmax:
+                    vmin -= 1.0
+                    vmax += 1.0
+                self.set_default_levels(vmin, vmax, apply=True)
+        # levels 更新後再套一次 rect，避免 transform 被重設
+        self._apply_data_rect(self._data_rect)
+        if reset_view:
+            self.reset_view()
+
+    def _apply_data_rect(self, rect):
+        """將影像對應到真實座標（mm）；並記住供 reset_view 使用。"""
+        if rect is None:
+            return
+        if not isinstance(rect, QRectF):
+            rect = QRectF(rect)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        self._data_rect = QRectF(rect)
+        try:
+            # setOpts(rect=...) 比單獨 setRect 更穩定
+            self.image_item.setOpts(rect=self._data_rect)
+        except Exception:
+            self.image_item.setRect(self._data_rect)
+
+    def set_default_levels(self, vmin, vmax, apply=True):
+        if vmin > vmax:
+            vmin, vmax = vmax, vmin
+        if vmin == vmax:
+            vmin -= 1.0
+            vmax += 1.0
+        self._default_levels = (float(vmin), float(vmax))
+        if apply:
+            self.apply_levels(vmin, vmax, update_hist_range=True)
+
+    def apply_levels(self, vmin, vmax, update_hist_range=False):
+        if vmin > vmax:
+            vmin, vmax = vmax, vmin
+        if vmin == vmax:
+            vmin -= 1e-9
+            vmax += 1e-9
+        self._level_updating = True
+        try:
+            self.hist.setLevels(float(vmin), float(vmax))
+            if update_hist_range:
+                # 外擴可視範圍，讓紫框上下緣離開邊界，方便直接拉扯
+                h0, h1 = self._padded_hist_range(vmin, vmax)
+                self.hist.setHistogramRange(h0, h1)
+            self._enable_level_drag()
+        finally:
+            self._level_updating = False
+        self._refresh_level_labels()
+        self.levelsChanged.emit(float(vmin), float(vmax))
+
+    def get_levels(self):
+        return self.hist.getLevels()
+
+    def _view_rect(self):
+        """取得影像在 view 座標系中的矩形（優先用設定的 mm rect）。"""
+        if self._data_rect is not None and self._data_rect.width() > 0:
+            return QRectF(self._data_rect)
+        vb = self.plot.getViewBox()
+        if vb is None or self.image_item.image is None:
+            return None
+        try:
+            # boundingRect 是局部像素座標，需映射到 view（含 setRect transform）
+            local = self.image_item.boundingRect()
+            poly = vb.mapFromItemToView(self.image_item, local)
+            xs = [p.x() for p in poly]
+            ys = [p.y() for p in poly]
+            return QRectF(
+                min(xs), min(ys),
+                max(xs) - min(xs),
+                max(ys) - min(ys),
+            )
+        except Exception:
+            return None
+
+    def reset_view(self):
+        """雙擊圖面：視野復原到影像完整真實座標範圍（保持 1:1，圓才是圓）。"""
+        vb = self.plot.getViewBox()
+        if vb is None or self.image_item.image is None:
+            return
+        # 確保 rect transform 仍在
+        self._apply_data_rect(self._data_rect)
+        rect = self._view_rect()
+        if rect is None or rect.width() <= 0 or rect.height() <= 0:
+            return
+        try:
+            vb.enableAutoRange(x=False, y=False)
+            vb.setAspectLocked(lock=True, ratio=1.0)
+            # 清掉先前誤用像素 boundingRect 設下的 limits
+            vb.setLimits(
+                xMin=None, xMax=None, yMin=None, yMax=None,
+                minXRange=None, maxXRange=None, minYRange=None, maxYRange=None,
+            )
+            pad = 0.02
+            x0, x1 = rect.left(), rect.right()
+            y0, y1 = rect.top(), rect.bottom()
+            vb.setRange(xRange=(x0, x1), yRange=(y0, y1), padding=pad)
+            # 允許略微超出以便滾輪縮放，但仍以資料範圍為中心
+            span_x = max(x1 - x0, 1e-9)
+            span_y = max(y1 - y0, 1e-9)
+            vb.setLimits(
+                xMin=x0 - 0.5 * span_x,
+                xMax=x1 + 0.5 * span_x,
+                yMin=y0 - 0.5 * span_y,
+                yMax=y1 + 0.5 * span_y,
+            )
+        except Exception:
+            pass
+        try:
+            self.plot.hideButtons()
+        except Exception:
+            pass
+
+    def reset_levels(self):
+        """雙擊色條：復原預設色階上下限。"""
+        if self._default_levels is None:
+            return
+        vmin, vmax = self._default_levels
+        self.apply_levels(vmin, vmax, update_hist_range=True)
+
+    def export_current_image(self):
+        safe_title = (
+            self._title.replace(" ", "_").replace("/", "-").replace("\\", "-")
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "匯出當前圖檔",
+            f"{safe_title}.png",
+            "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)",
+        )
+        if not path:
+            return False
+        try:
+            # 優先匯出整組圖面＋色條
+            target = getattr(self.win, "ci", None) or self.plot
+            exporter = pg_export.ImageExporter(target)
+            w = max(int(self.win.width()), 400)
+            h = max(int(self.win.height()), 300)
+            exporter.parameters()["width"] = w
+            exporter.parameters()["height"] = h
+            exporter.export(path)
+            QMessageBox.information(self, "匯出完成", f"已匯出：\n{path}")
+            return True
+        except Exception as exc:
+            QMessageBox.critical(self, "匯出失敗", f"無法匯出圖檔：\n{exc}")
+            return False
+
+    # ----- internal ---------------------------------------------------
+    def _refresh_level_labels(self):
+        try:
+            vmin, vmax = self.hist.getLevels()
+        except Exception:
+            self.lbl_level_min.setText("下限: --")
+            self.lbl_level_max.setText("上限: --")
+            return
+        self.lbl_level_min.setText(f"下限: {vmin:.6g}")
+        self.lbl_level_max.setText(f"上限: {vmax:.6g}")
+
+    def _on_hist_levels_changed(self):
+        if self._level_updating:
+            return
+        self._refresh_level_labels()
+        try:
+            vmin, vmax = self.hist.getLevels()
+            self.levelsChanged.emit(float(vmin), float(vmax))
+        except Exception:
+            pass
+
+    def _on_scene_clicked(self, evt):
+        if not evt.double():
+            return
+        pos = evt.scenePos()
+        # 色條雙擊 → 復原上下限
+        try:
+            hist_rect = self.hist.sceneBoundingRect()
+            if hist_rect.contains(pos):
+                self.reset_levels()
+                return
+        except Exception:
+            pass
+        # 圖面雙擊 → 復原視野
+        if self.plot.sceneBoundingRect().contains(pos):
+            self.reset_view()
+
+    def _on_mouse_moved(self, evt):
+        pos = evt[0]
+        if self.plot.sceneBoundingRect().contains(pos):
+            mouse_point = self.plot.getViewBox().mapSceneToView(pos)
+            self.mouseMoved.emit(mouse_point)
+        else:
+            self.mouseMoved.emit(None)
+
+    def _prompt_level(self, which):
+        """which: 'min' or 'max'（輔助精調；主要仍建議拖曳色條）。"""
+        try:
+            cur_min, cur_max = self.hist.getLevels()
+        except Exception:
+            return
+        if which == "min":
+            title, label, value = "設定色階下限", "請輸入最小值（色階下限）:", cur_min
+        else:
+            title, label, value = "設定色階上限", "請輸入最大值（色階上限）:", cur_max
+
+        new_val, ok = QInputDialog.getDouble(
+            self, title, label, float(value), -1e30, 1e30, 6
+        )
+        if not ok:
+            return
+        if which == "min":
+            new_min, new_max = float(new_val), float(cur_max)
+        else:
+            new_min, new_max = float(cur_min), float(new_val)
+        if new_min >= new_max:
+            QMessageBox.warning(self, "提醒", "下限必須小於上限。")
+            return
+        self.apply_levels(new_min, new_max, update_hist_range=True)
+
+    def _on_max_label_clicked(self, event):
+        if event.button() == Qt.LeftButton:
+            self._prompt_level("max")
+        QLabel.mousePressEvent(self.lbl_level_max, event)
+
+    def _on_min_label_clicked(self, event):
+        if event.button() == Qt.LeftButton:
+            self._prompt_level("min")
+        QLabel.mousePressEvent(self.lbl_level_min, event)
+
 
 # =========================================================================
 # 共用彈出視窗：Batch 專用的 Contour 視窗
