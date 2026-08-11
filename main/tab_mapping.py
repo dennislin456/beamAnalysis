@@ -452,10 +452,11 @@ class MappingTab(QWidget):
                 (self.heatmap_panel, heatmap_path),
                 (self.contour_panel, contour_path),
             ):
-                target = getattr(panel.win, "ci", None) or panel.plot
+                # 匯出主圖區域（含座標與格線），不包含右側 colorbar。
+                target = panel.plot
                 exporter = pg_export.ImageExporter(target)
-                exporter.parameters()["width"] = max(int(panel.win.width()), 400)
-                exporter.parameters()["height"] = max(int(panel.win.height()), 300)
+                exporter.parameters()["width"] = max(int(panel.plot.width()), 400)
+                exporter.parameters()["height"] = max(int(panel.plot.height()), 300)
                 exporter.export(out_path)
 
             csv_path = os.path.join(self.export_dir, f"{base_name}.csv")
