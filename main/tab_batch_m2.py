@@ -4,6 +4,8 @@
 """
 import os
 import json
+import csv
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
@@ -1007,9 +1009,10 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             QMessageBox.warning(self, "警告", "請先點擊「選擇儲存資料夾」按鈕以指定儲存路徑！")
             return
 
-        # 沿用父類匯出流程，ZIP 檔名區分 M2
-        zip_path = os.path.join(self.save_dir_path, "DataRay_Batch_M2_Results.zip")
-        summary_csv_path = os.path.join(self.save_dir_path, "Result_Spot_Analysis_M2.csv")
+        # 加上時間戳，避免同名覆蓋。
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_path = os.path.join(self.save_dir_path, f"DataRay_Batch_M2_Results_{ts}.zip")
+        summary_csv_path = os.path.join(self.save_dir_path, f"Result_Spot_Analysis_M2_{ts}.csv")
         prev_idx = self.batch_current_idx
         tmp_root = None
         import tempfile
@@ -1054,12 +1057,15 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                         unit_map[item] = unit
                         if item not in item_order:
                             item_order.append(item)
-                    summary_columns.append((group_name, value_map, unit_map))
+                    src_fname = ""
+                    if idx < len(self.batch_pairs):
+                        src_fname = str(self.batch_pairs[idx].get("filename", ""))
+                    summary_columns.append((group_name, value_map, unit_map, src_fname))
 
             self._write_spot_analysis_summary_csv(
                 summary_csv_path, item_order, summary_columns
             )
-            shutil.copy2(summary_csv_path, os.path.join(tmp_root, "Result_Spot_Analysis_M2.csv"))
+            shutil.copy2(summary_csv_path, os.path.join(tmp_root, os.path.basename(summary_csv_path)))
 
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
                 for root, _dirs, files in os.walk(tmp_root):
@@ -1093,6 +1099,44 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         finally:
             if tmp_root and os.path.isdir(tmp_root):
                 shutil.rmtree(tmp_root, ignore_errors=True)
+
+    def _write_spot_analysis_summary_csv(self, csv_path, item_order, summary_columns):
+        """M2 彙整：不同來源檔名之間插入一欄空白，提升閱讀性。"""
+
+        def _src_filename(col):
+            if len(col) >= 4:
+                return str(col[3] or "")
+            return ""
+
+        headers = ["Item", "Unit"]
+        prev_fname = None
+        for col_name, _values, _units, *rest in summary_columns:
+            cur_fname = _src_filename((col_name, _values, _units, *rest))
+            if prev_fname is not None and cur_fname != prev_fname:
+                headers.append("")
+            headers.append(col_name)
+            prev_fname = cur_fname
+
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+
+            for item in item_order:
+                unit = ""
+                for _name, _values, units, *_rest in summary_columns:
+                    if item in units and units[item] not in ("", None):
+                        unit = units[item]
+                        break
+
+                row = [item, unit]
+                prev_fname = None
+                for name, values, _units, *rest in summary_columns:
+                    cur_fname = _src_filename((name, values, _units, *rest))
+                    if prev_fname is not None and cur_fname != prev_fname:
+                        row.append("")
+                    row.append(values.get(item, ""))
+                    prev_fname = cur_fname
+                writer.writerow(row)
 
     def _export_single_group_like_dataray(self, base_path, idx):
         if self.batch_result_matrix is None:
