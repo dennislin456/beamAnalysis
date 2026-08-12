@@ -13,7 +13,7 @@ import pyqtgraph.exporters as pg_export
 from scipy.ndimage import uniform_filter
 
 from PyQt5.QtWidgets import (
-    QLabel, QFileDialog, QMessageBox, QApplication, QDialog,
+    QLabel, QFileDialog, QMessageBox, QApplication, QDialog, QPushButton,
     QHBoxLayout, QGridLayout, QCheckBox,
 )
 from PyQt5.QtCore import Qt
@@ -37,6 +37,10 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.batch_split_cx = None         # 縱切所用質心 X
         self.batch_split_peak_ys = None    # (y_lo, y_hi)
         self.batch_valley_roi_bounds = None  # 實際使用的 (x0,y0,x1,y1)
+        self._export_in_progress = False
+        self._export_pause_requested = False
+        self._export_paused = False
+        self._export_session = None
         self._adapt_ui_for_m2_only()
 
     # ------------------------------------------------------------------
@@ -182,6 +186,69 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.btn_batch_view_m2.setText("查看 M2 Heatmap（彈窗）")
         self.plot_batch_heat.setTitle("M2 Heatmap (Batch M2-only)")
         self.btn_batch_run.setText("載入已配置位置並運算（僅 M2）")
+
+        self.btn_batch_pause_export = QPushButton("暫停匯出")
+        self.btn_batch_pause_export.setStyleSheet(
+            "QPushButton { font-size: 12px; font-weight: bold; color: white; "
+            "background-color: #EF6C00; border: none; border-radius: 5px; padding: 6px 10px; }"
+            "QPushButton:hover { background-color: #F57C00; }"
+            "QPushButton:disabled { background-color: #B0BEC5; }"
+        )
+        self.btn_batch_pause_export.setMinimumHeight(38)
+        self.btn_batch_pause_export.setEnabled(False)
+        self.btn_batch_pause_export.clicked.connect(self._pause_export)
+
+        self.btn_batch_resume_export = QPushButton("續跑匯出")
+        self.btn_batch_resume_export.setStyleSheet(
+            "QPushButton { font-size: 12px; font-weight: bold; color: white; "
+            "background-color: #2E7D32; border: none; border-radius: 5px; padding: 6px 10px; }"
+            "QPushButton:hover { background-color: #388E3C; }"
+            "QPushButton:disabled { background-color: #B0BEC5; }"
+        )
+        self.btn_batch_resume_export.setMinimumHeight(38)
+        self.btn_batch_resume_export.setEnabled(False)
+        self.btn_batch_resume_export.clicked.connect(self._resume_export)
+
+        right_layout = self.btn_batch_export.parentWidget().layout()
+        if right_layout is not None and right_layout.count() > 0:
+            top_bar = right_layout.itemAt(0).layout()
+            if top_bar is not None:
+                insert_at = top_bar.indexOf(self.btn_batch_export)
+                if insert_at < 0:
+                    insert_at = top_bar.count()
+                top_bar.insertWidget(insert_at, self.btn_batch_pause_export)
+                top_bar.insertWidget(insert_at + 1, self.btn_batch_resume_export)
+
+    def _set_export_controls(self, running=False, paused=False):
+        if hasattr(self, "btn_batch_pause_export"):
+            self.btn_batch_pause_export.setEnabled(running and not paused)
+        if hasattr(self, "btn_batch_resume_export"):
+            self.btn_batch_resume_export.setEnabled((not running) and paused)
+
+    def _pause_export(self):
+        if not self._export_in_progress:
+            return
+        self._export_pause_requested = True
+        self._set_export_controls(running=True, paused=False)
+        self.lbl_batch_status.setText("狀態: 正在暫停並輸出目前進度...")
+        self.lbl_batch_status.setStyleSheet(
+            "color: #EF6C00; font-weight: bold; font-size: 12px;"
+        )
+
+    def _resume_export(self):
+        if self._export_in_progress:
+            return
+        if (not self._export_paused) or (not self._export_session):
+            QMessageBox.information(self, "提示", "目前沒有可續跑的暫停匯出。")
+            return
+        self._export_pause_requested = False
+        self._export_paused = False
+        self._export_pause_requested = False
+        self.lbl_batch_status.setText("狀態: 匯出續跑中...")
+        self.lbl_batch_status.setStyleSheet(
+            "color: #2E7D32; font-weight: bold; font-size: 12px;"
+        )
+        self._run_export_loop()
 
     def _compact_threshold_row(self, left_layout):
         """把門檻 checkbox 與 % 輸入排成同一列，縮小 spin 寬度。"""
@@ -1001,37 +1068,50 @@ class DataRayBatchM2Tab(DataRayBatchTab):
     def _get_m1_auto_mode_name(self):
         return "valley_split"
 
-    def export_batch_results_zip(self):
-        if self.batch_total_count == 0 or self.batch_result_matrix is None:
-            QMessageBox.warning(self, "警告", "目前無可匯出的數據！")
-            return
-        if not self.save_dir_path:
-            QMessageBox.warning(self, "警告", "請先點擊「選擇儲存資料夾」按鈕以指定儲存路徑！")
-            return
-
-        # 加上時間戳，避免同名覆蓋。
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_path = os.path.join(self.save_dir_path, f"DataRay_Batch_M2_Results_{ts}.zip")
-        summary_csv_path = os.path.join(self.save_dir_path, f"Result_Spot_Analysis_M2_{ts}.csv")
-        prev_idx = self.batch_current_idx
-        tmp_root = None
-        import tempfile
+    def _finalize_export_snapshot(self, session):
         import shutil
         import zipfile
 
+        self._write_spot_analysis_summary_csv(
+            session["summary_csv_path"],
+            session["item_order"],
+            session["summary_columns"],
+        )
+        shutil.copy2(
+            session["summary_csv_path"],
+            os.path.join(session["tmp_root"], os.path.basename(session["summary_csv_path"])),
+        )
+
+        with zipfile.ZipFile(session["zip_path"], "w", zipfile.ZIP_DEFLATED) as zipf:
+            for root, _dirs, files in os.walk(session["tmp_root"]):
+                for name in files:
+                    abs_path = os.path.join(root, name)
+                    arcname = os.path.relpath(abs_path, session["tmp_root"])
+                    zipf.write(abs_path, arcname)
+
+    def _cleanup_export_session(self):
+        import shutil
+
+        session = self._export_session
+        if session and session.get("tmp_root") and os.path.isdir(session["tmp_root"]):
+            shutil.rmtree(session["tmp_root"], ignore_errors=True)
+        self._export_session = None
+
+    def _run_export_loop(self):
+        session = self._export_session
+        if not session:
+            return
+
         try:
-            self.lbl_batch_status.setText("狀態: 正在匯出 ZIP...")
-            self.lbl_batch_status.setStyleSheet(
-                "color: #F57C00; font-weight: bold; font-size: 12px;"
-            )
+            self._export_in_progress = True
+            self._set_export_controls(running=True, paused=False)
             self.btn_batch_export.setEnabled(False)
             QApplication.processEvents()
 
-            tmp_root = tempfile.mkdtemp(prefix="dataray_batch_m2_export_")
-            summary_columns = []
-            item_order = []
+            for idx in range(session["next_idx"], self.batch_total_count):
+                if self._export_pause_requested:
+                    break
 
-            for idx in range(self.batch_total_count):
                 self.load_batch_group(idx)
                 QApplication.processEvents()
 
@@ -1044,7 +1124,8 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                         c if c.isalnum() or c in "-_" else "_" for c in str(fname)
                     )
                     group_name = f"Group_{idx + 1:02d}_{safe_loc}_{safe_fname}"
-                group_dir = os.path.join(tmp_root, group_name)
+
+                group_dir = os.path.join(session["tmp_root"], group_name)
                 os.makedirs(group_dir, exist_ok=True)
                 base_path = os.path.join(group_dir, "Result")
 
@@ -1055,39 +1136,66 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                     for item, value, unit in spot_rows:
                         value_map[item] = value
                         unit_map[item] = unit
-                        if item not in item_order:
-                            item_order.append(item)
+                        if item not in session["item_order"]:
+                            session["item_order"].append(item)
                     src_fname = ""
                     if idx < len(self.batch_pairs):
                         src_fname = str(self.batch_pairs[idx].get("filename", ""))
-                    summary_columns.append((group_name, value_map, unit_map, src_fname))
+                    session["summary_columns"].append((group_name, value_map, unit_map, src_fname))
 
-            self._write_spot_analysis_summary_csv(
-                summary_csv_path, item_order, summary_columns
-            )
-            shutil.copy2(summary_csv_path, os.path.join(tmp_root, os.path.basename(summary_csv_path)))
+                session["next_idx"] = idx + 1
+                self.lbl_batch_status.setText(
+                    f"狀態: 匯出中... {session['next_idx']}/{self.batch_total_count}"
+                )
+                self.lbl_batch_status.setStyleSheet(
+                    "color: #F57C00; font-weight: bold; font-size: 12px;"
+                )
+                QApplication.processEvents()
 
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-                for root, _dirs, files in os.walk(tmp_root):
-                    for name in files:
-                        abs_path = os.path.join(root, name)
-                        arcname = os.path.relpath(abs_path, tmp_root)
-                        zipf.write(abs_path, arcname)
+            self._finalize_export_snapshot(session)
 
-            self.load_batch_group(prev_idx)
+            if self._export_pause_requested and session["next_idx"] < self.batch_total_count:
+                self._export_in_progress = False
+                self._export_pause_requested = False
+                self._export_paused = True
+                self._set_export_controls(running=False, paused=True)
+                self.lbl_batch_status.setText(
+                    f"狀態: 已暫停並輸出進度（{session['next_idx']}/{self.batch_total_count}）"
+                )
+                self.lbl_batch_status.setStyleSheet(
+                    "color: #EF6C00; font-weight: bold; font-size: 12px;"
+                )
+                QMessageBox.information(
+                    self,
+                    "已暫停並輸出",
+                    f"目前進度已匯出，可先查看：\n\n"
+                    f"ZIP：\n{session['zip_path']}\n\n"
+                    f"彙整統計 CSV：\n{session['summary_csv_path']}\n\n"
+                    f"目前進度：{session['next_idx']}/{self.batch_total_count}"
+                )
+                return
+
+            self.load_batch_group(session["prev_idx"])
             self.lbl_batch_status.setText("狀態: 所有檔案匯出成功！")
             self.lbl_batch_status.setStyleSheet(
                 "color: #2E7D32; font-weight: bold; font-size: 12px;"
             )
             self.btn_batch_export.setEnabled(True)
+            self._set_export_controls(running=False, paused=False)
             QMessageBox.information(
                 self, "成功",
-                f"匯出完成！\n\nZIP：\n{zip_path}\n\n彙整統計 CSV：\n{summary_csv_path}\n\n"
+                f"匯出完成！\n\nZIP：\n{session['zip_path']}\n\n"
+                f"彙整統計 CSV：\n{session['summary_csv_path']}\n\n"
                 f"每組含：Heatmap／V_Profile／H_Profile／Heatmap_With_Profiles／Contour 等"
             )
+            self._cleanup_export_session()
+            self._export_paused = False
+            self._export_in_progress = False
+            self._export_pause_requested = False
         except Exception as e:
             try:
-                self.load_batch_group(prev_idx)
+                if session and session.get("prev_idx") is not None:
+                    self.load_batch_group(session["prev_idx"])
             except Exception:
                 pass
             self.lbl_batch_status.setText("狀態: 匯出失敗")
@@ -1095,10 +1203,67 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                 "color: #C62828; font-weight: bold; font-size: 12px;"
             )
             self.btn_batch_export.setEnabled(True)
+            self._set_export_controls(running=False, paused=False)
+            self._export_in_progress = False
+            self._export_pause_requested = False
             QMessageBox.critical(self, "匯出錯誤", f"匯出過程發生錯誤：\n{str(e)}")
-        finally:
-            if tmp_root and os.path.isdir(tmp_root):
-                shutil.rmtree(tmp_root, ignore_errors=True)
+
+    def export_batch_results_zip(self):
+        if self.batch_total_count == 0 or self.batch_result_matrix is None:
+            QMessageBox.warning(self, "警告", "目前無可匯出的數據！")
+            return
+        if not self.save_dir_path:
+            QMessageBox.warning(self, "警告", "請先點擊「選擇儲存資料夾」按鈕以指定儲存路徑！")
+            return
+        if self._export_in_progress:
+            QMessageBox.information(self, "提示", "目前已有匯出在進行中。")
+            return
+        if self._export_paused and self._export_session:
+            QMessageBox.information(self, "提示", "目前為暫停狀態，請按『續跑匯出』。")
+            return
+
+        # 加上時間戳，避免同名覆蓋。
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_path = os.path.join(self.save_dir_path, f"DataRay_Batch_M2_Results_{ts}.zip")
+        summary_csv_path = os.path.join(self.save_dir_path, f"Result_Spot_Analysis_M2_{ts}.csv")
+        import tempfile
+
+        self._export_session = {
+            "zip_path": zip_path,
+            "summary_csv_path": summary_csv_path,
+            "prev_idx": self.batch_current_idx,
+            "tmp_root": tempfile.mkdtemp(prefix="dataray_batch_m2_export_"),
+            "summary_columns": [],
+            "item_order": [],
+            "next_idx": 0,
+        }
+
+        self._export_in_progress = False
+        self._export_pause_requested = False
+        self._export_paused = False
+        self.lbl_batch_status.setText("狀態: 正在匯出 ZIP...")
+        self.lbl_batch_status.setStyleSheet(
+            "color: #F57C00; font-weight: bold; font-size: 12px;"
+        )
+        self._run_export_loop()
+
+    def closeEvent(self, event):
+        if self._export_in_progress:
+            QMessageBox.warning(
+                self,
+                "匯出進行中",
+                "目前正在匯出，為避免資料不完整，請先按『續跑匯出』直到完成後再關閉視窗。"
+            )
+            event.ignore()
+            return
+        if self._export_paused and self._export_session:
+            QMessageBox.information(
+                self,
+                "已暫停匯出",
+                "目前已暫停且已輸出部分結果；若關閉視窗，將無法在本次視窗內續跑，但已匯出的檔案會保留。"
+            )
+            self._cleanup_export_session()
+        super().closeEvent(event)
 
     def _write_spot_analysis_summary_csv(self, csv_path, item_order, summary_columns):
         """M2 彙整：不同來源檔名之間插入一欄空白，提升閱讀性。"""
