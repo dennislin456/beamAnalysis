@@ -186,6 +186,15 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.btn_batch_view_m2.setText("查看 M2 Heatmap（彈窗）")
         self.plot_batch_heat.setTitle("M2 Heatmap (Batch M2-only)")
         self.btn_batch_run.setText("載入已配置位置並運算（僅 M2）")
+        # 允許配置摘要換行，讓下方按鈕自然往下移，不壓縮按鈕高度。
+        self.lbl_batch_selected_info.setWordWrap(True)
+        self.lbl_batch_selected_info.setMaximumHeight(48)
+
+        # 固定關鍵按鈕高度，避免在摘要換行時被擠扁。
+        self.btn_location_config.setMinimumHeight(34)
+        self.btn_location_config.setMaximumHeight(34)
+        self.btn_batch_run.setMinimumHeight(38)
+        self.btn_batch_run.setMaximumHeight(38)
 
         self.btn_batch_pause_export = QPushButton("暫停匯出")
         self.btn_batch_pause_export.setStyleSheet(
@@ -195,6 +204,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             "QPushButton:disabled { background-color: #B0BEC5; }"
         )
         self.btn_batch_pause_export.setMinimumHeight(38)
+        self.btn_batch_pause_export.setMaximumHeight(38)
         self.btn_batch_pause_export.setEnabled(False)
         self.btn_batch_pause_export.clicked.connect(self._pause_export)
 
@@ -206,8 +216,21 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             "QPushButton:disabled { background-color: #B0BEC5; }"
         )
         self.btn_batch_resume_export.setMinimumHeight(38)
+        self.btn_batch_resume_export.setMaximumHeight(38)
         self.btn_batch_resume_export.setEnabled(False)
         self.btn_batch_resume_export.clicked.connect(self._resume_export)
+
+        self.btn_batch_clear_export = QPushButton("清除匯出")
+        self.btn_batch_clear_export.setStyleSheet(
+            "QPushButton { font-size: 12px; font-weight: bold; color: white; "
+            "background-color: #546E7A; border: none; border-radius: 5px; padding: 6px 10px; }"
+            "QPushButton:hover { background-color: #607D8B; }"
+            "QPushButton:disabled { background-color: #B0BEC5; }"
+        )
+        self.btn_batch_clear_export.setMinimumHeight(38)
+        self.btn_batch_clear_export.setMaximumHeight(38)
+        self.btn_batch_clear_export.setEnabled(False)
+        self.btn_batch_clear_export.clicked.connect(self._clear_export_state)
 
         right_layout = self.btn_batch_export.parentWidget().layout()
         if right_layout is not None and right_layout.count() > 0:
@@ -218,12 +241,15 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                     insert_at = top_bar.count()
                 top_bar.insertWidget(insert_at, self.btn_batch_pause_export)
                 top_bar.insertWidget(insert_at + 1, self.btn_batch_resume_export)
+                top_bar.insertWidget(insert_at + 2, self.btn_batch_clear_export)
 
     def _set_export_controls(self, running=False, paused=False):
         if hasattr(self, "btn_batch_pause_export"):
             self.btn_batch_pause_export.setEnabled(running and not paused)
         if hasattr(self, "btn_batch_resume_export"):
             self.btn_batch_resume_export.setEnabled((not running) and paused)
+        if hasattr(self, "btn_batch_clear_export"):
+            self.btn_batch_clear_export.setEnabled((not running) and paused)
 
     def _pause_export(self):
         if not self._export_in_progress:
@@ -243,12 +269,34 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             return
         self._export_pause_requested = False
         self._export_paused = False
-        self._export_pause_requested = False
         self.lbl_batch_status.setText("狀態: 匯出續跑中...")
         self.lbl_batch_status.setStyleSheet(
             "color: #2E7D32; font-weight: bold; font-size: 12px;"
         )
         self._run_export_loop()
+
+    def _clear_export_state(self, notify=True):
+        if self._export_in_progress:
+            QMessageBox.warning(self, "提示", "匯出進行中，請先暫停後再清除。")
+            return
+        if (not self._export_paused) and (not self._export_session):
+            if notify:
+                QMessageBox.information(self, "提示", "目前沒有可清除的暫停匯出。")
+            return
+
+        self._cleanup_export_session()
+        self._export_pause_requested = False
+        self._export_paused = False
+        self._export_in_progress = False
+        self._set_export_controls(running=False, paused=False)
+
+        self.btn_batch_export.setEnabled(self.batch_total_count > 0 and self.batch_result_matrix is not None)
+        self.lbl_batch_status.setText("狀態: 已清除暫停匯出，可重新一鍵匯出")
+        self.lbl_batch_status.setStyleSheet(
+            "color: #1565C0; font-weight: bold; font-size: 12px;"
+        )
+        if notify:
+            QMessageBox.information(self, "已清除", "已清除暫停匯出狀態，現在可重新一鍵匯出。")
 
     def _compact_threshold_row(self, left_layout):
         """把門檻 checkbox 與 % 輸入排成同一列，縮小 spin 寬度。"""
@@ -331,6 +379,29 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             self.spin_batch_valley_roi_w.value(),
             self.spin_batch_valley_roi_h.value(),
         )
+
+    def _update_selected_location_info(self, *_args):
+        """M2-only：配置摘要僅顯示位置，不顯示 cycle 明細。"""
+        selected = self._get_selected_locations()
+        n_pairs = 0
+        for loc in selected:
+            cycles = self.batch_location_config.get(loc, {}).get("cycles", [])
+            n_pairs += len(cycles)
+
+        if hasattr(self, "lbl_batch_selected_info"):
+            summary = f"已配置: {len(selected)} 個位置｜{n_pairs} 組 cycle"
+            brief = summary
+            if selected:
+                loc_line = "位置: " + "、".join(selected[:8])
+                if len(selected) > 8:
+                    loc_line += " ..."
+                brief = f"{summary}\n{loc_line}"
+
+            self.lbl_batch_selected_info.setText(brief)
+            full = summary
+            if selected:
+                full += "\n位置: " + "、".join(selected)
+            self.lbl_batch_selected_info.setToolTip(full)
 
     # ------------------------------------------------------------------
     # 資料掃描／載入（僅 M2）
@@ -1139,9 +1210,11 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                         if item not in session["item_order"]:
                             session["item_order"].append(item)
                     src_fname = ""
+                    src_loc = ""
                     if idx < len(self.batch_pairs):
                         src_fname = str(self.batch_pairs[idx].get("filename", ""))
-                    session["summary_columns"].append((group_name, value_map, unit_map, src_fname))
+                        src_loc = str(self.batch_pairs[idx].get("location", ""))
+                    session["summary_columns"].append((group_name, value_map, unit_map, src_fname, src_loc))
 
                 session["next_idx"] = idx + 1
                 self.lbl_batch_status.setText(
@@ -1262,25 +1335,25 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                 "已暫停匯出",
                 "目前已暫停且已輸出部分結果；若關閉視窗，將無法在本次視窗內續跑，但已匯出的檔案會保留。"
             )
-            self._cleanup_export_session()
+            self._clear_export_state(notify=False)
         super().closeEvent(event)
 
     def _write_spot_analysis_summary_csv(self, csv_path, item_order, summary_columns):
-        """M2 彙整：不同來源檔名之間插入一欄空白，提升閱讀性。"""
+        """M2 彙整：不同位置資料夾之間插入一欄空白。"""
 
-        def _src_filename(col):
-            if len(col) >= 4:
-                return str(col[3] or "")
+        def _src_location(col):
+            if len(col) >= 5:
+                return str(col[4] or "")
             return ""
 
         headers = ["Item", "Unit"]
-        prev_fname = None
+        prev_loc = None
         for col_name, _values, _units, *rest in summary_columns:
-            cur_fname = _src_filename((col_name, _values, _units, *rest))
-            if prev_fname is not None and cur_fname != prev_fname:
+            cur_loc = _src_location((col_name, _values, _units, *rest))
+            if prev_loc is not None and cur_loc != prev_loc:
                 headers.append("")
             headers.append(col_name)
-            prev_fname = cur_fname
+            prev_loc = cur_loc
 
         with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
@@ -1294,13 +1367,13 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                         break
 
                 row = [item, unit]
-                prev_fname = None
+                prev_loc = None
                 for name, values, _units, *rest in summary_columns:
-                    cur_fname = _src_filename((name, values, _units, *rest))
-                    if prev_fname is not None and cur_fname != prev_fname:
+                    cur_loc = _src_location((name, values, _units, *rest))
+                    if prev_loc is not None and cur_loc != prev_loc:
                         row.append("")
                     row.append(values.get(item, ""))
-                    prev_fname = cur_fname
+                    prev_loc = cur_loc
                 writer.writerow(row)
 
     def _export_single_group_like_dataray(self, base_path, idx):
