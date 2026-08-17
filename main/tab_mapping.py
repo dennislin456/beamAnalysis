@@ -7,11 +7,197 @@ import pyqtgraph.exporters as pg_export
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel,
     QFileDialog, QMessageBox, QSplitter, QFrame, QLineEdit,
+    QDoubleSpinBox, QCheckBox, QMainWindow, QGridLayout,
 )
 from PyQt5.QtGui import QIntValidator
 from PyQt5.QtCore import Qt, QRectF
 
 from shared_components import InteractiveHeatmapPanel
+
+
+class MappingRoiWindow(QMainWindow):
+    """Mapping ROI 獨立檢視與匯出視窗。"""
+
+    def __init__(self, matrix, x_coords, y_coords, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(
+            f"Mapping 範圍檢視｜X={float(x_coords[0]):.3f}~{float(x_coords[-1]):.3f} "
+            f"｜Y={float(y_coords[0]):.3f}~{float(y_coords[-1]):.3f}"
+        )
+        self.resize(900, 760)
+        self.matrix = np.asarray(matrix, dtype=float)
+        self.x_coords = np.asarray(x_coords, dtype=float)
+        self.y_coords = np.asarray(y_coords, dtype=float)
+        self.selected_point_item = None
+        self.selected_point = None
+
+        host = QWidget(self)
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(8, 8, 8, 8)
+        self.panel = InteractiveHeatmapPanel(
+            title="Mapping ROI",
+            x_label="X (mm)",
+            y_label="Y (mm)",
+        )
+        layout.addWidget(self.panel, 1)
+
+        toolbar = QHBoxLayout()
+        self.btn_export = QPushButton("匯出範圍圖片與數值")
+        self.btn_export.clicked.connect(self.export_roi)
+        toolbar.addWidget(self.btn_export)
+        self.lbl_point_info = QLabel("滑鼠位置: X=--, Y=--, Value=--")
+        toolbar.addWidget(self.lbl_point_info, 1)
+        toolbar.addStretch(1)
+        layout.addLayout(toolbar)
+        self.setCentralWidget(host)
+
+        rect = self._image_rect()
+        vmin, vmax = self._finite_minmax()
+        self.panel.set_image(self.matrix.T, rect=rect, levels=(vmin, vmax), reset_view=True)
+        self._configure_grid()
+        self.panel.mouseMoved.connect(self._on_mouse_moved)
+        self.panel.plot.scene().sigMouseClicked.connect(self._on_clicked)
+
+    def _finite_minmax(self):
+        finite = self.matrix[np.isfinite(self.matrix)]
+        if finite.size == 0:
+            return 0.0, 1.0
+        vmin, vmax = float(np.min(finite)), float(np.max(finite))
+        if vmin == vmax:
+            vmax = vmin + 1.0
+        return vmin, vmax
+
+    def _image_rect(self):
+        dx = float(np.median(np.diff(self.x_coords))) if self.x_coords.size > 1 else 1.0
+        dy = float(np.median(np.diff(self.y_coords))) if self.y_coords.size > 1 else 1.0
+        return QRectF(
+            float(self.x_coords[0]) - dx / 2,
+            float(self.y_coords[0]) - dy / 2,
+            dx * self.matrix.shape[1],
+            dy * self.matrix.shape[0],
+        )
+
+    def _configure_grid(self):
+        parent = self.parentWidget()
+        if parent is not None and hasattr(parent, "_tick_spacing"):
+            x_label, x_grid = parent._tick_spacing(self.x_coords)
+            y_label, y_grid = parent._tick_spacing(self.y_coords)
+        else:
+            x_grid = float(np.median(np.diff(self.x_coords))) if self.x_coords.size > 1 else 1.0
+            y_grid = float(np.median(np.diff(self.y_coords))) if self.y_coords.size > 1 else 1.0
+        self.panel.plot.getAxis("bottom").setTickSpacing(major=x_label, minor=x_grid)
+        self.panel.plot.getAxis("left").setTickSpacing(major=y_label, minor=y_grid)
+        self.panel.plot.showGrid(x=True, y=True, alpha=0.35)
+
+    def _on_mouse_moved(self, point):
+        if self.selected_point is not None:
+            return
+        if point is None:
+            self.lbl_point_info.setText("滑鼠位置: X=--, Y=--, Value=--")
+            return
+        ix = int(np.abs(self.x_coords - point.x()).argmin())
+        iy = int(np.abs(self.y_coords - point.y()).argmin())
+        value = self.matrix[iy, ix]
+        value_text = "NaN" if np.isnan(value) else f"{value:.6f}"
+        self.lbl_point_info.setText(
+            f"滑鼠位置: X={self.x_coords[ix]:.3f}, "
+            f"Y={self.y_coords[iy]:.3f}, Value={value_text}"
+        )
+
+    def _on_clicked(self, event):
+        if event.double():
+            self._reset_roi_view()
+            return
+        if event.button() != Qt.LeftButton:
+            return
+        pos = event.scenePos()
+        if not self.panel.plot.sceneBoundingRect().contains(pos):
+            return
+        point = self.panel.plot.getViewBox().mapSceneToView(pos)
+        ix = int(np.abs(self.x_coords - point.x()).argmin())
+        iy = int(np.abs(self.y_coords - point.y()).argmin())
+        value = self.matrix[iy, ix]
+        value_text = "NaN" if np.isnan(value) else f"{value:.6f}"
+        self.selected_point = (ix, iy)
+        self.lbl_point_info.setText(
+            f"已固定: X={self.x_coords[ix]:.3f}, "
+            f"Y={self.y_coords[iy]:.3f}, Value={value_text}"
+        )
+
+        self._clear_selected_point()
+        x, y = float(self.x_coords[ix]), float(self.y_coords[iy])
+        x0, x1 = self._cell_bounds(self.x_coords, ix)
+        y0, y1 = self._cell_bounds(self.y_coords, iy)
+        self.selected_point_item = pg.PlotDataItem(
+            [x0, x1, x1, x0, x0],
+            [y0, y0, y1, y1, y0],
+            pen=pg.mkPen("#FF0000", width=3),
+        )
+        self.panel.plot.addItem(self.selected_point_item, ignoreBounds=True)
+
+    def _reset_roi_view(self):
+        """雙擊 ROI 圖面時回到目前範圍的 X/Y 中心。"""
+        if self.x_coords.size == 0 or self.y_coords.size == 0:
+            return
+        x0, x1 = float(self.x_coords[0]), float(self.x_coords[-1])
+        y0, y1 = float(self.y_coords[0]), float(self.y_coords[-1])
+        vb = self.panel.plot.getViewBox()
+        vb.enableAutoRange(x=False, y=False)
+        vb.setAspectLocked(True, ratio=1.0)
+        vb.setRange(xRange=(x0, x1), yRange=(y0, y1), padding=0.02)
+
+    @staticmethod
+    def _cell_bounds(coords, index):
+        values = np.asarray(coords, dtype=float)
+        if values.size < 2:
+            value = float(values[0]) if values.size else 0.0
+            return value - 0.5, value + 0.5
+        left = values[index - 1] if index > 0 else values[index] - (values[index + 1] - values[index])
+        right = values[index + 1] if index < values.size - 1 else values[index] + (values[index] - values[index - 1])
+        return float((left + values[index]) / 2), float((values[index] + right) / 2)
+
+    def _clear_selected_point(self):
+        if self.selected_point_item is not None:
+            self.panel.plot.removeItem(self.selected_point_item)
+            self.selected_point_item = None
+
+    def export_roi(self):
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "匯出 Mapping 範圍",
+            "mapping_roi.png",
+            "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)",
+        )
+        if not save_path:
+            return
+        try:
+            base = os.path.splitext(save_path)[0]
+            exporter = pg_export.ImageExporter(self.panel.plot)
+            exporter.parameters()["width"] = max(int(self.panel.plot.width()), 400)
+            exporter.parameters()["height"] = max(int(self.panel.plot.height()), 300)
+            selected_item = self.selected_point_item
+            if selected_item is not None:
+                selected_item.hide()
+            try:
+                exporter.export(save_path)
+            finally:
+                if selected_item is not None:
+                    selected_item.show()
+
+            csv_path = f"{base}.csv"
+            with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
+                fh.write("x,y,value\n")
+                for iy, y in enumerate(self.y_coords):
+                    for ix, x in enumerate(self.x_coords):
+                        fh.write(f"{x:.6f},{y:.6f},{self.matrix[iy, ix]:.6f}\n")
+            np.save(f"{base}.npy", self.matrix)
+            QMessageBox.information(
+                self,
+                "匯出完成",
+                f"圖片：\n{save_path}\n\nCSV：\n{csv_path}\n\nNPY：\n{base}.npy",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "匯出失敗", f"無法匯出範圍資料：\n{exc}")
 
 
 class MappingTab(QWidget):
@@ -25,6 +211,10 @@ class MappingTab(QWidget):
         self.y_coords = None
         self.plot_drawn = False
         self.contour_line_items = []
+        self.roi_rect_item = None
+        self.roi_window = None
+        self.selected_point_item = None
+        self.selected_point = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -95,6 +285,33 @@ class MappingTab(QWidget):
         self.btn_export_mapping.setEnabled(False)
         left_layout.addWidget(self.btn_export_mapping)
 
+        roi_title = QLabel("範圍框選（可隨時取消）")
+        roi_title.setStyleSheet("font-weight: bold; color: #263238; font-size: 12px;")
+        left_layout.addWidget(roi_title)
+        self.chk_roi_enabled = QCheckBox("啟用黑框範圍")
+        self.chk_roi_enabled.toggled.connect(self._on_roi_enabled)
+        self.chk_roi_enabled.setEnabled(False)
+        left_layout.addWidget(self.chk_roi_enabled)
+
+        roi_grid = QGridLayout()
+        self.roi_spin_x0 = self._make_roi_spin()
+        self.roi_spin_x1 = self._make_roi_spin()
+        self.roi_spin_y0 = self._make_roi_spin()
+        self.roi_spin_y1 = self._make_roi_spin()
+        for label, spin, row, col in (
+            ("X 起點", self.roi_spin_x0, 0, 0),
+            ("X 終點", self.roi_spin_x1, 0, 2),
+            ("Y 起點", self.roi_spin_y0, 1, 0),
+            ("Y 終點", self.roi_spin_y1, 1, 2),
+        ):
+            roi_grid.addWidget(QLabel(label), row, col)
+            roi_grid.addWidget(spin, row, col + 1)
+        left_layout.addLayout(roi_grid)
+        self.btn_view_roi = QPushButton("查看範圍圖")
+        self.btn_view_roi.clicked.connect(self.show_roi_window)
+        self.btn_view_roi.setEnabled(False)
+        left_layout.addWidget(self.btn_view_roi)
+
         avg_label = QLabel("平均半寬度 (點數)")
         avg_label.setStyleSheet("color: #424242; font-size: 12px;")
         left_layout.addWidget(avg_label)
@@ -147,6 +364,7 @@ class MappingTab(QWidget):
         self.contour_hist = self.contour_panel.hist
 
         self.heatmap_panel.mouseMoved.connect(self._on_heatmap_mouse_moved)
+        self.heatmap_panel.plot.scene().sigMouseClicked.connect(self._on_heatmap_clicked)
 
         right_layout.addWidget(self.heatmap_panel, 1)
         right_layout.addWidget(self.contour_panel, 1)
@@ -154,6 +372,15 @@ class MappingTab(QWidget):
         splitter.addWidget(right_panel)
 
         self.setLayout(layout)
+
+    def _make_roi_spin(self):
+        spin = QDoubleSpinBox()
+        spin.setDecimals(6)
+        spin.setRange(-1e9, 1e9)
+        spin.setSingleStep(1.0)
+        spin.setEnabled(False)
+        spin.valueChanged.connect(self._on_roi_value_changed)
+        return spin
 
     def _create_hline(self):
         frame = QFrame()
@@ -182,6 +409,46 @@ class MappingTab(QWidget):
             vmin -= 1.0
             vmax += 1.0
         return vmin, vmax
+
+    def _grid_spacing(self, coords):
+        """直接使用座標資料 step 畫主要格線。"""
+        values = np.asarray(coords, dtype=float)
+        if values.size < 2:
+            return 1.0
+
+        diffs = np.abs(np.diff(values))
+        diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+        if diffs.size == 0:
+            return 1.0
+
+        data_step = float(np.median(diffs))
+        return data_step
+
+    def _tick_spacing(self, coords):
+        """回傳 (文字標籤間距, 格線間距)，避免軸標籤過度密集。"""
+        grid_spacing = self._grid_spacing(coords)
+        values = np.asarray(coords, dtype=float)
+        span = float(np.max(values) - np.min(values)) if values.size else 0.0
+        if span <= 0 or grid_spacing <= 0:
+            return grid_spacing, grid_spacing
+
+        label_count = 10.0
+        label_multiplier = max(1, int(np.ceil(span / (label_count * grid_spacing))))
+        label_spacing = grid_spacing * label_multiplier
+        return label_spacing, grid_spacing
+
+    def _configure_mapping_grid(self):
+        """依讀入的 X/Y step 設定主要格線，避免自動次格線過密。"""
+        if self.x_coords is None or self.y_coords is None:
+            return
+
+        x_label_spacing, x_grid_spacing = self._tick_spacing(self.x_coords)
+        y_label_spacing, y_grid_spacing = self._tick_spacing(self.y_coords)
+        x_axis = self.heatmap_panel.plot.getAxis("bottom")
+        y_axis = self.heatmap_panel.plot.getAxis("left")
+        x_axis.setTickSpacing(major=x_label_spacing, minor=x_grid_spacing)
+        y_axis.setTickSpacing(major=y_label_spacing, minor=y_grid_spacing)
+        self.heatmap_panel.plot.showGrid(x=True, y=True, alpha=0.35)
 
     def load_mapping_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -227,6 +494,8 @@ class MappingTab(QWidget):
             self.lbl_status.setText(f"狀態: 已匯入 {os.path.basename(file_path)}，請點「畫圖」")
             self.btn_plot_mapping.setEnabled(True)
             self.btn_export_mapping.setEnabled(False)
+            self.chk_roi_enabled.setEnabled(True)
+            self._set_roi_spin_ranges()
             self.plot_drawn = False
         except Exception as exc:
             QMessageBox.critical(self, "匯入失敗", f"無法讀取檔案：\n{str(exc)}")
@@ -236,6 +505,9 @@ class MappingTab(QWidget):
             self.y_coords = None
             self.btn_plot_mapping.setEnabled(False)
             self.btn_export_mapping.setEnabled(False)
+            self.chk_roi_enabled.setEnabled(False)
+            self.btn_view_roi.setEnabled(False)
+            self._clear_roi_overlay()
 
     def plot_mapping(self):
         if self.mapping_matrix is None:
@@ -260,12 +532,92 @@ class MappingTab(QWidget):
             levels=(raw_min, raw_max),
             reset_view=True,
         )
+        self._configure_mapping_grid()
 
         self._update_contour_plot(processed_matrix, reset_view=True)
 
         self.lbl_status.setText("狀態: Mapping 圖已繪製")
         self.plot_drawn = True
         self.btn_export_mapping.setEnabled(bool(self.export_dir))
+        self._update_roi_overlay()
+
+    def _set_roi_spin_ranges(self):
+        if self.x_coords is None or self.y_coords is None:
+            return
+        for spin, coords in (
+            (self.roi_spin_x0, self.x_coords),
+            (self.roi_spin_x1, self.x_coords),
+            (self.roi_spin_y0, self.y_coords),
+            (self.roi_spin_y1, self.y_coords),
+        ):
+            spin.blockSignals(True)
+            spin.setRange(float(np.min(coords)), float(np.max(coords)))
+            spin.setValue(float(coords[0] if spin in (self.roi_spin_x0, self.roi_spin_y0) else coords[-1]))
+            spin.blockSignals(False)
+
+    def _on_roi_enabled(self, enabled):
+        for spin in (self.roi_spin_x0, self.roi_spin_x1, self.roi_spin_y0, self.roi_spin_y1):
+            spin.setEnabled(enabled)
+        self.btn_view_roi.setEnabled(enabled and self.plot_drawn)
+        if enabled:
+            self._update_roi_overlay()
+        else:
+            self._clear_roi_overlay()
+
+    def _on_roi_value_changed(self, _value):
+        if self.chk_roi_enabled.isChecked():
+            self._update_roi_overlay()
+
+    def _clear_roi_overlay(self):
+        if self.roi_rect_item is not None:
+            self.plot.removeItem(self.roi_rect_item)
+            self.roi_rect_item = None
+
+    def _roi_indices(self):
+        if self.mapping_matrix is None:
+            return None
+        x0, x1 = sorted((self.roi_spin_x0.value(), self.roi_spin_x1.value()))
+        y0, y1 = sorted((self.roi_spin_y0.value(), self.roi_spin_y1.value()))
+        x_mask = (self.x_coords >= x0) & (self.x_coords <= x1)
+        y_mask = (self.y_coords >= y0) & (self.y_coords <= y1)
+        x_idx = np.flatnonzero(x_mask)
+        y_idx = np.flatnonzero(y_mask)
+        if x_idx.size == 0 or y_idx.size == 0:
+            return None
+        return x_idx, y_idx
+
+    def _update_roi_overlay(self):
+        if not self.chk_roi_enabled.isChecked():
+            self._clear_roi_overlay()
+            self.btn_view_roi.setEnabled(False)
+            return
+        indices = self._roi_indices()
+        if indices is None or not self.plot_drawn:
+            self.btn_view_roi.setEnabled(False)
+            return
+        x_idx, y_idx = indices
+        x0, x1 = float(self.x_coords[x_idx[0]]), float(self.x_coords[x_idx[-1]])
+        y0, y1 = float(self.y_coords[y_idx[0]]), float(self.y_coords[y_idx[-1]])
+        pen = pg.mkPen("#000000", width=3)
+        if self.roi_rect_item is not None:
+            self.plot.removeItem(self.roi_rect_item)
+        self.roi_rect_item = pg.PlotDataItem(
+            [x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0], pen=pen
+        )
+        self.plot.addItem(self.roi_rect_item, ignoreBounds=True)
+        self.btn_view_roi.setEnabled(True)
+
+    def show_roi_window(self):
+        indices = self._roi_indices()
+        if indices is None:
+            QMessageBox.warning(self, "範圍無效", "請確認 X/Y 起點與終點涵蓋有效資料。")
+            return
+        x_idx, y_idx = indices
+        roi_matrix = self._get_processed_matrix()[np.ix_(y_idx, x_idx)]
+        self.roi_window = MappingRoiWindow(
+            roi_matrix, self.x_coords[x_idx], self.y_coords[y_idx], parent=self
+        )
+        self.roi_window.show()
 
     def select_export_directory(self):
         export_dir = QFileDialog.getExistingDirectory(self, "選擇儲存資料夾", "")
@@ -333,6 +685,15 @@ class MappingTab(QWidget):
             levels=(contour_min, contour_max),
             reset_view=reset_view,
         )
+        contour_x_label_spacing, contour_x_grid_spacing = self._tick_spacing(self.x_coords)
+        contour_y_label_spacing, contour_y_grid_spacing = self._tick_spacing(self.y_coords)
+        self.contour_panel.plot.getAxis("bottom").setTickSpacing(
+            major=contour_x_label_spacing, minor=contour_x_grid_spacing
+        )
+        self.contour_panel.plot.getAxis("left").setTickSpacing(
+            major=contour_y_label_spacing, minor=contour_y_grid_spacing
+        )
+        self.contour_panel.plot.showGrid(x=True, y=True, alpha=0.35)
 
         self._clear_contour_lines()
         levels = np.linspace(contour_min, contour_max, 8)
@@ -403,10 +764,11 @@ class MappingTab(QWidget):
         return segments
 
     def _on_heatmap_mouse_moved(self, mouse_point):
+        if self.selected_point is not None:
+            return
         if mouse_point is None:
             self.lbl_mouse_info.setText("滑鼠位置: X=--, Y=--, Value=--")
             return
-
         x = mouse_point.x()
         y = mouse_point.y()
         if (
@@ -423,6 +785,41 @@ class MappingTab(QWidget):
             )
         else:
             self.lbl_mouse_info.setText(f"滑鼠位置: X={x:.3f} mm, Y={y:.3f} mm, Value=--")
+
+    def _on_heatmap_clicked(self, event):
+        if self.mapping_matrix is None or not self.plot_drawn:
+            return
+        if event.button() != Qt.LeftButton:
+            return
+        pos = event.scenePos()
+        if not self.plot.sceneBoundingRect().contains(pos):
+            return
+
+        point = self.plot.getViewBox().mapSceneToView(pos)
+        ix = int(np.abs(self.x_coords - point.x()).argmin())
+        iy = int(np.abs(self.y_coords - point.y()).argmin())
+        x0, x1 = MappingRoiWindow._cell_bounds(self.x_coords, ix)
+        y0, y1 = MappingRoiWindow._cell_bounds(self.y_coords, iy)
+        value = self.mapping_matrix[iy, ix]
+        value_text = "NaN" if np.isnan(value) else f"{value:.6f}"
+        self.selected_point = (ix, iy)
+        self.lbl_mouse_info.setText(
+            f"已固定範圍: X={x0:.3f}~{x1:.3f} mm, "
+            f"Y={y0:.3f}~{y1:.3f} mm, Value={value_text}"
+        )
+
+        self._clear_selected_point()
+        self.selected_point_item = pg.PlotDataItem(
+            [x0, x1, x1, x0, x0],
+            [y0, y0, y1, y1, y0],
+            pen=pg.mkPen("#FF0000", width=3),
+        )
+        self.plot.addItem(self.selected_point_item, ignoreBounds=True)
+
+    def _clear_selected_point(self):
+        if self.selected_point_item is not None:
+            self.plot.removeItem(self.selected_point_item)
+            self.selected_point_item = None
 
     def export_mapping(self):
         if self.mapping_matrix is None:
@@ -448,6 +845,10 @@ class MappingTab(QWidget):
             heatmap_path = save_path
             contour_path = os.path.join(self.export_dir, f"{base_name}_contour{ext}")
 
+            # 選點紅框只供畫面判讀，匯出圖片時暫時移除。
+            selected_item = self.selected_point_item
+            if selected_item is not None:
+                selected_item.hide()
             for panel, out_path in (
                 (self.heatmap_panel, heatmap_path),
                 (self.contour_panel, contour_path),
@@ -476,3 +877,6 @@ class MappingTab(QWidget):
             )
         except Exception as exc:
             QMessageBox.critical(self, "匯出失敗", f"無法匯出檔案：\n{str(exc)}")
+        finally:
+            if selected_item is not None:
+                selected_item.show()
