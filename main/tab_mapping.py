@@ -7,7 +7,7 @@ import pyqtgraph.exporters as pg_export
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel,
     QFileDialog, QMessageBox, QSplitter, QFrame, QLineEdit,
-    QDoubleSpinBox, QCheckBox, QMainWindow, QGridLayout,
+    QDoubleSpinBox, QCheckBox, QMainWindow, QGridLayout, QComboBox,
 )
 from PyQt5.QtGui import QIntValidator
 from PyQt5.QtCore import Qt, QRectF
@@ -207,8 +207,14 @@ class MappingTab(QWidget):
         self.export_dir = ""
         self.mapping_path = ""
         self.mapping_matrix = None
+        self.mapping_matrix_f1 = None
+        self.mapping_matrix_f2 = None
         self.x_coords = None
         self.y_coords = None
+        self.x_coords_f2 = None
+        self.y_coords_f2 = None
+        self.mapping_f1_path = ""
+        self.mapping_f2_path = ""
         self.plot_drawn = False
         self.contour_line_items = []
         self.roi_rect_item = None
@@ -253,6 +259,12 @@ class MappingTab(QWidget):
         lbl_title.setStyleSheet("font-weight: bold; font-size: 14px; color: #37474F;")
         left_layout.addWidget(lbl_title)
 
+        self.combo_mapping_mode = QComboBox()
+        self.combo_mapping_mode.addItem("單檔 Mapping", "single")
+        self.combo_mapping_mode.addItem("F1 - F2（Chuck - Wafer）", "subtract")
+        self.combo_mapping_mode.currentIndexChanged.connect(self._on_mapping_mode_changed)
+        left_layout.addWidget(self.combo_mapping_mode)
+
         self.btn_load_mapping = QPushButton("I. 匯入 Mapping 檔案")
         self.btn_load_mapping.setStyleSheet(btn_style_default)
         self.btn_load_mapping.clicked.connect(self.load_mapping_file)
@@ -262,6 +274,18 @@ class MappingTab(QWidget):
         self.lbl_mapping_path.setStyleSheet("color: #757575; font-size: 11px;")
         self.lbl_mapping_path.setWordWrap(True)
         left_layout.addWidget(self.lbl_mapping_path)
+
+        self.btn_load_mapping_f2 = QPushButton("II. 匯入 F2（Wafer）檔案")
+        self.btn_load_mapping_f2.setStyleSheet(btn_style_default)
+        self.btn_load_mapping_f2.clicked.connect(self.load_mapping_file_f2)
+        self.btn_load_mapping_f2.setVisible(False)
+        left_layout.addWidget(self.btn_load_mapping_f2)
+
+        self.lbl_mapping_f2_path = QLabel("未選擇 F2（Wafer）檔案")
+        self.lbl_mapping_f2_path.setStyleSheet("color: #757575; font-size: 11px;")
+        self.lbl_mapping_f2_path.setWordWrap(True)
+        self.lbl_mapping_f2_path.setVisible(False)
+        left_layout.addWidget(self.lbl_mapping_f2_path)
 
         self.btn_plot_mapping = QPushButton("II. 畫出 Mapping 圖")
         self.btn_plot_mapping.setStyleSheet(btn_style_primary)
@@ -450,6 +474,55 @@ class MappingTab(QWidget):
         y_axis.setTickSpacing(major=y_label_spacing, minor=y_grid_spacing)
         self.heatmap_panel.plot.showGrid(x=True, y=True, alpha=0.35)
 
+    def _on_mapping_mode_changed(self):
+        subtract = self.combo_mapping_mode.currentData() == "subtract"
+        self.btn_load_mapping.setText(
+            "I. 匯入 F1（Chuck）檔案" if subtract else "I. 匯入 Mapping 檔案"
+        )
+        self.btn_load_mapping_f2.setVisible(subtract)
+        self.lbl_mapping_f2_path.setVisible(subtract)
+        if subtract:
+            self.lbl_mapping_path.setText("未選擇 F1（Chuck）檔案")
+        else:
+            self.lbl_mapping_path.setText("未選擇 Mapping 檔案")
+        self.btn_plot_mapping.setEnabled(False)
+        self.btn_export_mapping.setEnabled(False)
+        self.mapping_matrix = None
+        self.mapping_matrix_f1 = None
+        self.mapping_matrix_f2 = None
+        self.plot_drawn = False
+
+    def _read_mapping_file(self, file_path):
+        if file_path.lower().endswith(".npy"):
+            matrix = np.asarray(np.load(file_path), dtype=float)
+            if matrix.ndim != 2:
+                raise ValueError("NPY 必須是二維數值矩陣。")
+            return matrix, np.arange(matrix.shape[1], dtype=float), np.arange(matrix.shape[0], dtype=float)
+
+        df = pd.read_csv(file_path, usecols=["x_rel_mm", "y_rel_mm", "value"])
+        if df.empty:
+            raise ValueError("CSV 檔案不含有效的 x_rel_mm / y_rel_mm / value 資料。")
+        x_vals = np.asarray(df["x_rel_mm"], dtype=float)
+        y_vals = np.asarray(df["y_rel_mm"], dtype=float)
+        z_vals = np.asarray(df["value"], dtype=float)
+        x_unique = np.sort(np.unique(x_vals))
+        y_unique = np.sort(np.unique(y_vals))
+        if x_unique.size < 2 or y_unique.size < 2:
+            raise ValueError("Mapping 檔案需有至少 2 個不同的 X/Y 座標。")
+        matrix = np.full((y_unique.size, x_unique.size), np.nan, dtype=float)
+        matrix[
+            np.searchsorted(y_unique, y_vals),
+            np.searchsorted(x_unique, x_vals),
+        ] = z_vals
+        return matrix, x_unique, y_unique
+
+    def _update_mapping_import_state(self):
+        subtract = self.combo_mapping_mode.currentData() == "subtract"
+        ready = self.mapping_matrix_f1 is not None
+        if subtract:
+            ready = ready and self.mapping_matrix_f2 is not None
+        self.btn_plot_mapping.setEnabled(ready)
+
     def load_mapping_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -461,38 +534,18 @@ class MappingTab(QWidget):
             return
 
         try:
-            if file_path.lower().endswith('.npy'):
-                matrix = np.load(file_path)
-                self.x_coords = np.arange(matrix.shape[1])
-                self.y_coords = np.arange(matrix.shape[0])
+            matrix, x_coords, y_coords = self._read_mapping_file(file_path)
+            self.mapping_matrix_f1 = matrix
+            self.x_coords = x_coords
+            self.y_coords = y_coords
+            self.mapping_f1_path = file_path
+            if self.combo_mapping_mode.currentData() == "subtract":
+                self.lbl_mapping_path.setText(f"F1（Chuck）: {os.path.basename(file_path)}")
+                self.lbl_status.setText(f"狀態: 已匯入 F1（Chuck）{os.path.basename(file_path)}")
             else:
-                df = pd.read_csv(file_path, usecols=['x_rel_mm', 'y_rel_mm', 'value'])
-                if df.empty:
-                    raise ValueError("CSV 檔案不含 x_rel_mm / y_rel_mm / value 資料。")
-
-                x_vals = np.asarray(df['x_rel_mm'], dtype=float)
-                y_vals = np.asarray(df['y_rel_mm'], dtype=float)
-                z_vals = np.asarray(df['value'], dtype=float)
-
-                x_unique = np.unique(x_vals)
-                y_unique = np.unique(y_vals)
-                if x_unique.size < 2 or y_unique.size < 2:
-                    raise ValueError("Mapping 檔案需有至少 2 個不同的 x_rel_mm 與 y_rel_mm 值。")
-
-                x_unique.sort()
-                y_unique.sort()
-                self.x_coords = x_unique
-                self.y_coords = y_unique
-                matrix = np.full((y_unique.size, x_unique.size), np.nan, dtype=float)
-                x_idx = np.searchsorted(x_unique, x_vals)
-                y_idx = np.searchsorted(y_unique, y_vals)
-                matrix[y_idx, x_idx] = z_vals
-
-            self.mapping_matrix = matrix.astype(float)
-            self.mapping_path = file_path
-            self.lbl_mapping_path.setText(os.path.basename(file_path))
-            self.lbl_status.setText(f"狀態: 已匯入 {os.path.basename(file_path)}，請點「畫圖」")
-            self.btn_plot_mapping.setEnabled(True)
+                self.lbl_mapping_path.setText(os.path.basename(file_path))
+                self.lbl_status.setText(f"狀態: 已匯入 {os.path.basename(file_path)}")
+            self._update_mapping_import_state()
             self.btn_export_mapping.setEnabled(False)
             self.chk_roi_enabled.setEnabled(True)
             self._set_roi_spin_ranges()
@@ -501,6 +554,8 @@ class MappingTab(QWidget):
             QMessageBox.critical(self, "匯入失敗", f"無法讀取檔案：\n{str(exc)}")
             self.lbl_status.setText("狀態: 匯入失敗，請選擇有效的 Mapping 檔案")
             self.mapping_matrix = None
+            self.mapping_matrix_f1 = None
+            self.mapping_matrix_f2 = None
             self.x_coords = None
             self.y_coords = None
             self.btn_plot_mapping.setEnabled(False)
@@ -509,10 +564,44 @@ class MappingTab(QWidget):
             self.btn_view_roi.setEnabled(False)
             self._clear_roi_overlay()
 
-    def plot_mapping(self):
-        if self.mapping_matrix is None:
-            QMessageBox.warning(self, "提醒", "請先匯入 Mapping 檔案。")
+    def load_mapping_file_f2(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "選擇 F2（Wafer）Mapping 檔案", "",
+            "CSV 檔 (*.csv);;NumPy 檔 (*.npy);;所有檔案 (*)"
+        )
+        if not file_path:
             return
+        try:
+            matrix, x_coords, y_coords = self._read_mapping_file(file_path)
+            if self.mapping_matrix_f1 is not None:
+                if not np.array_equal(self.x_coords, x_coords) or not np.array_equal(self.y_coords, y_coords):
+                    raise ValueError("F1（Chuck）與 F2（Wafer）的 X/Y 座標網格不一致。")
+                if self.mapping_matrix_f1.shape != matrix.shape:
+                    raise ValueError("F1（Chuck）與 F2（Wafer）的矩陣尺寸不一致。")
+            self.mapping_matrix_f2 = matrix
+            self.x_coords_f2 = x_coords
+            self.y_coords_f2 = y_coords
+            self.mapping_f2_path = file_path
+            self.lbl_mapping_f2_path.setText(f"F2（Wafer）: {os.path.basename(file_path)}")
+            self.lbl_status.setText(f"狀態: 已匯入 F2（Wafer）{os.path.basename(file_path)}")
+            self._update_mapping_import_state()
+        except Exception as exc:
+            QMessageBox.critical(self, "F2 匯入失敗", f"無法讀取 F2（Wafer）：\n{exc}")
+
+    def plot_mapping(self):
+        if self.mapping_matrix_f1 is None:
+            QMessageBox.warning(self, "提醒", "請先匯入 F1（Chuck）或 Mapping 檔案。")
+            return
+
+        if self.combo_mapping_mode.currentData() == "subtract":
+            if self.mapping_matrix_f2 is None:
+                QMessageBox.warning(self, "提醒", "請先匯入 F2（Wafer）檔案。")
+                return
+            self.mapping_matrix = self.mapping_matrix_f1 - self.mapping_matrix_f2
+            plot_title = "Mapping Heatmap（F1 Chuck - F2 Wafer）"
+        else:
+            self.mapping_matrix = self.mapping_matrix_f1.copy()
+            plot_title = "Mapping Heatmap (mm)"
 
         raw_matrix = self.mapping_matrix
         processed_matrix = self._get_processed_matrix()
@@ -521,7 +610,7 @@ class MappingTab(QWidget):
 
         if rect is not None:
             self.heatmap_panel.set_axis_labels("X (mm)", "Y (mm)")
-            self.heatmap_panel.set_plot_title("Mapping Heatmap (mm)")
+            self.heatmap_panel.set_plot_title(plot_title)
         else:
             self.heatmap_panel.set_axis_labels("X Pixels", "Y Pixels")
             self.heatmap_panel.set_plot_title("Mapping Heatmap")
@@ -698,13 +787,25 @@ class MappingTab(QWidget):
         self._clear_contour_lines()
         levels = np.linspace(contour_min, contour_max, 8)
         for level in levels:
+            # 每個 level 合併成一個 PlotDataItem，保留 mm 座標，
+            # 避免逐格建立數千個圖形物件造成 UI 卡住。
             segments = self._marching_squares(matrix, level)
-            for seg in segments:
-                if seg.shape[0] < 2:
+            if not segments:
+                continue
+            line_x = []
+            line_y = []
+            for segment in segments:
+                if segment.shape[0] < 2:
                     continue
-                line = pg.PlotDataItem(seg[:, 0], seg[:, 1], pen=pg.mkPen(color=(50, 50, 50), width=1))
-                self.contour_plot.addItem(line)
-                self.contour_line_items.append(line)
+                line_x.extend([segment[0, 0], segment[1, 0], np.nan])
+                line_y.extend([segment[0, 1], segment[1, 1], np.nan])
+            line = pg.PlotDataItem(
+                np.asarray(line_x, dtype=float),
+                np.asarray(line_y, dtype=float),
+                pen=pg.mkPen(color=(50, 50, 50), width=1),
+            )
+            self.contour_plot.addItem(line)
+            self.contour_line_items.append(line)
 
         if reset_view:
             self.contour_panel.reset_view()
