@@ -499,7 +499,20 @@ class MappingTab(QWidget):
                 raise ValueError("NPY 必須是二維數值矩陣。")
             return matrix, np.arange(matrix.shape[1], dtype=float), np.arange(matrix.shape[0], dtype=float)
 
-        df = pd.read_csv(file_path, usecols=["x_rel_mm", "y_rel_mm", "value"])
+        df = pd.read_csv(file_path)
+        normalized_columns = {
+            str(column).replace("\ufeff", "").strip().lower(): column
+            for column in df.columns
+        }
+        required = ("x_rel_mm", "y_rel_mm", "value")
+        missing = [name for name in required if name not in normalized_columns]
+        if missing:
+            raise ValueError(
+                "CSV 檔案缺少欄位："
+                + ", ".join(missing)
+                + "；需要 x_rel_mm、y_rel_mm、value。"
+            )
+        df = df[[normalized_columns[name] for name in required]].copy()
         if df.empty:
             raise ValueError("CSV 檔案不含有效的 x_rel_mm / y_rel_mm / value 資料。")
         x_vals = np.asarray(df["x_rel_mm"], dtype=float)
@@ -785,10 +798,11 @@ class MappingTab(QWidget):
         self.contour_panel.plot.showGrid(x=True, y=True, alpha=0.35)
 
         self._clear_contour_lines()
-        levels = np.linspace(contour_min, contour_max, 8)
+        # 讓 contour 更連續：從 8 個 level 提升為 16~20 個，
+        # 也避免因為某些格子含 NaN / 未跨 level 而直接中斷整條輪廓。
+        level_count = 18 if contour_max > contour_min else 2
+        levels = np.linspace(contour_min, contour_max, level_count)
         for level in levels:
-            # 每個 level 合併成一個 PlotDataItem，保留 mm 座標，
-            # 避免逐格建立數千個圖形物件造成 UI 卡住。
             segments = self._marching_squares(matrix, level)
             if not segments:
                 continue
@@ -799,6 +813,8 @@ class MappingTab(QWidget):
                     continue
                 line_x.extend([segment[0, 0], segment[1, 0], np.nan])
                 line_y.extend([segment[0, 1], segment[1, 1], np.nan])
+            if not line_x:
+                continue
             line = pg.PlotDataItem(
                 np.asarray(line_x, dtype=float),
                 np.asarray(line_y, dtype=float),
@@ -813,22 +829,24 @@ class MappingTab(QWidget):
     def _marching_squares(self, matrix, level):
         ny, nx = matrix.shape
         segments = []
-        if np.isnan(matrix).any():
-            valid = ~np.isnan(matrix)
-        else:
-            valid = np.ones_like(matrix, dtype=bool)
 
         for iy in range(ny - 1):
             for ix in range(nx - 1):
-                if not valid[iy:iy + 2, ix:ix + 2].all():
-                    continue
-                v0 = matrix[iy, ix]
-                v1 = matrix[iy, ix + 1]
-                v2 = matrix[iy + 1, ix + 1]
-                v3 = matrix[iy + 1, ix]
-                if np.any(np.isnan([v0, v1, v2, v3])):
+                cell = matrix[iy:iy + 2, ix:ix + 2]
+                vals = np.asarray(cell, dtype=float).reshape(-1)
+                finite_mask = np.isfinite(vals)
+                if not np.any(finite_mask):
                     continue
 
+                # 若 cell 有 NaN，先用該 cell 內已有的有效值做局部補值，
+                # 避免因為單點缺失直接使該格完全跳過，導致 contour 斷裂。
+                if np.any(~finite_mask):
+                    fill_value = float(np.nanmean(vals[finite_mask])) if np.any(finite_mask) else 0.0
+                    vals = vals.copy()
+                    vals[~finite_mask] = fill_value
+
+                v0, v1, v2, v3 = vals
+               
                 x0, x1 = self.x_coords[ix], self.x_coords[ix + 1]
                 y0, y1 = self.y_coords[iy], self.y_coords[iy + 1]
                 points = []
