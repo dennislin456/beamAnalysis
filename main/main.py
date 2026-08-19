@@ -8,6 +8,7 @@ from tab_batch_m2 import DataRayBatchM2Tab
 from tab_batch_basler import BaslerBatchTab
 from tab_basler import BaslerTab
 from tab_mapping import MappingTab
+from tab_mapping_filename import MappingFilenameTab
 
 class ModularMatrixApp(QMainWindow):
     def __init__(self):
@@ -29,6 +30,7 @@ class ModularMatrixApp(QMainWindow):
         self.tab_batch_basler = BaslerBatchTab(self)
         self.tab_basler = BaslerTab(self)
         self.tab_mapping = MappingTab(self)
+        self.tab_mapping_filename = MappingFilenameTab(self)
         
         # 將分頁加入 Tab 容器
         self.tabs.addTab(self.tab_dataray, "DataRay (單檔/雙檔)")
@@ -37,6 +39,7 @@ class ModularMatrixApp(QMainWindow):
         self.tabs.addTab(self.tab_batch_basler, "Basler (Batch)")
         self.tabs.addTab(self.tab_basler, "Basler")
         self.tabs.addTab(self.tab_mapping, "Mapping")
+        self.tabs.addTab(self.tab_mapping_filename, "Mapping (檔名平均)")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

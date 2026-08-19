@@ -30,6 +30,7 @@ class MappingRoiWindow(QMainWindow):
         self.y_coords = np.asarray(y_coords, dtype=float)
         self.selected_point_item = None
         self.selected_point = None
+        self.extrema_items = []
 
         host = QWidget(self)
         layout = QVBoxLayout(host)
@@ -47,6 +48,8 @@ class MappingRoiWindow(QMainWindow):
         toolbar.addWidget(self.btn_export)
         self.lbl_point_info = QLabel("滑鼠位置: X=--, Y=--, Value=--")
         toolbar.addWidget(self.lbl_point_info, 1)
+        self.lbl_extrema_info = QLabel("最大/最小: --")
+        toolbar.addWidget(self.lbl_extrema_info, 1)
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
         self.setCentralWidget(host)
@@ -55,6 +58,7 @@ class MappingRoiWindow(QMainWindow):
         vmin, vmax = self._finite_minmax()
         self.panel.set_image(self.matrix.T, rect=rect, levels=(vmin, vmax), reset_view=True)
         self._configure_grid()
+        self._add_extrema_markers()
         self.panel.mouseMoved.connect(self._on_mouse_moved)
         self.panel.plot.scene().sigMouseClicked.connect(self._on_clicked)
 
@@ -88,6 +92,42 @@ class MappingRoiWindow(QMainWindow):
         self.panel.plot.getAxis("bottom").setTickSpacing(major=x_label, minor=x_grid)
         self.panel.plot.getAxis("left").setTickSpacing(major=y_label, minor=y_grid)
         self.panel.plot.showGrid(x=True, y=True, alpha=0.35)
+
+    def _add_extrema_markers(self):
+        """在 ROI 內以 X 標示最大值與最小值。"""
+        finite_mask = np.isfinite(self.matrix)
+        if not np.any(finite_mask):
+            self.lbl_extrema_info.setText("最大/最小: 無有效數值")
+            return
+
+        finite_values = np.where(finite_mask, self.matrix, np.nan)
+        max_index = np.unravel_index(np.nanargmax(finite_values), self.matrix.shape)
+        min_index = np.unravel_index(np.nanargmin(finite_values), self.matrix.shape)
+        max_y, max_x = max_index
+        min_y, min_x = min_index
+        max_value = float(self.matrix[max_y, max_x])
+        min_value = float(self.matrix[min_y, min_x])
+
+        max_item = pg.ScatterPlotItem(
+            x=[self.x_coords[max_x]], y=[self.y_coords[max_y]],
+            symbol="x", size=26,
+            pen=pg.mkPen("#7F0000", width=5),
+            brush=None,
+        )
+        min_item = pg.ScatterPlotItem(
+            x=[self.x_coords[min_x]], y=[self.y_coords[min_y]],
+            symbol="x", size=26,
+            pen=pg.mkPen("#001B5E", width=5),
+            brush=None,
+        )
+        self.panel.plot.addItem(max_item, ignoreBounds=True)
+        self.panel.plot.addItem(min_item, ignoreBounds=True)
+        self.extrema_items.extend([max_item, min_item])
+        self.lbl_extrema_info.setText(
+            f"最大 X: ({self.x_coords[max_x]:.3f}, {self.y_coords[max_y]:.3f}) "
+            f"= {max_value:.6f} ｜ 最小 X: ({self.x_coords[min_x]:.3f}, "
+            f"{self.y_coords[min_y]:.3f}) = {min_value:.6f}"
+        )
 
     def _on_mouse_moved(self, point):
         if self.selected_point is not None:

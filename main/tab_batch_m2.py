@@ -3,11 +3,9 @@
 可選框選 ROI（X/Y/Width/Height）：僅在固定矩形內做縱切找波谷，避免散射雜點干擾。
 """
 import os
-import json
 import csv
 from datetime import datetime
 import numpy as np
-import pandas as pd
 import pyqtgraph as pg
 import pyqtgraph.exporters as pg_export
 from scipy.ndimage import uniform_filter
@@ -18,8 +16,6 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 from PyQt5.QtCore import Qt
-
-import openpyxl
 
 from shared_components import (
     HeatmapViewerWindow, find_dual_peak_valley_y, split_y_index,
@@ -1225,7 +1221,8 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             session["summary_columns"],
         )
 
-        with zipfile.ZipFile(session["zip_path"], "w", zipfile.ZIP_DEFLATED) as zipf:
+        # PNG 已經壓縮過；使用 ZIP_STORED，避免再次壓縮造成大量等待。
+        with zipfile.ZipFile(session["zip_path"], "w", zipfile.ZIP_STORED) as zipf:
             for root, _dirs, files in os.walk(session["tmp_root"]):
                 for name in files:
                     abs_path = os.path.join(root, name)
@@ -1259,6 +1256,8 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                 QApplication.processEvents()
 
                 group_name = f"Group_{idx + 1:02d}"
+                safe_loc = "Location"
+                safe_fname = f"Group_{idx + 1:04d}"
                 if idx < len(self.batch_pairs):
                     loc = self.batch_pairs[idx]["location"]
                     fname = os.path.splitext(self.batch_pairs[idx]["filename"])[0]
@@ -1268,13 +1267,15 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                     )
                     group_name = f"Group_{idx + 1:02d}_{safe_loc}_{safe_fname}"
 
-                group_dir = os.path.join(session["tmp_root"], group_name)
+                # 同一位置的所有資料放在同一個資料夾，每筆資料使用獨立檔名。
+                group_dir = os.path.join(session["tmp_root"], safe_loc)
                 os.makedirs(group_dir, exist_ok=True)
-                base_path = os.path.join(group_dir, "Result")
+                base_path = os.path.join(group_dir, f"Group_{idx + 1:04d}_{safe_fname}")
 
                 spot_rows = self._export_single_group_like_dataray(base_path, idx)
-                # 匯出需求只保留：參數 JSON、無 colorbar/標示的 Heatmap、統整 CSV。
+                # 匯出只保留無 colorbar/標示的 Heatmap；參數與其他中間檔不放入 ZIP。
                 for suffix in (
+                    ".json",
                     "_Result.xlsx",
                     "_Spot_Analysis.xlsx",
                     "_V_Profile.png",
@@ -1297,6 +1298,16 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                     if idx < len(self.batch_pairs):
                         src_fname = str(self.batch_pairs[idx].get("filename", ""))
                         src_loc = str(self.batch_pairs[idx].get("location", ""))
+                    note = (
+                        f"模式={self._get_p2_point_mode_name()}; "
+                        f"門檻={'啟用' if self.chk_batch_p2_use_threshold.isChecked() else '停用'} "
+                        f"{self.batch_pixel_pitch_um:g}um/px; "
+                        f"門檻比例={self.spin_batch_p2_thresh_percent.value():g}%"
+                    )
+                    value_map["備註"] = note
+                    unit_map["備註"] = ""
+                    if "備註" not in session["item_order"]:
+                        session["item_order"].append("備註")
                     session["summary_columns"].append((group_name, value_map, unit_map, src_fname, src_loc))
 
                 session["next_idx"] = idx + 1
@@ -1342,7 +1353,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                 self, "成功",
                 f"匯出完成！\n\nZIP：\n{session['zip_path']}\n\n"
                 f"彙整統計 CSV：\n{session['summary_csv_path']}\n\n"
-                f"每組含：參數 JSON／Heatmap_With_Profiles.png（無 colorbar 與定位標示）"
+                f"每個位置資料夾含各筆 Heatmap_With_Profiles.png（保留 X/Y 剖面，無 colorbar 與定位標示）"
             )
             self._cleanup_export_session()
             self._export_paused = False
@@ -1462,8 +1473,8 @@ class DataRayBatchM2Tab(DataRayBatchTab):
     def _export_heatmap_without_crosses(self, output_path):
         """匯出含左右/下方剖面的 Heatmap，不含 colorbar 與定位標示。"""
         hidden_items = []
-        for item in self.batch_cross_items:
-            if item is not None and item.isVisible():
+        for item in self.plot_batch_heat.items:
+            if item is not self.batch_image_item and item is not None and item.isVisible():
                 item.hide()
                 hidden_items.append(item)
         hist_visible = self.batch_hist.isVisible()
@@ -1507,50 +1518,6 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         pair = self.batch_pairs[idx] if idx < len(self.batch_pairs) else {}
         location = pair.get("location", "")
         filename = pair.get("filename", "")
-
-        path = base_path + ".json"
-        config_params = {
-            "ma_kernel_size": 31,
-            "colorbar_min": float(c_min),
-            "colorbar_max": float(c_max),
-            "cross_size": 40,
-            "heatmap_click_points": click_points,
-            "mode": "m2_only",
-            "split_valley_y_px": self.batch_split_y,
-            "split_centroid_x_px": self.batch_split_cx,
-            "split_peak_ys": list(self.batch_split_peak_ys) if self.batch_split_peak_ys else None,
-            "valley_roi_enabled": self.chk_batch_valley_roi.isChecked(),
-            "valley_roi_x": self.spin_batch_valley_roi_x.value() if self.chk_batch_valley_roi.isChecked() else None,
-            "valley_roi_y": self.spin_batch_valley_roi_y.value() if self.chk_batch_valley_roi.isChecked() else None,
-            "valley_roi_w": self.spin_batch_valley_roi_w.value() if self.chk_batch_valley_roi.isChecked() else None,
-            "valley_roi_h": self.spin_batch_valley_roi_h.value() if self.chk_batch_valley_roi.isChecked() else None,
-            "valley_roi_bounds": list(self.batch_valley_roi_bounds) if self.batch_valley_roi_bounds else None,
-            "m2_below_x_px": m2_pt[0] if m2_pt else None,
-            "m2_below_y_px": m2_pt[1] if m2_pt else None,
-            "m2_above_x_px": m2a_pt[0] if m2a_pt else None,
-            "m2_above_y_px": m2a_pt[1] if m2a_pt else None,
-            "m2_below_inscribed_r_px": getattr(self, "batch_m2_below_circle_r", None),
-            "m2_above_inscribed_r_px": getattr(self, "batch_m2_above_circle_r", None),
-            "p2_point_mode": self._get_p2_point_mode_name(),
-            "p2_use_threshold": self.chk_batch_p2_use_threshold.isChecked(),
-            "p2_threshold_percent": self.spin_batch_p2_thresh_percent.value(),
-            "batch_group_index": idx + 1,
-            "batch_location": location,
-            "batch_filename": filename,
-            "batch_m2_file": os.path.basename(self.batch_m2_files[idx]) if idx < len(self.batch_m2_files) else "",
-            "batch_m2_path": self.batch_m2_files[idx] if idx < len(self.batch_m2_files) else "",
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(config_params, f, indent=4, ensure_ascii=False)
-
-        excel_img_path = f"{base_path}_Result.xlsx"
-        pd.DataFrame(self.batch_result_matrix).to_excel(excel_img_path, index=False, header=False)
-
-        spot_analysis_excel_path = f"{base_path}_Spot_Analysis.xlsx"
-        wb_spot = openpyxl.Workbook()
-        ws_spot = wb_spot.active
-        ws_spot.title = "Spot_and_Measurement"
-        ws_spot.append(["Item", "Value", "Unit"])
 
         p2 = m2_pt if m2_pt is not None else ("--", "--")
         p2a = m2a_pt if m2a_pt is not None else ("--", "--")
@@ -1601,29 +1568,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             ["M2Above to M2Below Total Distance (Real)", dist_ab_um, "μm"],
             ["Cross Marker Size", 40, "px"],
         ]
-        for r in spot_rows:
-            ws_spot.append(r)
-        wb_spot.save(spot_analysis_excel_path)
-
         heatmap_img_path = f"{base_path}_Heatmap_With_Profiles.png"
         self._export_heatmap_without_crosses(heatmap_img_path)
 
-        contour_img_path = f"{base_path}_Contour.png"
-        smoothed = uniform_filter(self.batch_result_matrix, size=31, mode="nearest")
-        temp_win = pg.GraphicsLayoutWidget()
-        plot_contour = temp_win.addPlot(title="Smoothed Contour Map")
-        plot_contour.getViewBox().invertY(False)
-        plot_contour.setAspectLocked(True)
-        plot_contour.setLabel("bottom", "X Pixels")
-        plot_contour.setLabel("left", "Y Pixels")
-        contour_img = pg.ImageItem(smoothed.T)
-        plot_contour.addItem(contour_img)
-        min_v, max_v = float(np.min(smoothed)), float(np.max(smoothed))
-        for level in np.linspace(min_v, max_v, 10):
-            iso = pg.IsocurveItem(data=smoothed.T, level=level, pen=pg.mkPen("w", width=0.8))
-            plot_contour.addItem(iso)
-        QApplication.processEvents()
-        pg_export.ImageExporter(plot_contour).export(contour_img_path)
-        temp_win.close()
-        temp_win.deleteLater()
         return spot_rows
