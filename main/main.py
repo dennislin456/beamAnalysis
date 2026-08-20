@@ -36,10 +36,10 @@ class ModularMatrixApp(QMainWindow):
         self.tabs.addTab(self.tab_dataray, "DataRay (單檔/雙檔)")
         self.tabs.addTab(self.tab_batch, "DataRay (Batch 批量)")
         self.tabs.addTab(self.tab_batch_m2, "DataRay (M2 Batch)")
-        self.tabs.addTab(self.tab_batch_basler, "Basler (Batch)")
+        self.tabs.addTab(self.tab_batch_basler, "Basler (M2 Batch)")
         self.tabs.addTab(self.tab_basler, "Basler")
         self.tabs.addTab(self.tab_mapping, "Mapping")
-        self.tabs.addTab(self.tab_mapping_filename, "Mapping (檔名平均)")
+        self.tabs.addTab(self.tab_mapping_filename, "Mapping (Batch)")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
