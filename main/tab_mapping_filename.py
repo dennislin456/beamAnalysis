@@ -5,10 +5,10 @@ import os
 import re
 
 import numpy as np
-import pyqtgraph as pg
 
-from PyQt5.QtWidgets import QFileDialog, QMessageBox
-from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QFileDialog, QMessageBox, QGraphicsRectItem
+from PyQt5.QtGui import QBrush, QColor, QPen
+from PyQt5.QtCore import Qt, QRectF
 
 from tab_mapping import MappingTab, MappingRoiWindow
 
@@ -101,57 +101,119 @@ class MappingFilenameTab(MappingTab):
             f"Min={min_text}, Max={max_text}, STD={std_text}"
         )
 
+    def _build_image_rect(self, matrix):
+        """單列／單欄時父類 dy/dx 會變成 0，影像無法對到 mm，點擊與紅框都會失效。"""
+        if self.x_coords is None or self.y_coords is None or matrix is None:
+            return None
+        dx = float(self._grid_spacing(self.x_coords))
+        dy = float(self._grid_spacing(self.y_coords))
+        if not np.isfinite(dx) or dx <= 0:
+            dx = 1.0
+        if not np.isfinite(dy) or dy <= 0:
+            dy = 1.0
+        x0 = float(np.min(self.x_coords)) - dx / 2.0
+        y0 = float(np.min(self.y_coords)) - dy / 2.0
+        return QRectF(x0, y0, dx * matrix.shape[1], dy * matrix.shape[0])
+
+    def _cell_rect_bounds(self, ix, iy):
+        """回傳與 heatmap 色塊對齊的格子邊界（畫面座標）。"""
+        rect = self._build_image_rect(self.mapping_matrix)
+        ny, nx = self.mapping_matrix.shape
+        if rect is None or nx <= 0 or ny <= 0:
+            x0, x1 = MappingRoiWindow._cell_bounds(self.x_coords, ix)
+            y0, y1 = MappingRoiWindow._cell_bounds(self.y_coords, iy)
+            return x0, x1, y0, y1
+        dx = rect.width() / nx
+        dy = rect.height() / ny
+        x0 = rect.left() + ix * dx
+        y0 = rect.top() + iy * dy
+        return float(x0), float(x0 + dx), float(y0), float(y0 + dy)
+
+    def _cell_index_from_view(self, x, y):
+        """依點擊落在哪個色塊來選格，而不是用 mm 最近點（1 列資料時會永遠選到第一點）。"""
+        ny, nx = self.mapping_matrix.shape
+        rect = self._build_image_rect(self.mapping_matrix)
+        if rect is None or rect.width() <= 0 or rect.height() <= 0:
+            ix = int(np.abs(self.x_coords - x).argmin())
+            iy = int(np.abs(self.y_coords - y).argmin())
+            return ix, iy
+        ix = int(np.floor((float(x) - rect.left()) / (rect.width() / nx)))
+        iy = int(np.floor((float(y) - rect.top()) / (rect.height() / ny)))
+        return int(np.clip(ix, 0, nx - 1)), int(np.clip(iy, 0, ny - 1))
+
+    @staticmethod
+    def _disable_overlay_mouse(item):
+        """選取框不得攔截滑鼠，否則無法再點其他格子。"""
+        targets = [item]
+        for name in ("curve", "scatter"):
+            sub = getattr(item, name, None)
+            if sub is not None:
+                targets.append(sub)
+        for target in targets:
+            try:
+                target.setAcceptedMouseButtons(Qt.NoButton)
+            except Exception:
+                pass
+            if hasattr(target, "setClickable"):
+                try:
+                    target.setClickable(False)
+                except Exception:
+                    pass
+
+    def _draw_selected_point_box(self, ix, iy):
+        self._clear_selected_point()
+        x0, x1, y0, y1 = self._cell_rect_bounds(ix, iy)
+        item = QGraphicsRectItem(x0, y0, x1 - x0, y1 - y0)
+        pen = QPen(QColor("#FF0000"))
+        pen.setWidth(3)
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        item.setBrush(QBrush(Qt.NoBrush))
+        item.setZValue(1000)
+        item.setAcceptedMouseButtons(Qt.NoButton)
+        self.plot.addItem(item, ignoreBounds=True)
+        self.selected_point_item = item
+
+    def _apply_selected_cell(self, ix, iy):
+        self.selected_point = (ix, iy)
+        self._update_point_info_with_std(ix, iy, "已固定")
+        self._draw_selected_point_box(ix, iy)
+
     def _on_heatmap_mouse_moved(self, mouse_point):
-        super()._on_heatmap_mouse_moved(mouse_point)
         if self.mapping_matrix is None or self.x_coords is None or self.y_coords is None:
+            super()._on_heatmap_mouse_moved(mouse_point)
             return
         if self.selected_point is not None:
             ix, iy = self.selected_point
             self._update_point_info_with_std(ix, iy, "已固定")
             return
         if mouse_point is None:
+            self.lbl_mouse_info.setText("滑鼠位置: X=--, Y=--, Value=--")
             return
-        ix = int(np.clip(np.abs(self.x_coords - mouse_point.x()).argmin(), 0, self.mapping_matrix.shape[1] - 1))
-        iy = int(np.clip(np.abs(self.y_coords - mouse_point.y()).argmin(), 0, self.mapping_matrix.shape[0] - 1))
+        ix, iy = self._cell_index_from_view(mouse_point.x(), mouse_point.y())
         self._update_point_info_with_std(ix, iy, "滑鼠位置")
 
     def _on_heatmap_clicked(self, event):
         if self.mapping_matrix is None or not self.plot_drawn:
             return
-        if event.button() != Qt.LeftButton:
+        # 雙擊交給 InteractiveHeatmapPanel 復原視野
+        if event.double():
+            return
+        button = event.button()
+        if button not in (Qt.LeftButton, Qt.NoButton):
             return
         pos = event.scenePos()
-        if not self.heatmap_panel.plot.sceneBoundingRect().contains(pos):
+        try:
+            if self.heatmap_panel.hist.sceneBoundingRect().contains(pos):
+                return
+        except Exception:
+            pass
+        if not self.plot.sceneBoundingRect().contains(pos):
             return
 
-        point = self.heatmap_panel.plot.getViewBox().mapSceneToView(pos)
-        ix = int(np.clip(
-            np.abs(self.x_coords - point.x()).argmin(),
-            0, self.mapping_matrix.shape[1] - 1,
-        ))
-        iy = int(np.clip(
-            np.abs(self.y_coords - point.y()).argmin(),
-            0, self.mapping_matrix.shape[0] - 1,
-        ))
-        self.selected_point = (ix, iy)
-        self._update_point_info_with_std(ix, iy, "已固定")
-
-        if self.selected_point_item is not None:
-            self.plot.removeItem(self.selected_point_item)
-        x = float(self.x_coords[ix])
-        y = float(self.y_coords[iy])
-        x0, x1 = MappingRoiWindow._cell_bounds(self.x_coords, ix)
-        y0, y1 = MappingRoiWindow._cell_bounds(self.y_coords, iy)
-        self.selected_point_item = pg.PlotDataItem(
-            [x0, x1, x1, x0, x0],
-            [y0, y0, y1, y1, y0],
-            pen=pg.mkPen("#FF0000", width=3),
-        )
-        self.plot.addItem(self.selected_point_item, ignoreBounds=True)
-        try:
-            self.selected_point_item.setAcceptedMouseButtons(Qt.NoButton)
-        except AttributeError:
-            pass
+        point = self.plot.getViewBox().mapSceneToView(pos)
+        ix, iy = self._cell_index_from_view(point.x(), point.y())
+        self._apply_selected_cell(ix, iy)
 
     def load_mapping_file(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -228,12 +290,27 @@ class MappingFilenameTab(MappingTab):
             self.btn_plot_mapping.setEnabled(False)
             self.btn_export_mapping.setEnabled(False)
 
+    def _update_roi_overlay(self):
+        super()._update_roi_overlay()
+        if self.roi_rect_item is not None:
+            try:
+                self.roi_rect_item.setZValue(500)
+            except Exception:
+                pass
+            self._disable_overlay_mouse(self.roi_rect_item)
+
     def plot_mapping(self):
         if self.mapping_matrix_f1 is None:
             QMessageBox.warning(self, "提醒", "請先匯入 JSON 檔案。")
             return
+        self.selected_point = None
+        self._clear_selected_point()
         self.mapping_matrix = self.mapping_matrix_f1.copy()
         super().plot_mapping()
+        try:
+            self.image_item.setZValue(0)
+        except Exception:
+            pass
         self.heatmap_panel.set_plot_title("Filename Mapping (average dist_ifc)")
         self.contour_panel.set_plot_title("Filename Mapping Contour")
         unit_text = ", ".join(sorted(self._filename_units)) if self._filename_units else ""
