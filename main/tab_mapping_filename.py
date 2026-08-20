@@ -5,10 +5,12 @@ import os
 import re
 
 import numpy as np
+import pyqtgraph as pg
 
 from PyQt5.QtWidgets import QFileDialog, QMessageBox
+from PyQt5.QtCore import Qt
 
-from tab_mapping import MappingTab
+from tab_mapping import MappingTab, MappingRoiWindow
 
 
 _COORD_RE = re.compile(
@@ -64,7 +66,92 @@ class MappingFilenameTab(MappingTab):
             dist_value = float("nan")
         if not np.isfinite(dist_value):
             raise ValueError(f"JSON 沒有有效的 value.dist_ifc：{os.path.basename(file_path)}")
-        return dist_value, str(unit)
+        x_value = data.get("x_mm")
+        y_value = data.get("y_mm")
+        if x_value is None or y_value is None:
+            raise ValueError(f"JSON 沒有有效的 x_mm/y_mm：{os.path.basename(file_path)}")
+        return dist_value, str(unit), float(x_value), float(y_value)
+
+    def _std_for_point(self, ix, iy):
+        """取得目前 X/Y 點所有原始 dist_ifc 的母體標準差。"""
+        if self.x_coords is None or self.y_coords is None:
+            return float("nan")
+        x = float(self.x_coords[ix])
+        y = float(self.y_coords[iy])
+        values = self._filename_groups.get((x, y), [])
+        if not values:
+            return float("nan")
+        return float(np.std(values, ddof=0))
+
+    def _update_point_info_with_std(self, ix, iy, prefix):
+        value = self.mapping_matrix[iy, ix]
+        value_text = "NaN" if np.isnan(value) else f"{value:.6f}"
+        values = self._filename_groups.get(
+            (float(self.x_coords[ix]), float(self.y_coords[iy])), []
+        )
+        finite_values = np.asarray(values, dtype=float)
+        finite_values = finite_values[np.isfinite(finite_values)]
+        min_text = f"{np.min(finite_values):.6f}" if finite_values.size else "NaN"
+        max_text = f"{np.max(finite_values):.6f}" if finite_values.size else "NaN"
+        std = self._std_for_point(ix, iy)
+        std_text = "NaN" if not np.isfinite(std) else f"{std:.6f}"
+        self.lbl_mouse_info.setText(
+            f"{prefix}: X={self.x_coords[ix]:.3f} mm, "
+            f"Y={self.y_coords[iy]:.3f} mm, Value={value_text}, "
+            f"Min={min_text}, Max={max_text}, STD={std_text}"
+        )
+
+    def _on_heatmap_mouse_moved(self, mouse_point):
+        super()._on_heatmap_mouse_moved(mouse_point)
+        if self.mapping_matrix is None or self.x_coords is None or self.y_coords is None:
+            return
+        if self.selected_point is not None:
+            ix, iy = self.selected_point
+            self._update_point_info_with_std(ix, iy, "已固定")
+            return
+        if mouse_point is None:
+            return
+        ix = int(np.clip(np.abs(self.x_coords - mouse_point.x()).argmin(), 0, self.mapping_matrix.shape[1] - 1))
+        iy = int(np.clip(np.abs(self.y_coords - mouse_point.y()).argmin(), 0, self.mapping_matrix.shape[0] - 1))
+        self._update_point_info_with_std(ix, iy, "滑鼠位置")
+
+    def _on_heatmap_clicked(self, event):
+        if self.mapping_matrix is None or not self.plot_drawn:
+            return
+        if event.button() != Qt.LeftButton:
+            return
+        pos = event.scenePos()
+        if not self.heatmap_panel.plot.sceneBoundingRect().contains(pos):
+            return
+
+        point = self.heatmap_panel.plot.getViewBox().mapSceneToView(pos)
+        ix = int(np.clip(
+            np.abs(self.x_coords - point.x()).argmin(),
+            0, self.mapping_matrix.shape[1] - 1,
+        ))
+        iy = int(np.clip(
+            np.abs(self.y_coords - point.y()).argmin(),
+            0, self.mapping_matrix.shape[0] - 1,
+        ))
+        self.selected_point = (ix, iy)
+        self._update_point_info_with_std(ix, iy, "已固定")
+
+        if self.selected_point_item is not None:
+            self.plot.removeItem(self.selected_point_item)
+        x = float(self.x_coords[ix])
+        y = float(self.y_coords[iy])
+        x0, x1 = MappingRoiWindow._cell_bounds(self.x_coords, ix)
+        y0, y1 = MappingRoiWindow._cell_bounds(self.y_coords, iy)
+        self.selected_point_item = pg.PlotDataItem(
+            [x0, x1, x1, x0, x0],
+            [y0, y0, y1, y1, y0],
+            pen=pg.mkPen("#FF0000", width=3),
+        )
+        self.plot.addItem(self.selected_point_item, ignoreBounds=True)
+        try:
+            self.selected_point_item.setAcceptedMouseButtons(Qt.NoButton)
+        except AttributeError:
+            pass
 
     def load_mapping_file(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -83,7 +170,8 @@ class MappingFilenameTab(MappingTab):
             for path in paths:
                 try:
                     coordinate = self._parse_coordinate(path)
-                    distance, unit = self._read_dist_ifc(path)
+                    distance, unit, x_mm, y_mm = self._read_dist_ifc(path)
+                    coordinate = (x_mm, y_mm)
                     groups.setdefault(coordinate, []).append(distance)
                     if unit:
                         units.add(unit)
