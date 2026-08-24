@@ -3,20 +3,60 @@
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
+import pyqtgraph.exporters as pg_export
 
-from PyQt5.QtWidgets import QFileDialog, QMessageBox, QGraphicsRectItem
+from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox, QGraphicsRectItem
 from PyQt5.QtGui import QBrush, QColor, QPen
 from PyQt5.QtCore import Qt, QRectF
 
 from tab_mapping import MappingTab, MappingRoiWindow
+
+try:
+    import orjson as _fast_json
+except ImportError:  # pragma: no cover
+    _fast_json = None
 
 
 _COORD_RE = re.compile(
     r"X(?P<x_sign>-?)(?P<x_int>\d+(?:p\d+)?)_Y(?P<y_sign>-?)(?P<y_int>\d+(?:p\d+)?)",
     re.IGNORECASE,
 )
+
+# 大量 JSON 時用執行緒吃磁碟／解析；上限避免開太多 thread
+_IMPORT_WORKERS = min(32, max(4, (os.cpu_count() or 4) * 2))
+
+
+def _load_json_obj(file_path):
+    """優先 orjson（若已安裝），否則標準 json。"""
+    if _fast_json is not None:
+        with open(file_path, "rb") as fh:
+            return _fast_json.loads(fh.read())
+    with open(file_path, "r", encoding="utf-8-sig") as fh:
+        return json.load(fh)
+
+
+def _read_one_mapping_json(file_path):
+    """單一檔讀取（給 thread pool 用）。"""
+    try:
+        data = _load_json_obj(file_path)
+        value = data.get("value", {})
+        if not isinstance(value, dict):
+            value = {}
+        dist = value.get("dist_ifc", data.get("dist_ifc"))
+        unit = value.get("dist_ifc_unit", data.get("dist_ifc_unit", "")) or ""
+        dist_value = float(dist)
+        if not np.isfinite(dist_value):
+            raise ValueError(f"JSON 沒有有效的 value.dist_ifc：{os.path.basename(file_path)}")
+        x_value = data.get("x_mm")
+        y_value = data.get("y_mm")
+        if x_value is None or y_value is None:
+            raise ValueError(f"JSON 沒有有效的 x_mm/y_mm：{os.path.basename(file_path)}")
+        return file_path, dist_value, str(unit), float(x_value), float(y_value), None
+    except Exception as exc:
+        return file_path, None, None, None, None, exc
 
 
 class MappingFilenameTab(MappingTab):
@@ -25,7 +65,7 @@ class MappingFilenameTab(MappingTab):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.combo_mapping_mode.hide()
-        self.btn_load_mapping.setText("I. 匯入 JSON 檔案（可多選）")
+        self.btn_load_mapping.setText("I. 匯入 JSON 資料夾／檔案")
         self.btn_load_mapping_f2.hide()
         self.lbl_mapping_f2_path.hide()
         self.lbl_mapping_path.setText("未選擇 JSON 檔案")
@@ -53,24 +93,59 @@ class MappingFilenameTab(MappingTab):
 
     @staticmethod
     def _read_dist_ifc(file_path):
-        with open(file_path, "r", encoding="utf-8-sig") as fh:
-            data = json.load(fh)
-        value = data.get("value", {})
-        if not isinstance(value, dict):
-            value = {}
-        dist = value.get("dist_ifc", data.get("dist_ifc"))
-        unit = value.get("dist_ifc_unit", data.get("dist_ifc_unit", ""))
-        try:
-            dist_value = float(dist)
-        except (TypeError, ValueError):
-            dist_value = float("nan")
-        if not np.isfinite(dist_value):
-            raise ValueError(f"JSON 沒有有效的 value.dist_ifc：{os.path.basename(file_path)}")
-        x_value = data.get("x_mm")
-        y_value = data.get("y_mm")
-        if x_value is None or y_value is None:
-            raise ValueError(f"JSON 沒有有效的 x_mm/y_mm：{os.path.basename(file_path)}")
-        return dist_value, str(unit), float(x_value), float(y_value)
+        _path, dist_value, unit, x_value, y_value, err = _read_one_mapping_json(file_path)
+        if err is not None:
+            raise err
+        return dist_value, unit, x_value, y_value
+
+    def _collect_json_paths(self):
+        """優先選資料夾（適合上萬筆）；取消後可改多選檔案。"""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "選擇 JSON 資料夾（取消則改為多選檔案）",
+            "",
+        )
+        if folder:
+            paths = [
+                os.path.join(folder, name)
+                for name in os.listdir(folder)
+                if name.lower().endswith(".json")
+            ]
+            paths.sort()
+            return paths
+
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "選擇檔案 Mapping JSON（可多選）",
+            "",
+            "JSON 檔 (*.json);;所有檔案 (*)",
+        )
+        return paths
+
+    def _ingest_paths_parallel(self, paths):
+        """平行讀取 JSON，回傳 (groups, units, skipped)。"""
+        groups = {}
+        units = set()
+        skipped = []
+        total = len(paths)
+        done = 0
+        workers = min(_IMPORT_WORKERS, max(1, total))
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_read_one_mapping_json, path) for path in paths]
+            for future in as_completed(futures):
+                path, distance, unit, x_mm, y_mm, err = future.result()
+                done += 1
+                if done == 1 or done == total or done % 500 == 0:
+                    self.lbl_status.setText(f"狀態: 匯入中 {done}/{total} …")
+                    QApplication.processEvents()
+                if err is not None:
+                    skipped.append(f"{os.path.basename(path)}: {err}")
+                    continue
+                groups.setdefault((x_mm, y_mm), []).append(distance)
+                if unit:
+                    units.add(unit)
+        return groups, units, skipped
 
     def _std_for_point(self, ix, iy):
         """取得目前 X/Y 點所有原始 dist_ifc 的母體標準差。"""
@@ -216,29 +291,15 @@ class MappingFilenameTab(MappingTab):
         self._apply_selected_cell(ix, iy)
 
     def load_mapping_file(self):
-        paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "選擇檔案 Mapping JSON（可多選）",
-            "",
-            "JSON 檔 (*.json);;所有檔案 (*)",
-        )
+        paths = self._collect_json_paths()
         if not paths:
             return
 
+        self.btn_load_mapping.setEnabled(False)
+        self.lbl_status.setText(f"狀態: 開始平行匯入 {len(paths)} 筆 JSON …")
+        QApplication.processEvents()
         try:
-            groups = {}
-            units = set()
-            skipped = []
-            for path in paths:
-                try:
-                    coordinate = self._parse_coordinate(path)
-                    distance, unit, x_mm, y_mm = self._read_dist_ifc(path)
-                    coordinate = (x_mm, y_mm)
-                    groups.setdefault(coordinate, []).append(distance)
-                    if unit:
-                        units.add(unit)
-                except (OSError, ValueError, json.JSONDecodeError) as exc:
-                    skipped.append(f"{os.path.basename(path)}: {exc}")
+            groups, units, skipped = self._ingest_paths_parallel(paths)
 
             if not groups:
                 detail = "\n".join(skipped[:8])
@@ -266,7 +327,7 @@ class MappingFilenameTab(MappingTab):
             )
             unit_text = ", ".join(sorted(units)) if units else "未提供單位"
             self.lbl_status.setText(
-                f"狀態: 已載入檔名座標並平均 dist_ifc（單位: {unit_text}），請點「畫圖」"
+                f"狀態: 已載入並平均 dist_ifc（單位: {unit_text}），請點「畫圖」"
             )
             if skipped:
                 QMessageBox.warning(
@@ -289,6 +350,8 @@ class MappingFilenameTab(MappingTab):
             self.y_coords = None
             self.btn_plot_mapping.setEnabled(False)
             self.btn_export_mapping.setEnabled(False)
+        finally:
+            self.btn_load_mapping.setEnabled(True)
 
     def _update_roi_overlay(self):
         super()._update_roi_overlay()
@@ -318,3 +381,82 @@ class MappingFilenameTab(MappingTab):
             f"狀態: 已繪製平均 Mapping｜{len(self._filename_groups)} 個點"
             + (f"｜單位: {unit_text}" if unit_text else "")
         )
+
+    def _point_stats(self, x, y, mean_value):
+        """回傳單一 X/Y 點的 mean / min / max / std（母體）。"""
+        values = np.asarray(self._filename_groups.get((float(x), float(y)), []), dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            mean_text = "nan" if not np.isfinite(mean_value) else f"{mean_value:.6f}"
+            return mean_text, "nan", "nan", "nan", 0
+        mean_text = f"{float(np.mean(values)):.6f}"
+        min_text = f"{float(np.min(values)):.6f}"
+        max_text = f"{float(np.max(values)):.6f}"
+        std_text = f"{float(np.std(values, ddof=0)):.6f}"
+        return mean_text, min_text, max_text, std_text, int(values.size)
+
+    def export_mapping(self):
+        """匯出圖檔，並在 CSV 附上各點 mean / min / max / std。"""
+        if self.mapping_matrix is None:
+            QMessageBox.warning(self, "提醒", "請先匯入並繪製 Mapping。")
+            return
+        if not self.export_dir:
+            QMessageBox.warning(self, "提醒", "請先選擇儲存資料夾。")
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "匯出 Heatmap 檔名",
+            os.path.join(self.export_dir, "mapping_heatmap.png"),
+            "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)",
+        )
+        if not save_path:
+            return
+
+        avg_matrix = self._get_processed_matrix()
+        selected_item = self.selected_point_item
+        try:
+            base_name = os.path.splitext(os.path.basename(save_path))[0]
+            ext = os.path.splitext(save_path)[1] or ".png"
+            heatmap_path = save_path
+            contour_path = os.path.join(self.export_dir, f"{base_name}_contour{ext}")
+
+            if selected_item is not None:
+                selected_item.hide()
+            for panel, out_path in (
+                (self.heatmap_panel, heatmap_path),
+                (self.contour_panel, contour_path),
+            ):
+                target = panel.plot
+                exporter = pg_export.ImageExporter(target)
+                exporter.parameters()["width"] = max(int(panel.plot.width()), 400)
+                exporter.parameters()["height"] = max(int(panel.plot.height()), 300)
+                exporter.export(out_path)
+
+            csv_path = os.path.join(self.export_dir, f"{base_name}.csv")
+            with open(csv_path, "w", encoding="utf-8") as fh:
+                fh.write("x,y,value,min,max,std,count\n")
+                if self.x_coords is not None and self.y_coords is not None:
+                    for iy, y in enumerate(self.y_coords):
+                        for ix, x in enumerate(self.x_coords):
+                            mean_text, min_text, max_text, std_text, count = self._point_stats(
+                                x, y, avg_matrix[iy, ix]
+                            )
+                            fh.write(
+                                f"{x:.6f},{y:.6f},{mean_text},{min_text},"
+                                f"{max_text},{std_text},{count}\n"
+                            )
+
+            self.lbl_status.setText(
+                "狀態: 已匯出 heatmap、contour 與含 min/max/std 的 CSV"
+            )
+            QMessageBox.information(
+                self,
+                "匯出完成",
+                f"已匯出：\n{heatmap_path}\n{contour_path}\n\nCSV：\n{csv_path}",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "匯出失敗", f"無法匯出檔案：\n{exc}")
+        finally:
+            if selected_item is not None:
+                selected_item.show()

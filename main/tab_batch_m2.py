@@ -12,8 +12,8 @@ from scipy.ndimage import uniform_filter
 
 from PyQt5.QtWidgets import (
     QLabel, QFileDialog, QMessageBox, QApplication, QDialog, QPushButton,
-    QWidget, QHBoxLayout, QGridLayout, QCheckBox, QTableWidget,
-    QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QCheckBox, QTableWidget,
+    QTableWidgetItem, QHeaderView, QAbstractItemView, QRadioButton,
 )
 from PyQt5.QtCore import Qt
 
@@ -174,6 +174,28 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             "自動抓取 (M2 門檻 contour 內切圓中心，Y 上／下)"
         )
         self.radio_batch_p2_manual.setText("手動抓取 (點擊 M2 影像)")
+
+        # I² 加權質心：插在一般質心與內切圓之間（pad 測試一致性較佳）
+        self.radio_batch_p2_m2_power_centroid = QRadioButton(
+            "自動抓取 (M2 切分 Y 以下 I² 加權質心)"
+        )
+        self.radio_batch_p2_m2_power_centroid.setToolTip(
+            "門檻最大連通區內以 I² 加權質心定位；較一般質心更靠近峰值，較不受外暈影響。"
+        )
+        self.radio_batch_p2_m2_power_centroid.toggled.connect(
+            self.on_batch_p2_point_mode_changed
+        )
+        self.batch_m2_point_group.addButton(self.radio_batch_p2_m2_power_centroid)
+        cent_idx = left_layout.indexOf(self.radio_batch_p2_m2_centroid)
+        if cent_idx >= 0:
+            left_layout.insertWidget(cent_idx + 1, self.radio_batch_p2_m2_power_centroid)
+        else:
+            insc_idx = left_layout.indexOf(self.radio_batch_p2_m2_inscribed)
+            if insc_idx >= 0:
+                left_layout.insertWidget(insc_idx, self.radio_batch_p2_m2_power_centroid)
+            else:
+                left_layout.addWidget(self.radio_batch_p2_m2_power_centroid)
+
         self.radio_batch_p2_m2_centroid.setChecked(True)
 
         self.chk_batch_show_cross.setText(
@@ -259,6 +281,27 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         host_layout.setSpacing(6)
         host_layout.addWidget(self.win_batch_top, 1)
 
+        table_panel = QWidget()
+        table_layout = QVBoxLayout(table_panel)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setSpacing(4)
+
+        self.btn_batch_refresh_distance = QPushButton("更新距離清單")
+        self.btn_batch_refresh_distance.setToolTip(
+            "依目前抓取模式與門檻，重新計算右側全部組別的 above→below 距離。"
+        )
+        self.btn_batch_refresh_distance.setStyleSheet(
+            "QPushButton { font-size: 12px; font-weight: bold; color: white; "
+            "background-color: #1565C0; border: none; border-radius: 5px; padding: 6px 10px; }"
+            "QPushButton:hover { background-color: #1976D2; }"
+            "QPushButton:disabled { background-color: #B0BEC5; }"
+        )
+        self.btn_batch_refresh_distance.setEnabled(False)
+        self.btn_batch_refresh_distance.clicked.connect(
+            lambda: self._refresh_all_distance_table(silent=False)
+        )
+        table_layout.addWidget(self.btn_batch_refresh_distance)
+
         self.batch_distance_table = QTableWidget(0, 4)
         self.batch_distance_table.setHorizontalHeaderLabels(
             ["組別", "位置", "檔名", "距離(μm)"]
@@ -268,11 +311,53 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.batch_distance_table.setAlternatingRowColors(True)
         self.batch_distance_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.batch_distance_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.batch_distance_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.batch_distance_table.cellClicked.connect(self._on_distance_row_clicked)
         self.batch_distance_table.verticalHeader().setVisible(False)
         self.batch_distance_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        host_layout.addWidget(self.batch_distance_table)
+        table_layout.addWidget(self.batch_distance_table, 1)
+        host_layout.addWidget(table_panel)
         right_layout.insertWidget(heatmap_index, host, 3)
+
+    def _fill_distance_table_row(self, idx, distance_um):
+        if not hasattr(self, "batch_distance_table"):
+            return
+        if idx < 0 or idx >= len(self.batch_pairs):
+            return
+        pair = self.batch_pairs[idx]
+        if distance_um is None:
+            dist_text = "--"
+        elif isinstance(distance_um, str):
+            dist_text = distance_um
+        else:
+            dist_text = f"{float(distance_um):.2f}"
+        values = [
+            str(idx + 1),
+            str(pair.get("location", "")),
+            str(pair.get("filename", "")),
+            dist_text,
+        ]
+        self.batch_distance_table.setRowCount(
+            max(self.batch_distance_table.rowCount(), idx + 1)
+        )
+        for col, value in enumerate(values):
+            self.batch_distance_table.setItem(idx, col, QTableWidgetItem(value))
+        self.batch_distance_table.resizeRowsToContents()
+
+    def _highlight_distance_table_row(self, idx):
+        """左右鍵切換組別時，右側清單同步標示目前列。"""
+        if not hasattr(self, "batch_distance_table"):
+            return
+        if idx < 0 or idx >= self.batch_distance_table.rowCount():
+            return
+        self.batch_distance_table.blockSignals(True)
+        self.batch_distance_table.selectRow(idx)
+        item = self.batch_distance_table.item(idx, 0)
+        if item is not None:
+            self.batch_distance_table.scrollToItem(
+                item, QAbstractItemView.PositionAtCenter
+            )
+        self.batch_distance_table.blockSignals(False)
 
     def _update_distance_table(self, idx):
         if not hasattr(self, "batch_distance_table"):
@@ -283,24 +368,157 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         below = getattr(self, "batch_m2_center_point", None)
         above = getattr(self, "batch_m2_above_point", None)
         if below is None or above is None:
-            distance_um = "--"
+            distance_um = None
         else:
             distance_px = float(np.hypot(
                 below[0] - above[0], below[1] - above[1]
             ))
-            distance_um = f"{distance_px * self.batch_pixel_pitch_um:.2f}"
+            distance_um = distance_px * self.batch_pixel_pitch_um
 
-        pair = self.batch_pairs[idx]
-        values = [
-            str(idx + 1),
-            str(pair.get("location", "")),
-            str(pair.get("filename", "")),
-            distance_um,
-        ]
-        self.batch_distance_table.setRowCount(max(self.batch_distance_table.rowCount(), idx + 1))
-        for col, value in enumerate(values):
-            self.batch_distance_table.setItem(idx, col, QTableWidgetItem(value))
-        self.batch_distance_table.resizeRowsToContents()
+        self._fill_distance_table_row(idx, distance_um)
+        self._highlight_distance_table_row(idx)
+
+    def _compute_m2_above_point_for_matrix(
+        self, matrix2, split_y, p2_mode, use_thresh, thresh_percent, power=1.0
+    ):
+        if matrix2 is None:
+            return None
+        if p2_mode == "auto_min":
+            return self._find_min_above_y(matrix2, split_y)
+        if p2_mode == "m2_inscribed":
+            result = self._find_inscribed_circle_above_y(
+                matrix2, split_y, use_thresh, thresh_percent
+            )
+            if result is None:
+                return None
+            cx, cy, _radius = result
+            return (cx, cy)
+        if p2_mode == "m2_thresh_geom":
+            center_mode = "thresh_geom"
+        elif p2_mode in ("m2_centroid", "m2_power_centroid"):
+            center_mode = "centroid"
+        else:
+            center_mode = "centroid"
+        return self._find_center_above_y(
+            matrix2, split_y, center_mode, use_thresh, thresh_percent, power=power
+        )
+
+    def _compute_m2_points_for_matrix(
+        self, matrix2, p2_mode=None, manual_below=None, manual_above=None
+    ):
+        """對指定矩陣計算 below／above，不更動目前 UI 狀態。"""
+        if matrix2 is None:
+            return None, None
+        if p2_mode is None:
+            p2_mode = self._get_p2_point_mode_name()
+
+        use_thresh = self.chk_batch_p2_use_threshold.isChecked()
+        thresh_percent = self.spin_batch_p2_thresh_percent.value()
+        power = self._centroid_power_for_mode(p2_mode)
+
+        info = find_dual_peak_valley_y(matrix2, roi=self._get_valley_roi_tuple())
+        split_y = info["valley_y"]
+        split_y_i = split_y_index(split_y)
+        split_cx = info["cx"]
+
+        m2_x, m2_y = None, None
+        if p2_mode == "manual":
+            if manual_below:
+                m2_x, m2_y = manual_below
+            else:
+                m2_x = split_cx if split_cx is not None else matrix2.shape[1] // 2
+                m2_y = max(0, split_y_i - 1)
+        elif p2_mode == "auto_min":
+            p2 = self._find_min_below_y(matrix2, split_y)
+            if p2 is not None:
+                m2_x, m2_y = p2
+        elif p2_mode == "m2_inscribed":
+            p2 = self._find_inscribed_circle_below_y(
+                matrix2, split_y, use_thresh, thresh_percent
+            )
+            if p2 is not None:
+                m2_x, m2_y, _r = p2
+        else:
+            center_mode = "thresh_geom" if p2_mode == "m2_thresh_geom" else "centroid"
+            p2 = self._find_center_below_y(
+                matrix2, split_y, center_mode, use_thresh, thresh_percent, power=power
+            )
+            if p2 is not None:
+                m2_x, m2_y = p2
+
+        if m2_x is None or m2_y is None:
+            return None, None
+
+        if p2_mode == "manual" and manual_above:
+            return (m2_x, m2_y), manual_above
+
+        m2a = self._compute_m2_above_point_for_matrix(
+            matrix2, split_y, p2_mode, use_thresh, thresh_percent, power=power
+        )
+        if m2a is None:
+            return (m2_x, m2_y), None
+        return (m2_x, m2_y), m2a
+
+    def _compute_distance_um_for_group(self, idx, p2_mode=None):
+        if idx < 0 or idx >= self.batch_total_count:
+            return None
+        _m1, matrix2 = self._ensure_matrix_cached(idx)
+        if matrix2 is None:
+            return None
+        if p2_mode is None:
+            p2_mode = self._get_p2_point_mode_name()
+
+        manual_below = manual_above = None
+        if p2_mode == "manual":
+            saved = self.batch_saved_params.get(idx, {})
+            manual_below = saved.get("m2_center_point")
+            manual_above = saved.get("m2_above_point")
+
+        below, above = self._compute_m2_points_for_matrix(
+            matrix2, p2_mode, manual_below=manual_below, manual_above=manual_above
+        )
+        if below is None or above is None:
+            return None
+        dist_px = float(np.hypot(below[0] - above[0], below[1] - above[1]))
+        return dist_px * self.batch_pixel_pitch_um
+
+    def _refresh_all_distance_table(self, silent=False):
+        """依目前抓取模式，更新右側距離清單全部列。"""
+        if not hasattr(self, "batch_distance_table"):
+            return
+        if self.batch_total_count <= 0:
+            return
+
+        prev_idx = self.batch_current_idx
+        p2_mode = self._get_p2_point_mode_name()
+        self.batch_distance_table.setRowCount(self.batch_total_count)
+
+        if not silent:
+            self.lbl_batch_status.setText(
+                f"狀態: 更新距離清單... 0/{self.batch_total_count}"
+            )
+            self.lbl_batch_status.setStyleSheet(
+                "color: #1565C0; font-weight: bold; font-size: 12px;"
+            )
+            QApplication.processEvents()
+
+        for idx in range(self.batch_total_count):
+            distance_um = self._compute_distance_um_for_group(idx, p2_mode)
+            self._fill_distance_table_row(idx, distance_um)
+            if not silent and ((idx + 1) % 3 == 0 or idx == self.batch_total_count - 1):
+                self.lbl_batch_status.setText(
+                    f"狀態: 更新距離清單... {idx + 1}/{self.batch_total_count}"
+                )
+                QApplication.processEvents()
+
+        self._highlight_distance_table_row(prev_idx)
+        if not silent:
+            self.lbl_batch_status.setText(
+                f"狀態: 距離清單已更新（{self.batch_total_count} 組，模式={p2_mode}）"
+            )
+            self.lbl_batch_status.setStyleSheet(
+                "color: #2E7D32; font-weight: bold; font-size: 12px;"
+            )
 
     def _on_distance_row_clicked(self, row, _column):
         if 0 <= row < self.batch_total_count:
@@ -645,10 +863,10 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             self.btn_batch_run.setEnabled(True)
             if hasattr(self, "batch_distance_table"):
                 self.batch_distance_table.setRowCount(0)
-                for idx in range(self.batch_total_count):
-                    self.load_batch_group(idx)
-                    QApplication.processEvents()
             self.load_batch_group(0)
+            if hasattr(self, "btn_batch_refresh_distance"):
+                self.btn_batch_refresh_distance.setEnabled(True)
+            self._refresh_all_distance_table(silent=True)
             self.btn_batch_export.setEnabled(True)
             self.btn_batch_view_m1.setEnabled(False)
             self.btn_batch_view_m2.setEnabled(True)
@@ -825,6 +1043,21 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.batch_m1_center_point = (self.batch_split_cx, self.batch_split_y)
         return self.batch_split_y
 
+    def _is_p2_auto_mode(self):
+        return (
+            super()._is_p2_auto_mode()
+            or self.radio_batch_p2_m2_power_centroid.isChecked()
+        )
+
+    def _get_p2_point_mode_name(self):
+        if self.radio_batch_p2_m2_power_centroid.isChecked():
+            return "m2_power_centroid"
+        return super()._get_p2_point_mode_name()
+
+    def _centroid_power_for_mode(self, p2_mode):
+        """一般質心 power=1；I² 加權質心 power=2。"""
+        return 2.0 if p2_mode == "m2_power_centroid" else 1.0
+
     def _compute_m2_above_point(self, split_y, p2_mode, silent=False):
         """以與 below 相同方法，在切分 Y 以上找 M2 above。"""
         use_thresh = self.chk_batch_p2_use_threshold.isChecked()
@@ -849,12 +1082,15 @@ class DataRayBatchM2Tab(DataRayBatchTab):
 
         if p2_mode == "m2_thresh_geom":
             center_mode = "thresh_geom"
-        elif p2_mode == "m2_centroid":
+            power = 1.0
+        elif p2_mode in ("m2_centroid", "m2_power_centroid"):
             center_mode = "centroid"
+            power = self._centroid_power_for_mode(p2_mode)
         else:
             center_mode = "centroid"
+            power = 1.0
         return self._find_center_above_y(
-            self.matrix2, split_y, center_mode, use_thresh, thresh_percent
+            self.matrix2, split_y, center_mode, use_thresh, thresh_percent, power=power
         )
 
     def update_batch_calculations(self, silent=False):
@@ -906,8 +1142,10 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             use_thresh = self.chk_batch_p2_use_threshold.isChecked()
             thresh_percent = self.spin_batch_p2_thresh_percent.value()
             center_mode = "thresh_geom" if p2_mode == "m2_thresh_geom" else "centroid"
+            power = self._centroid_power_for_mode(p2_mode)
             p2 = self._find_center_below_y(
-                self.matrix2, split_y, center_mode, use_thresh, thresh_percent
+                self.matrix2, split_y, center_mode, use_thresh, thresh_percent,
+                power=power,
             )
             if p2 is None:
                 if not silent:
@@ -1173,6 +1411,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             "auto_min": self.radio_batch_p2_auto_min,
             "m2_thresh_geom": self.radio_batch_p2_m2_thresh_geom,
             "m2_centroid": self.radio_batch_p2_m2_centroid,
+            "m2_power_centroid": self.radio_batch_p2_m2_power_centroid,
             "m2_inscribed": self.radio_batch_p2_m2_inscribed,
             "manual": self.radio_batch_p2_manual,
         }

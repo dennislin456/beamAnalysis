@@ -1757,13 +1757,15 @@ class DataRayBatchTab(QWidget):
         xs = cx + radius * np.cos(theta)
         ys = cy + radius * np.sin(theta)
         return pg.PlotCurveItem(x=xs, y=ys, pen=pen)
-    def _compute_auto_spot_center(self, matrix, mode, use_threshold=False, thresh_percent=50.0):
+    def _compute_auto_spot_center(self, matrix, mode, use_threshold=False, thresh_percent=50.0,
+                                  power=1.0):
         # 強化定位：背景扣除 + 最大連通區 + 亞像素（peak_geom 仍走峰值幾何）
         return compute_auto_spot_center(
             matrix, mode, use_threshold, thresh_percent,
             bg_subtract=(mode != "peak_geom"),
             largest_cc_only=(mode != "peak_geom"),
             subpixel=True,
+            power=power,
         )
 
     def _build_threshold_mask(self, matrix, use_threshold, thresh_percent, y_below=None, y_above=None,
@@ -1937,7 +1939,7 @@ class DataRayBatchTab(QWidget):
             return None
         return (float(np.mean(xs)), float(np.mean(ys)))
 
-    def _find_center_below_y(self, matrix, y1, mode, use_thresh, thresh_percent):
+    def _find_center_below_y(self, matrix, y1, mode, use_thresh, thresh_percent, power=1.0):
         matrix = np.asarray(matrix)
         y1 = split_y_index(y1)
         if y1 <= 0:
@@ -1945,7 +1947,9 @@ class DataRayBatchTab(QWidget):
         region = matrix[:y1, :]
         if region.size == 0:
             return None
-        return self._compute_auto_spot_center(region, mode, use_thresh, thresh_percent)
+        return self._compute_auto_spot_center(
+            region, mode, use_thresh, thresh_percent, power=power
+        )
 
     def _find_min_above_y(self, matrix, y1):
         matrix = np.asarray(matrix)
@@ -1962,7 +1966,7 @@ class DataRayBatchTab(QWidget):
             return None
         return (float(np.mean(xs)), float(np.mean(ys)) + y1 + 1)
 
-    def _find_center_above_y(self, matrix, y1, mode, use_thresh, thresh_percent):
+    def _find_center_above_y(self, matrix, y1, mode, use_thresh, thresh_percent, power=1.0):
         matrix = np.asarray(matrix)
         y1 = split_y_index(y1)
         h = matrix.shape[0]
@@ -1971,7 +1975,9 @@ class DataRayBatchTab(QWidget):
         region = matrix[y1 + 1:, :]
         if region.size == 0:
             return None
-        cx, cy_local = self._compute_auto_spot_center(region, mode, use_thresh, thresh_percent)
+        cx, cy_local = self._compute_auto_spot_center(
+            region, mode, use_thresh, thresh_percent, power=power
+        )
         return (cx, cy_local + y1 + 1)
 
     def _compute_m2_above_point(self, m1_y, p2_mode, silent=False):
