@@ -239,8 +239,11 @@ def build_robust_threshold_mask(matrix, use_threshold=True, thresh_percent=50.0,
 
 
 def compute_auto_spot_center(matrix, mode, use_threshold=False, thresh_percent=50.0,
-                             bg_subtract=True, largest_cc_only=True, subpixel=True):
+                             bg_subtract=True, largest_cc_only=True, subpixel=True,
+                             power=1.0):
     """計算光斑中心。centroid／thresh_geom 預設：背景扣除 + 最大連通區 + 亞像素。
+
+    power: 僅用於質心加權（mode 非 thresh_geom／peak_geom）。1=一般質心，2=I² 加權。
 
     Returns:
         (cx, cy) — subpixel=True 時為 float，否則為 int
@@ -293,7 +296,11 @@ def compute_auto_spot_center(matrix, mode, use_threshold=False, thresh_percent=5
     if mode == "thresh_geom":
         cx, cy = float(np.mean(xs)), float(np.mean(ys))
     else:
-        weights = work[mask]
+        p = float(power) if np.isfinite(power) and power > 0 else 1.0
+        if abs(p - 1.0) < 1e-12:
+            weights = work[mask]
+        else:
+            weights = np.power(np.clip(work[mask], 0.0, None), p)
         wsum = float(np.sum(weights))
         if wsum <= 0:
             cx, cy = float(np.mean(xs)), float(np.mean(ys))
