@@ -36,12 +36,12 @@ class BaslerBatchTab(DataRayBatchM2Tab):
         for widget in self.findChildren(QLabel):
             widget.setText(widget.text().replace("*5.5", "*3.45"))
 
+    def _import_folder_dialog_title(self):
+        return "選擇 Basler 主資料夾（內含位置子資料夾）"
+
     def load_batch_m2_folder(self):
         super().load_batch_m2_folder()
         self.btn_batch_m2_dir.setText("I. 選擇 Basler 主資料夾（含位置子資料夾）")
-        self.lbl_batch_m2_info.setText(
-            self.lbl_batch_m2_info.text().replace("M2", "Basler")
-        )
 
     def load_batch_group(self, idx):
         super().load_batch_group(idx)

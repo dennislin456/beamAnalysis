@@ -21,7 +21,7 @@ from shared_components import (
     HeatmapViewerWindow, find_dual_peak_valley_y, split_y_index,
     NoWheelSpinBox, clip_roi_to_matrix,
 )
-from batch_data_loader import load_numeric_matrix
+from batch_data_loader import load_numeric_matrix, scan_location_files
 from tab_batch import DataRayBatchTab, LocationConfigDialog
 
 
@@ -57,9 +57,9 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.btn_batch_m1_dir.hide()
         self.lbl_batch_m1_info.hide()
 
-        self.btn_batch_m2_dir.setText("I. 選擇 M2 主資料夾（含位置子資料夾）")
-        self.lbl_batch_m2_info.setText("未選擇 M2 主資料夾\n格式: M2/<位置>/<檔名>.xlsx / .csv / .npy")
-        self.lbl_batch_pair_info.setText("掃描結果: 尚未選擇 M2 主資料夾")
+        self.btn_batch_m2_dir.setText("I. 選擇主資料夾（含位置子資料夾）")
+        self.lbl_batch_m2_info.setText("未選擇主資料夾\n格式: <主資料夾>/<位置>/<檔名>.xlsx / .csv / .npy")
+        self.lbl_batch_pair_info.setText("掃描結果: 尚未選擇主資料夾")
 
         # 隱藏 M1→below 距離列
         for attr in (
@@ -344,22 +344,23 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             self.batch_distance_table.setItem(idx, col, QTableWidgetItem(value))
         self.batch_distance_table.resizeRowsToContents()
 
-    def _highlight_distance_table_row(self, idx):
-        """左右鍵切換組別時，右側清單同步標示目前列。"""
+    def _highlight_distance_table_row(self, idx, scroll=False):
+        """標示目前列；scroll=True 時僅在列不在視野內才捲動（不置中）。"""
         if not hasattr(self, "batch_distance_table"):
             return
         if idx < 0 or idx >= self.batch_distance_table.rowCount():
             return
         self.batch_distance_table.blockSignals(True)
         self.batch_distance_table.selectRow(idx)
-        item = self.batch_distance_table.item(idx, 0)
-        if item is not None:
-            self.batch_distance_table.scrollToItem(
-                item, QAbstractItemView.PositionAtCenter
-            )
+        if scroll:
+            item = self.batch_distance_table.item(idx, 0)
+            if item is not None:
+                self.batch_distance_table.scrollToItem(
+                    item, QAbstractItemView.EnsureVisible
+                )
         self.batch_distance_table.blockSignals(False)
 
-    def _update_distance_table(self, idx):
+    def _update_distance_table(self, idx, scroll_list=False):
         if not hasattr(self, "batch_distance_table"):
             return
         if idx < 0 or idx >= len(self.batch_pairs):
@@ -376,7 +377,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             distance_um = distance_px * self.batch_pixel_pitch_um
 
         self._fill_distance_table_row(idx, distance_um)
-        self._highlight_distance_table_row(idx)
+        self._highlight_distance_table_row(idx, scroll=scroll_list)
 
     def _compute_m2_above_point_for_matrix(
         self, matrix2, split_y, p2_mode, use_thresh, thresh_percent, power=1.0
@@ -511,7 +512,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                 )
                 QApplication.processEvents()
 
-        self._highlight_distance_table_row(prev_idx)
+        self._highlight_distance_table_row(prev_idx, scroll=False)
         if not silent:
             self.lbl_batch_status.setText(
                 f"狀態: 距離清單已更新（{self.batch_total_count} 組，模式={p2_mode}）"
@@ -698,7 +699,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
 
         if not self.batch_m2_root:
             if hasattr(self, "lbl_batch_pair_info"):
-                self.lbl_batch_pair_info.setText("掃描結果: 請選擇 M2 主資料夾")
+                self.lbl_batch_pair_info.setText("掃描結果: 請選擇主資料夾")
             if hasattr(self, "btn_location_config"):
                 self.btn_location_config.setEnabled(False)
             self.batch_location_config = {}
@@ -740,7 +741,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
 
         msg = (
             f"辨識到 {len(self.batch_available_locations)} 個位置，"
-            f"共 {total_pairs} 組 M2 量測（請點「位置配置」選擇位置與 cycle）"
+            f"共 {total_pairs} 組量測（請點「位置配置」選擇位置與 cycle）"
         )
         if hasattr(self, "lbl_batch_pair_info"):
             self.lbl_batch_pair_info.setText(msg)
@@ -750,7 +751,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
 
     def open_location_config_dialog(self):
         if not self.batch_available_locations:
-            QMessageBox.warning(self, "警告", "尚無可配置的位置，請先匯入 M2 主資料夾。")
+            QMessageBox.warning(self, "警告", "尚無可配置的位置，請先匯入主資料夾。")
             return
         dlg = LocationConfigDialog(
             self.batch_available_locations,
@@ -776,13 +777,60 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.batch_m2_files = [p["m2_path"] for p in pairs]
         return selected, pairs
 
+    def _import_folder_dialog_title(self):
+        return "選擇主資料夾（內含位置子資料夾）"
+
+    def _scan_location_files(self, root_dir):
+        """不要求資料夾名為 M2：直接掃位置子資料夾；沒有則往下一層找。"""
+        loc_map = scan_location_files(root_dir)
+        if loc_map:
+            return loc_map
+
+        nested = {}
+        if not root_dir or not os.path.isdir(root_dir):
+            return nested
+        try:
+            entries = os.listdir(root_dir)
+        except OSError:
+            return nested
+
+        buckets = {}
+        for entry in entries:
+            mid_path = os.path.join(root_dir, entry)
+            if not os.path.isdir(mid_path):
+                continue
+            child_map = scan_location_files(mid_path)
+            for loc, files in child_map.items():
+                buckets.setdefault(loc, []).append((entry, files))
+        for loc, items in buckets.items():
+            if len(items) == 1:
+                nested[loc] = items[0][1]
+            else:
+                for mid, files in items:
+                    nested[f"{mid}/{loc}"] = files
+        if nested:
+            return nested
+
+        files = {}
+        try:
+            for fname in os.listdir(root_dir):
+                if fname.startswith("~$"):
+                    continue
+                if fname.lower().endswith((".xlsx", ".xls", ".csv", ".npy")):
+                    files[fname] = os.path.join(root_dir, fname)
+        except OSError:
+            return {}
+        if files:
+            return {os.path.basename(root_dir): files}
+        return {}
+
     def load_batch_m1_folder(self):
         """M2-only：不使用 M1。"""
-        QMessageBox.information(self, "提示", "此分頁僅需載入 M2，不需選擇 M1。")
+        QMessageBox.information(self, "提示", "此分頁不需選擇 M1，請直接選擇含位置子資料夾的主資料夾。")
 
     def load_batch_m2_folder(self):
         dir_path = QFileDialog.getExistingDirectory(
-            self, "選擇 M2 主資料夾（內含位置子資料夾）", ""
+            self, self._import_folder_dialog_title(), ""
         )
         if not dir_path:
             return
@@ -790,9 +838,9 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         if not loc_map:
             QMessageBox.warning(
                 self, "警告",
-                "此資料夾下找不到「位置子資料夾／Excel或CSV」結構。\n"
-                "預期格式：M2/<位置名>/<檔名>.xlsx 或 <檔名>.csv\n"
-                "或如 beamImage/… 下各位置資料夾內的 .xlsx/.csv"
+                "此資料夾下找不到「位置子資料夾／資料檔」結構。\n"
+                "預期格式：<主資料夾>/<位置名>/<檔名>.xlsx / .csv / .npy\n"
+                "也可選上一層（會自動往下找位置資料夾），或直接選含資料檔的資料夾。"
             )
             return
         self.batch_m2_root = dir_path
@@ -810,15 +858,15 @@ class DataRayBatchM2Tab(DataRayBatchTab):
 
     def process_batch_data(self):
         if not self.batch_m2_root:
-            QMessageBox.warning(self, "警告", "請先選擇 M2 主資料夾！")
+            QMessageBox.warning(self, "警告", "請先選擇主資料夾！")
             return
         if not self.batch_available_locations:
             self._rebuild_batch_pairs()
         if not self.batch_available_locations:
             QMessageBox.warning(
                 self, "警告",
-                "找不到任何位置子資料夾內的 Excel/CSV！\n"
-                "請確認結構為 M2/<位置>/<檔名>.xlsx 或 <檔名>.csv"
+                "找不到任何位置子資料夾內的資料檔！\n"
+                "請確認結構為 <主資料夾>/<位置>/<檔名>.xlsx / .csv / .npy"
             )
             return
 
@@ -912,7 +960,17 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         }
         return matrix2.copy(), scale_info
 
-    def load_batch_group(self, idx):
+    def batch_go_prev(self):
+        if self.batch_total_count > 0:
+            idx = (self.batch_current_idx - 1) % self.batch_total_count
+            self.load_batch_group(idx, scroll_list=True)
+
+    def batch_go_next(self):
+        if self.batch_total_count > 0:
+            idx = (self.batch_current_idx + 1) % self.batch_total_count
+            self.load_batch_group(idx, scroll_list=True)
+
+    def load_batch_group(self, idx, scroll_list=False):
         if idx < 0 or idx >= self.batch_total_count:
             return
         try:
@@ -984,7 +1042,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             if self.chk_batch_pixel_profile.isChecked() and self.batch_profile_point is not None:
                 self.update_batch_inline_profiles(reset_view=True)
             self._refresh_open_batch_viewers()
-            self._update_distance_table(idx)
+            self._update_distance_table(idx, scroll_list=scroll_list)
         except Exception as e:
             self.lbl_batch_status.setText("狀態: 載入失敗")
             self.lbl_batch_status.setStyleSheet(
