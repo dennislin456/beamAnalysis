@@ -57,13 +57,13 @@ def load_numeric_matrix(path):
 
 def _read_excel_matrix(path):
     df = pd.read_excel(path, header=None, skiprows=4)
-    return df.dropna(how="all").astype(float).to_numpy()
+    return df.dropna(how="all").astype(np.float32).to_numpy()
 
 
 def _read_npy_matrix(path):
     arr = np.load(path)
     if isinstance(arr, np.ndarray):
-        return np.asarray(arr, dtype=float)
+        return np.asarray(arr, dtype=np.float32)
     raise ValueError(f"NPY content is not a numeric array: {path}")
 
 
@@ -121,7 +121,7 @@ def _read_csv_matrix(path):
     # The numeric block itself is already selected from the first parseable rows.
 
     # Preserve the full numeric block; if a column is all NaN, drop only that column.
-    parsed = parsed.loc[:, parsed.notna().any()].astype(float)
+    parsed = parsed.loc[:, parsed.notna().any()].astype(np.float32)
     if parsed.shape[1] == 0:
         raise ValueError(f"Matrix is empty after cleanup: {path}")
 
