@@ -22,8 +22,11 @@ PLOT_WIDGET_STYLE = (
 )
 # 剖面訊號區目標邊長（縱剖面寬 ≈ 橫剖面高）
 PROFILE_VIEW_PX = 130
+PROFILE_VIEW_PX_COMPACT = 88  # Mapping 等含剖面的面板，略縮以減少擁擠
 PROFILE_SIDE_AXIS_PX = 48   # V 左軸／H 右軸
 PROFILE_EDGE_AXIS_PX = 28   # V 上軸／H 下軸
+PROFILE_SIDE_AXIS_PX_COMPACT = 40
+PROFILE_EDGE_AXIS_PX_COMPACT = 24
 
 
 def apply_readable_plot_theme(widget, plots=None, transparent_view_plots=None):
@@ -67,12 +70,22 @@ def set_heatmap_view_transparent(plot):
         pass
 
 
-def configure_equal_profile_strips(layout_widget, profile_col=0, profile_row=1):
+def configure_equal_profile_strips(
+    layout_widget,
+    profile_col=0,
+    profile_row=1,
+    view_px=None,
+    side_axis_px=None,
+    edge_axis_px=None,
+):
     """讓縱剖面欄寬與橫剖面列高一致，訊號 ViewBox 視覺尺寸相同。"""
     if layout_widget is None or not hasattr(layout_widget, "ci"):
         return
-    col_w = PROFILE_VIEW_PX + PROFILE_SIDE_AXIS_PX
-    row_h = PROFILE_VIEW_PX + PROFILE_EDGE_AXIS_PX
+    view = PROFILE_VIEW_PX if view_px is None else int(view_px)
+    side = PROFILE_SIDE_AXIS_PX if side_axis_px is None else int(side_axis_px)
+    edge = PROFILE_EDGE_AXIS_PX if edge_axis_px is None else int(edge_axis_px)
+    col_w = view + side
+    row_h = view + edge
     layout = layout_widget.ci.layout
     layout.setColumnFixedWidth(profile_col, col_w)
     layout.setRowFixedHeight(profile_row, row_h)
@@ -535,7 +548,7 @@ class HeatmapViewerWindow(QMainWindow):
         self.thresh_overlay_item.setOpacity(1.0)
         self.plot.addItem(self.thresh_overlay_item)
 
-        self.hist = pg.HistogramLUTItem()
+        self.hist = LevelAlignedHistogramLUTItem()
         self.hist.setImageItem(self.image_item)
         self.hist.gradient.setColorMap(self.jet_map)
         self.win.addItem(self.hist, row=0, col=1)
@@ -550,7 +563,7 @@ class HeatmapViewerWindow(QMainWindow):
         if matrix_data is not None:
             self.image_item.setImage(matrix_data.T)
             min_v, max_v = float(np.min(matrix_data)), float(np.max(matrix_data))
-            self.hist.setHistogramRange(min_v, max_v)
+            self.hist.setHistogramRange(min_v, max_v, padding=0)
             self.hist.setLevels(min_v, max_v)
             self.reset_view_to_data()
 
@@ -848,20 +861,93 @@ _JET_COLORS = [
 ]
 
 
+class LevelAlignedHistogramLUTItem(pg.HistogramLUTItem):
+    """修正 pyqtgraph 預設把上下限連到色條頂/底，造成拉條看起來不在設定值上。"""
+
+    def paint(self, p, *args):
+        if self.levelMode != "mono" or not self.region.isVisible():
+            return
+
+        pen = self.region.lines[0].pen
+        mn, mx = self.getLevels()
+        vbc = self.vb.viewRect().center()
+        grad_rect = self.gradient.mapRectToParent(self.gradient.gradRect.rect())
+
+        if self.orientation == "vertical":
+            p_mn = self.vb.mapFromViewToItem(self, pg.Point(vbc.x(), mn))
+            p_mx = self.vb.mapFromViewToItem(self, pg.Point(vbc.x(), mx))
+            x_grad = (
+                grad_rect.left()
+                if self.gradientPosition == "right"
+                else grad_rect.right()
+            )
+            # 水平連到色條「同一 Y」，不再 ±5px、也不連到色條頂/底
+            ends = (
+                (p_mn, pg.Point(x_grad, p_mn.y())),
+                (p_mx, pg.Point(x_grad, p_mx.y())),
+            )
+            tick_specs = (
+                (pg.Point(grad_rect.left(), p_mn.y()), pg.Point(grad_rect.right(), p_mn.y())),
+                (pg.Point(grad_rect.left(), p_mx.y()), pg.Point(grad_rect.right(), p_mx.y())),
+            )
+        else:
+            p_mn = self.vb.mapFromViewToItem(self, pg.Point(mn, vbc.y()))
+            p_mx = self.vb.mapFromViewToItem(self, pg.Point(mx, vbc.y()))
+            y_grad = (
+                grad_rect.top()
+                if self.gradientPosition == "bottom"
+                else grad_rect.bottom()
+            )
+            ends = (
+                (p_mn, pg.Point(p_mn.x(), y_grad)),
+                (p_mx, pg.Point(p_mx.x(), y_grad)),
+            )
+            tick_specs = (
+                (pg.Point(p_mn.x(), grad_rect.top()), pg.Point(p_mn.x(), grad_rect.bottom())),
+                (pg.Point(p_mx.x(), grad_rect.top()), pg.Point(p_mx.x(), grad_rect.bottom())),
+            )
+
+        from pyqtgraph.Qt import QtGui
+        from pyqtgraph import functions as fn
+
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        for draw_pen in (fn.mkPen((0, 0, 0, 100), width=3), pen):
+            p.setPen(draw_pen)
+            for a, b in ends:
+                p.drawLine(a, b)
+            for a, b in tick_specs:
+                p.drawLine(a, b)
+
+
 class InteractiveHeatmapPanel(QWidget):
     """自訂座標熱力圖：滾輪縮放、拖曳平移、雙擊復原視野；
-    色條可直接拖曳紫框上下緣調整上下限（亦可點擊數值精調）；上方可匯出當前圖檔。"""
+    色條可直接拖曳藍色拉條調整上下限（亦可點擊數值精調）；上方可匯出當前圖檔。
+    with_profiles=True 時左側／下方顯示 X/Y 剖面（點擊更新，可隱藏十字）。"""
 
     levelsChanged = pyqtSignal(float, float)
     mouseMoved = pyqtSignal(object)  # QPointF in view coords, or None
-    _HIST_RANGE_PAD = 0.18  # 色條可視範圍相對上下限的外擴，方便拖曳拉柄
+    profilePointChanged = pyqtSignal(int, int)  # ix, iy
+    _HIST_RANGE_PAD = 0.08  # 輸入上下限後色條可視範圍相對該區間的外擴
 
-    def __init__(self, title="Heatmap", parent=None, x_label="X", y_label="Y"):
+    def __init__(self, title="Heatmap", parent=None, x_label="X", y_label="Y",
+                 aspect_locked=True, with_profiles=False):
         super().__init__(parent)
         self._title = title
         self._default_levels = None  # (min, max)
+        self._data_hist_range = None  # 完整資料範圍，色條軸以此為準
         self._data_rect = None  # QRectF in data/view coordinates (e.g. mm)
         self._level_updating = False
+        self._aspect_locked = bool(aspect_locked)
+        self._with_profiles = bool(with_profiles)
+        self._profile_matrix = None  # (ny, nx)
+        self._profile_x = None
+        self._profile_y = None
+        self._profile_point = None  # (ix, iy)
+        self._profile_cross_items = []
+        self._show_profile_cross = True
+        self._profile_view_ready = False
+        self._x_label = x_label
+        self._y_label = y_label
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -884,21 +970,57 @@ class InteractiveHeatmapPanel(QWidget):
         self.btn_export.clicked.connect(self.export_current_image)
         toolbar.addWidget(self.btn_export)
 
-        tip = QLabel("滾輪縮放 · 拖曳平移 · 雙擊圖面復原 · 色條拖曳紫框上下緣調上下限 · 雙擊色條復原")
+        # 放在匯出旁，避免擠在上下限右側造成工具列跳動
+        self.btn_toggle_cross = QPushButton("隱藏十字")
+        self.btn_toggle_cross.setCheckable(True)
+        self.btn_toggle_cross.setChecked(False)
+        self.btn_toggle_cross.setCursor(QCursor(Qt.PointingHandCursor))
+        self.btn_toggle_cross.setToolTip("隱藏圖上十字標示；X/Y 剖面波形仍保留")
+        self.btn_toggle_cross.setStyleSheet(
+            "QPushButton { font-size: 12px; font-weight: bold; color: #37474F; "
+            "background-color: #ECEFF1; border: 1px solid #B0BEC5; border-radius: 4px; "
+            "padding: 5px 10px; }"
+            "QPushButton:checked { color: white; background-color: #546E7A; }"
+            "QPushButton:hover { background-color: #CFD8DC; }"
+            "QPushButton:checked:hover { background-color: #607D8B; }"
+        )
+        self.btn_toggle_cross.toggled.connect(self._on_toggle_cross)
+        self.btn_toggle_cross.setVisible(self._with_profiles)
+        toolbar.addWidget(self.btn_toggle_cross)
+
+        if self._with_profiles:
+            tip_text = (
+                "滾輪縮放主圖／剖面（剖面不跟主圖連動）· 點擊更新剖面 · "
+                "雙擊主圖依比例復原 · 雙擊剖面復原"
+            )
+        else:
+            tip_text = (
+                "滾輪縮放 · 拖曳平移 · 雙擊圖面復原 · "
+                "色條拖曳藍色拉條調上下限 · 雙擊色條復原"
+            )
+        tip = QLabel(tip_text)
         tip.setStyleSheet("color: #607D8B; font-size: 11px;")
+        tip.setMinimumWidth(0)
+        tip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         toolbar.addWidget(tip, 1)
 
         self.lbl_level_max = QLabel("上限: --")
         self.lbl_level_min = QLabel("下限: --")
+        # 固定寬度，避免數值位數變化撐動整排工具列
+        _level_lbl_w = 128
         for lbl in (self.lbl_level_max, self.lbl_level_min):
             lbl.setStyleSheet(
                 "QLabel { color: #37474F; font-size: 12px; font-weight: bold; "
-                "padding: 3px 8px; border: 1px solid #B0BEC5; border-radius: 3px; "
+                "font-family: Consolas, 'Courier New', monospace; "
+                "padding: 3px 6px; border: 1px solid #B0BEC5; border-radius: 3px; "
                 "background-color: #ECEFF1; }"
                 "QLabel:hover { background-color: #CFD8DC; }"
             )
+            lbl.setFixedWidth(_level_lbl_w)
+            lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             lbl.setCursor(QCursor(Qt.PointingHandCursor))
-            lbl.setToolTip("主要請直接拖曳右側色條紫框上下緣；點此可精準輸入數值")
+            lbl.setToolTip("主要請直接拖曳右側色條藍色拉條；點此可精準輸入數值")
+            lbl.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.lbl_level_max.mousePressEvent = self._on_max_label_clicked
         self.lbl_level_min.mousePressEvent = self._on_min_label_clicked
         toolbar.addWidget(self.lbl_level_max)
@@ -909,25 +1031,89 @@ class InteractiveHeatmapPanel(QWidget):
         self.win.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         root.addWidget(self.win, 1)
 
-        self.plot = self.win.addPlot(row=0, col=0, title=title)
+        heat_row, heat_col = (0, 1) if self._with_profiles else (0, 0)
+        self.plot = self.win.addPlot(row=heat_row, col=heat_col, title=title)
         self.plot.getViewBox().invertY(False)
-        # 強制 X/Y 同比例，圓形資料才不會被拉成橢圓／長條
-        self.plot.getViewBox().setAspectLocked(lock=True, ratio=1.0)
+        if self._aspect_locked:
+            self.plot.getViewBox().setAspectLocked(lock=True, ratio=1.0)
+        else:
+            self.plot.getViewBox().setAspectLocked(False)
         self.plot.showGrid(x=True, y=True, alpha=0.4)
-        self.plot.setLabel("bottom", x_label)
-        self.plot.setLabel("left", y_label)
         configure_stable_plot_item(self.plot, mouse_enabled=True)
 
         self.image_item = pg.ImageItem()
         self.plot.addItem(self.image_item)
 
-        self.hist = pg.HistogramLUTItem()
+        self.hist = LevelAlignedHistogramLUTItem()
         self.hist.setImageItem(self.image_item)
         self.hist.gradient.setColorMap(pg.ColorMap(_JET_POS, _JET_COLORS))
         self._enable_level_drag()
-        self.win.addItem(self.hist, row=0, col=1)
 
-        apply_readable_plot_theme(self.win, [self.plot])
+        self.plot_x_profile = None
+        self.plot_y_profile = None
+        self.plot_profile_corner = None
+
+        if self._with_profiles:
+            self.plot_y_profile = self.win.addPlot(row=0, col=0)
+            self.plot_y_profile.setLabel("top", "Value")
+            self.plot_y_profile.setLabel("left", y_label)
+            self.plot_y_profile.showAxis("bottom", show=False)
+            self.plot_y_profile.showAxis("top", show=True)
+            self.plot_y_profile.showGrid(x=True, y=True, alpha=0.25)
+            self.plot_y_profile.titleLabel.hide()
+            configure_stable_plot_item(self.plot_y_profile, mouse_enabled=True)
+            self.plot_y_profile.getViewBox().setMouseEnabled(x=True, y=True)
+
+            self.win.addItem(self.hist, row=0, col=2)
+
+            self.plot_x_profile = self.win.addPlot(row=1, col=1)
+            self.plot_x_profile.setLabel("bottom", x_label)
+            self.plot_x_profile.setLabel("right", "Value")
+            self.plot_x_profile.showAxis("left", show=False)
+            self.plot_x_profile.showAxis("right", show=True)
+            self.plot_x_profile.showGrid(x=True, y=True, alpha=0.25)
+            self.plot_x_profile.titleLabel.hide()
+            configure_stable_plot_item(self.plot_x_profile, mouse_enabled=True)
+            self.plot_x_profile.getViewBox().setMouseEnabled(x=True, y=True)
+
+            corner = self.win.addPlot(row=1, col=0)
+            corner.hideAxis("left")
+            corner.hideAxis("bottom")
+            corner.hideAxis("top")
+            corner.hideAxis("right")
+            corner.titleLabel.hide()
+            configure_stable_plot_item(corner, mouse_enabled=False)
+            self.plot_profile_corner = corner
+
+            # 熱圖保留座標軸；剖面獨立（不 setXLink/setYLink）
+            self.plot.showAxis("bottom", show=True)
+            self.plot.showAxis("left", show=True)
+            self.plot.setLabel("bottom", x_label)
+            self.plot.setLabel("left", y_label)
+
+            configure_equal_profile_strips(
+                self.win,
+                profile_col=0,
+                profile_row=1,
+                view_px=PROFILE_VIEW_PX_COMPACT,
+                side_axis_px=PROFILE_SIDE_AXIS_PX_COMPACT,
+                edge_axis_px=PROFILE_EDGE_AXIS_PX_COMPACT,
+            )
+            self.win.ci.layout.setColumnStretchFactor(1, 1)
+            self.win.ci.layout.setColumnStretchFactor(2, 0)
+            self.plot_y_profile.getAxis("left").setWidth(PROFILE_SIDE_AXIS_PX_COMPACT)
+            self.plot_y_profile.getAxis("top").setHeight(PROFILE_EDGE_AXIS_PX_COMPACT)
+            self.plot_x_profile.getAxis("right").setWidth(PROFILE_SIDE_AXIS_PX_COMPACT)
+            self.plot_x_profile.getAxis("bottom").setHeight(PROFILE_EDGE_AXIS_PX_COMPACT)
+
+            theme_plots = [self.plot, self.plot_x_profile, self.plot_y_profile]
+        else:
+            self.plot.setLabel("bottom", x_label)
+            self.plot.setLabel("left", y_label)
+            self.win.addItem(self.hist, row=0, col=1)
+            theme_plots = [self.plot]
+
+        apply_readable_plot_theme(self.win, theme_plots)
 
         self.hist.sigLevelsChanged.connect(self._on_hist_levels_changed)
         self.plot.scene().sigMouseClicked.connect(self._on_scene_clicked)
@@ -978,24 +1164,48 @@ class InteractiveHeatmapPanel(QWidget):
         except Exception:
             pass
 
-    def _padded_hist_range(self, vmin, vmax):
-        span = max(float(vmax) - float(vmin), 1e-12)
-        pad = self._HIST_RANGE_PAD * span
-        return float(vmin) - pad, float(vmax) + pad
-
     # ----- public API -------------------------------------------------
     def set_plot_title(self, title):
         self._title = title
         self.plot.setTitle(title)
 
+    def set_tick_spacing(self, x_major, x_minor, y_major, y_minor, show_grid=True, grid_alpha=0.25):
+        """設定熱圖與剖面軸刻度。"""
+        self.plot.getAxis("bottom").setTickSpacing(major=x_major, minor=x_minor)
+        self.plot.getAxis("left").setTickSpacing(major=y_major, minor=y_minor)
+        if show_grid:
+            self.plot.showGrid(x=True, y=True, alpha=grid_alpha)
+        if self.plot_x_profile is not None:
+            self.plot_x_profile.getAxis("bottom").setTickSpacing(major=x_major, minor=x_minor)
+            self.plot_x_profile.showGrid(x=True, y=True, alpha=grid_alpha)
+        if self.plot_y_profile is not None:
+            self.plot_y_profile.getAxis("left").setTickSpacing(major=y_major, minor=y_minor)
+            self.plot_y_profile.showGrid(x=True, y=True, alpha=grid_alpha)
+
     def set_axis_labels(self, x_label=None, y_label=None):
         if x_label is not None:
+            self._x_label = x_label
             self.plot.setLabel("bottom", x_label)
+            if self._with_profiles and self.plot_x_profile is not None:
+                self.plot_x_profile.setLabel("bottom", x_label)
         if y_label is not None:
+            self._y_label = y_label
             self.plot.setLabel("left", y_label)
+            if self._with_profiles and self.plot_y_profile is not None:
+                self.plot_y_profile.setLabel("left", y_label)
 
-    def set_image(self, image, rect=None, levels=None, reset_view=True):
-        """image: 已轉置後給 ImageItem 的陣列；levels=(min,max) 可選。"""
+    def set_image(
+        self,
+        image,
+        rect=None,
+        levels=None,
+        reset_view=True,
+        source_matrix=None,
+        x_coords=None,
+        y_coords=None,
+    ):
+        """image: 已轉置後給 ImageItem 的陣列；levels=(min,max) 可選。
+        source_matrix / x_coords / y_coords：剖面用（列=Y、欄=X）。"""
         self.image_item.setImage(image, autoLevels=False)
         self._apply_data_rect(rect)
         if levels is not None:
@@ -1011,8 +1221,57 @@ class InteractiveHeatmapPanel(QWidget):
                 self.set_default_levels(vmin, vmax, apply=True)
         # levels 更新後再套一次 rect，避免 transform 被重設
         self._apply_data_rect(self._data_rect)
+        if self._with_profiles:
+            self._bind_profile_data(image, source_matrix, x_coords, y_coords)
         if reset_view:
             self.reset_view()
+        if self._with_profiles and self._profile_matrix is not None:
+            ny, nx = self._profile_matrix.shape
+            if self._profile_point is None:
+                self.set_profile_point(nx // 2, ny // 2, reset_view=True)
+            else:
+                ix, iy = self._profile_point
+                self.set_profile_point(ix, iy, reset_view=reset_view)
+
+    def _bind_profile_data(self, image, source_matrix, x_coords, y_coords):
+        if source_matrix is not None:
+            matrix = np.asarray(source_matrix, dtype=float)
+        elif image is not None:
+            # ImageItem 為 (nx, ny)，轉回 (ny, nx)
+            matrix = np.asarray(image, dtype=float).T
+        else:
+            self._profile_matrix = None
+            self._profile_x = None
+            self._profile_y = None
+            return
+        ny, nx = matrix.shape
+        if x_coords is not None:
+            xs = np.asarray(x_coords, dtype=float)
+        elif self._data_rect is not None and nx > 0:
+            dx = self._data_rect.width() / nx
+            xs = self._data_rect.left() + (np.arange(nx) + 0.5) * dx
+        else:
+            xs = np.arange(nx, dtype=float)
+        if y_coords is not None:
+            ys = np.asarray(y_coords, dtype=float)
+        elif self._data_rect is not None and ny > 0:
+            dy = self._data_rect.height() / ny
+            ys = self._data_rect.top() + (np.arange(ny) + 0.5) * dy
+        else:
+            ys = np.arange(ny, dtype=float)
+        if xs.size != nx:
+            xs = np.arange(nx, dtype=float)
+        if ys.size != ny:
+            ys = np.arange(ny, dtype=float)
+        self._profile_matrix = matrix
+        self._profile_x = xs
+        self._profile_y = ys
+        if self._profile_point is not None:
+            ix, iy = self._profile_point
+            self._profile_point = (
+                int(np.clip(ix, 0, nx - 1)),
+                int(np.clip(iy, 0, ny - 1)),
+            )
 
     def _apply_data_rect(self, rect):
         """將影像對應到真實座標（mm）；並記住供 reset_view 使用。"""
@@ -1036,6 +1295,7 @@ class InteractiveHeatmapPanel(QWidget):
             vmin -= 1.0
             vmax += 1.0
         self._default_levels = (float(vmin), float(vmax))
+        self._data_hist_range = (float(vmin), float(vmax))
         if apply:
             self.apply_levels(vmin, vmax, update_hist_range=True)
 
@@ -1045,18 +1305,21 @@ class InteractiveHeatmapPanel(QWidget):
         if vmin == vmax:
             vmin -= 1e-9
             vmax += 1e-9
+        vmin, vmax = float(vmin), float(vmax)
         self._level_updating = True
         try:
-            self.hist.setLevels(float(vmin), float(vmax))
+            self.hist.setLevels(vmin, vmax)
             if update_hist_range:
-                # 外擴可視範圍，讓紫框上下緣離開邊界，方便直接拉扯
-                h0, h1 = self._padded_hist_range(vmin, vmax)
-                self.hist.setHistogramRange(h0, h1)
+                # 輸入／復原上下限後，色條可視範圍跟著縮放到該區間（拉條自動放大）
+                span = max(vmax - vmin, 1e-12)
+                pad = self._HIST_RANGE_PAD * span
+                self.hist.setHistogramRange(vmin - pad, vmax + pad, padding=0)
+                self.hist.setLevels(vmin, vmax)
             self._enable_level_drag()
         finally:
             self._level_updating = False
         self._refresh_level_labels()
-        self.levelsChanged.emit(float(vmin), float(vmax))
+        self.levelsChanged.emit(vmin, vmax)
 
     def get_levels(self):
         return self.hist.getLevels()
@@ -1083,42 +1346,72 @@ class InteractiveHeatmapPanel(QWidget):
             return None
 
     def reset_view(self):
-        """雙擊圖面：視野復原到影像完整真實座標範圍（保持 1:1，圓才是圓）。"""
+        """雙擊圖面：依 mm 真實比例復原（不壓縮）；剖面獨立、不跟著動。"""
         vb = self.plot.getViewBox()
         if vb is None or self.image_item.image is None:
             return
-        # 確保 rect transform 仍在
         self._apply_data_rect(self._data_rect)
         rect = self._view_rect()
         if rect is None or rect.width() <= 0 or rect.height() <= 0:
             return
         try:
             vb.enableAutoRange(x=False, y=False)
-            vb.setAspectLocked(lock=True, ratio=1.0)
-            # 清掉先前誤用像素 boundingRect 設下的 limits
+            # 必須先清掉 limits，否則無法為 1:1 比例在短軸方向留白（會被裁切壓縮）
             vb.setLimits(
                 xMin=None, xMax=None, yMin=None, yMax=None,
                 minXRange=None, maxXRange=None, minYRange=None, maxYRange=None,
             )
-            pad = 0.02
-            x0, x1 = rect.left(), rect.right()
-            y0, y1 = rect.top(), rect.bottom()
-            vb.setRange(xRange=(x0, x1), yRange=(y0, y1), padding=pad)
-            # 允許略微超出以便滾輪縮放，但仍以資料範圍為中心
+            x0, x1 = float(rect.left()), float(rect.right())
+            y0, y1 = float(rect.top()), float(rect.bottom())
             span_x = max(x1 - x0, 1e-9)
             span_y = max(y1 - y0, 1e-9)
+            if self._aspect_locked:
+                self._apply_aspect_fit_range(vb, x0, x1, y0, y1, pad=0.06)
+            else:
+                vb.setAspectLocked(lock=False)
+                vb.setRange(xRange=(x0, x1), yRange=(y0, y1), padding=0.04)
+            # limits 要比「比例復原後的視野」更寬，允許之後平移／縮放與再次留白
+            try:
+                vr = vb.viewRange()
+                vx0, vx1 = float(vr[0][0]), float(vr[0][1])
+                vy0, vy1 = float(vr[1][0]), float(vr[1][1])
+                vw = max(vx1 - vx0, span_x)
+                vh = max(vy1 - vy0, span_y)
+            except Exception:
+                vx0, vx1, vy0, vy1 = x0, x1, y0, y1
+                vw, vh = span_x, span_y
             vb.setLimits(
-                xMin=x0 - 0.5 * span_x,
-                xMax=x1 + 0.5 * span_x,
-                yMin=y0 - 0.5 * span_y,
-                yMax=y1 + 0.5 * span_y,
+                xMin=min(x0, vx0) - 2.0 * vw,
+                xMax=max(x1, vx1) + 2.0 * vw,
+                yMin=min(y0, vy0) - 2.0 * vh,
+                yMax=max(y1, vy1) + 2.0 * vh,
             )
+            vb.enableAutoRange(x=False, y=False)
         except Exception:
             pass
         try:
             self.plot.hideButtons()
         except Exception:
             pass
+        # 刻意不改剖面視野：剖面與熱圖已斷開連動
+
+    def _apply_aspect_fit_range(self, vb, x0, x1, y0, y1, pad=0.05):
+        """鎖 1:1 mm 比例並完整包住資料（多餘方向留白，如圖二）。"""
+        span_x = max(x1 - x0, 1e-9)
+        span_y = max(y1 - y0, 1e-9)
+        cx = 0.5 * (x0 + x1)
+        cy = 0.5 * (y0 + y1)
+        pw = max(float(vb.width()), 1.0)
+        ph = max(float(vb.height()), 1.0)
+        scale = max(span_x / pw, span_y / ph) * (1.0 + float(pad))
+        view_w = scale * pw
+        view_h = scale * ph
+        xr = (cx - 0.5 * view_w, cx + 0.5 * view_w)
+        yr = (cy - 0.5 * view_h, cy + 0.5 * view_h)
+        # setAspectLocked(True) 會 updateViewRange 並可能裁切；先設好視野再寫入 state
+        vb.setAspectLocked(lock=False)
+        vb.setRange(xRange=xr, yRange=yr, padding=0, disableAutoRange=True)
+        vb.state["aspectLocked"] = 1.0
 
     def reset_levels(self):
         """雙擊色條：復原預設色階上下限。"""
@@ -1126,6 +1419,195 @@ class InteractiveHeatmapPanel(QWidget):
             return
         vmin, vmax = self._default_levels
         self.apply_levels(vmin, vmax, update_hist_range=True)
+
+    def _on_toggle_cross(self, hidden):
+        self._show_profile_cross = not bool(hidden)
+        self.btn_toggle_cross.setText("顯示十字" if hidden else "隱藏十字")
+        self._redraw_profile_cross()
+
+    def set_profile_at_view(self, x, y, reset_view=False):
+        """依視圖座標（mm）對應最近網格點並更新剖面。"""
+        if self._profile_matrix is None or self._profile_x is None or self._profile_y is None:
+            return
+        ix = int(np.clip(np.abs(self._profile_x - float(x)).argmin(), 0, self._profile_x.size - 1))
+        iy = int(np.clip(np.abs(self._profile_y - float(y)).argmin(), 0, self._profile_y.size - 1))
+        self.set_profile_point(ix, iy, reset_view=reset_view)
+
+    def set_profile_point(self, ix, iy, reset_view=False):
+        if self._profile_matrix is None:
+            return
+        ny, nx = self._profile_matrix.shape
+        ix = int(np.clip(ix, 0, nx - 1))
+        iy = int(np.clip(iy, 0, ny - 1))
+        self._profile_point = (ix, iy)
+        self._redraw_profile_cross()
+        self.update_inline_profiles(reset_view=reset_view)
+        self.profilePointChanged.emit(ix, iy)
+
+    def clear_profile_cross(self):
+        for item in self._profile_cross_items:
+            try:
+                self.plot.removeItem(item)
+            except Exception:
+                pass
+        self._profile_cross_items = []
+
+    def _redraw_profile_cross(self):
+        self.clear_profile_cross()
+        if (
+            not self._with_profiles
+            or not self._show_profile_cross
+            or self._profile_point is None
+            or self._profile_x is None
+            or self._profile_y is None
+        ):
+            return
+        ix, iy = self._profile_point
+        x = float(self._profile_x[ix])
+        y = float(self._profile_y[iy])
+        pen = pg.mkPen("#FF1744", width=1.5)
+        v_item = pg.InfiniteLine(pos=x, angle=90, pen=pen)
+        h_item = pg.InfiniteLine(pos=y, angle=0, pen=pen)
+        self.plot.addItem(v_item, ignoreBounds=True)
+        self.plot.addItem(h_item, ignoreBounds=True)
+        self._profile_cross_items = [v_item, h_item]
+
+    def _relink_profiles(self):
+        """保留空實作：剖面刻意不與熱圖連動。"""
+        return
+
+    def update_inline_profiles(self, reset_view=False):
+        """更新剖面波形。剖面與熱圖視野獨立。"""
+        if (
+            not self._with_profiles
+            or self._profile_matrix is None
+            or self._profile_point is None
+            or self.plot_x_profile is None
+            or self.plot_y_profile is None
+        ):
+            return
+        ix, iy = self._profile_point
+        x_profile = np.asarray(self._profile_matrix[iy, :], dtype=float)
+        y_profile = np.asarray(self._profile_matrix[:, ix], dtype=float)
+        x_axis = np.asarray(self._profile_x, dtype=float)
+        y_axis = np.asarray(self._profile_y, dtype=float)
+        x_pos = float(x_axis[ix])
+        y_pos = float(y_axis[iy])
+
+        keep_x_view = None
+        keep_y_view = None
+        if not reset_view and self._profile_view_ready:
+            try:
+                keep_x_view = self.plot_x_profile.viewRange()
+                keep_y_view = self.plot_y_profile.viewRange()
+            except Exception:
+                pass
+
+        self.plot_x_profile.clear()
+        self.plot_y_profile.clear()
+        self.plot_x_profile.addItem(
+            pg.PlotCurveItem(x_axis, x_profile, pen=pg.mkPen("#00ACC1", width=1.5))
+        )
+        self.plot_x_profile.addItem(
+            pg.InfiniteLine(
+                pos=x_pos, angle=90, pen=pg.mkPen("#FF1744", width=1, style=Qt.DashLine)
+            )
+        )
+        self.plot_y_profile.addItem(
+            pg.PlotCurveItem(y_profile, y_axis, pen=pg.mkPen("#FF5722", width=1.5))
+        )
+        self.plot_y_profile.addItem(
+            pg.InfiniteLine(
+                pos=y_pos, angle=0, pen=pg.mkPen("#FF1744", width=1, style=Qt.DashLine)
+            )
+        )
+        self.plot_x_profile.titleLabel.hide()
+        self.plot_y_profile.titleLabel.hide()
+        self.plot_x_profile.setToolTip(f"Horizontal profile at Y = {y_pos:.6g}")
+        self.plot_y_profile.setToolTip(f"Vertical profile at X = {x_pos:.6g}")
+
+        finite = np.concatenate(
+            [x_profile[np.isfinite(x_profile)], y_profile[np.isfinite(y_profile)]]
+        )
+        if finite.size:
+            lo, hi = float(np.min(finite)), float(np.max(finite))
+            if lo == hi:
+                lo -= 1.0
+                hi += 1.0
+            pad = 0.05 * (hi - lo)
+            default_i0, default_i1 = lo - pad, hi + pad
+        else:
+            default_i0, default_i1 = 0.0, 1.0
+
+        if keep_x_view is not None and keep_y_view is not None:
+            self.plot_x_profile.setRange(
+                xRange=keep_x_view[0], yRange=keep_x_view[1], padding=0
+            )
+            self.plot_y_profile.setRange(
+                xRange=keep_y_view[0], yRange=keep_y_view[1], padding=0
+            )
+        else:
+            if x_axis.size:
+                self.plot_x_profile.setXRange(
+                    float(x_axis[0]), float(x_axis[-1]), padding=0.02
+                )
+            self.plot_x_profile.setYRange(default_i0, default_i1, padding=0)
+            self.plot_y_profile.setXRange(default_i0, default_i1, padding=0)
+            if y_axis.size:
+                self.plot_y_profile.setYRange(
+                    float(y_axis[0]), float(y_axis[-1]), padding=0.02
+                )
+            self._profile_view_ready = True
+
+        configure_stable_plot_item(self.plot_x_profile, mouse_enabled=True)
+        configure_stable_plot_item(self.plot_y_profile, mouse_enabled=True)
+        self.plot_x_profile.getViewBox().setMouseEnabled(x=True, y=True)
+        self.plot_y_profile.getViewBox().setMouseEnabled(x=True, y=True)
+
+    def _reset_profile_view(self, which="both"):
+        """雙擊剖面：復原該剖面完整範圍（不影響熱圖）。"""
+        self._profile_view_ready = False
+        if which == "x":
+            # 只重設 X 剖面：暫時清 keep 邏輯，強制 default
+            if self.plot_x_profile is None or self._profile_matrix is None:
+                return
+            ix, iy = self._profile_point
+            x_profile = np.asarray(self._profile_matrix[iy, :], dtype=float)
+            x_axis = np.asarray(self._profile_x, dtype=float)
+            finite = x_profile[np.isfinite(x_profile)]
+            if finite.size == 0 or x_axis.size == 0:
+                return
+            lo, hi = float(np.min(finite)), float(np.max(finite))
+            if lo == hi:
+                lo -= 1.0
+                hi += 1.0
+            pad = 0.05 * (hi - lo)
+            self.plot_x_profile.setXRange(float(x_axis[0]), float(x_axis[-1]), padding=0.02)
+            self.plot_x_profile.setYRange(lo - pad, hi + pad, padding=0)
+        elif which == "y":
+            if self.plot_y_profile is None or self._profile_matrix is None:
+                return
+            ix, iy = self._profile_point
+            y_profile = np.asarray(self._profile_matrix[:, ix], dtype=float)
+            y_axis = np.asarray(self._profile_y, dtype=float)
+            finite = y_profile[np.isfinite(y_profile)]
+            if finite.size == 0 or y_axis.size == 0:
+                return
+            lo, hi = float(np.min(finite)), float(np.max(finite))
+            if lo == hi:
+                lo -= 1.0
+                hi += 1.0
+            pad = 0.05 * (hi - lo)
+            self.plot_y_profile.setXRange(lo - pad, hi + pad, padding=0)
+            self.plot_y_profile.setYRange(float(y_axis[0]), float(y_axis[-1]), padding=0.02)
+        else:
+            self.update_inline_profiles(reset_view=True)
+        configure_stable_plot_item(self.plot_x_profile, mouse_enabled=True)
+        configure_stable_plot_item(self.plot_y_profile, mouse_enabled=True)
+        if self.plot_x_profile is not None:
+            self.plot_x_profile.getViewBox().setMouseEnabled(x=True, y=True)
+        if self.plot_y_profile is not None:
+            self.plot_y_profile.getViewBox().setMouseEnabled(x=True, y=True)
 
     def export_current_image(self):
         safe_title = (
@@ -1155,6 +1637,19 @@ class InteractiveHeatmapPanel(QWidget):
             return False
 
     # ----- internal ---------------------------------------------------
+    def _format_level_value(self, value):
+        """固定顯示寬度用的色階數值格式（避免工具列被撐開）。"""
+        try:
+            v = float(value)
+        except Exception:
+            return "--"
+        av = abs(v)
+        if av == 0.0:
+            return "0"
+        if av >= 1e4 or (av < 1e-3 and av > 0):
+            return f"{v:.3e}"
+        return f"{v:.5g}"
+
     def _refresh_level_labels(self):
         try:
             vmin, vmax = self.hist.getLevels()
@@ -1162,8 +1657,8 @@ class InteractiveHeatmapPanel(QWidget):
             self.lbl_level_min.setText("下限: --")
             self.lbl_level_max.setText("上限: --")
             return
-        self.lbl_level_min.setText(f"下限: {vmin:.6g}")
-        self.lbl_level_max.setText(f"上限: {vmax:.6g}")
+        self.lbl_level_min.setText(f"下限: {self._format_level_value(vmin)}")
+        self.lbl_level_max.setText(f"上限: {self._format_level_value(vmax)}")
 
     def _on_hist_levels_changed(self):
         if self._level_updating:
@@ -1176,20 +1671,43 @@ class InteractiveHeatmapPanel(QWidget):
             pass
 
     def _on_scene_clicked(self, evt):
-        if not evt.double():
-            return
         pos = evt.scenePos()
-        # 色條雙擊 → 復原上下限
         try:
-            hist_rect = self.hist.sceneBoundingRect()
-            if hist_rect.contains(pos):
+            on_hist = self.hist.sceneBoundingRect().contains(pos)
+        except Exception:
+            on_hist = False
+
+        if evt.double():
+            if on_hist:
                 self.reset_levels()
                 return
-        except Exception:
-            pass
-        # 圖面雙擊 → 復原視野
-        if self.plot.sceneBoundingRect().contains(pos):
-            self.reset_view()
+            # 剖面雙擊：復原該剖面（不影響熱圖）
+            if self._with_profiles:
+                try:
+                    if (
+                        self.plot_x_profile is not None
+                        and self.plot_x_profile.sceneBoundingRect().contains(pos)
+                    ):
+                        self._reset_profile_view(which="x")
+                        return
+                    if (
+                        self.plot_y_profile is not None
+                        and self.plot_y_profile.sceneBoundingRect().contains(pos)
+                    ):
+                        self._reset_profile_view(which="y")
+                        return
+                except Exception:
+                    pass
+            if self.plot.sceneBoundingRect().contains(pos):
+                self.reset_view()
+            return
+
+        # 單擊熱圖：更新剖面十字與波形
+        if self._with_profiles and not on_hist and self.plot.sceneBoundingRect().contains(pos):
+            if evt.button() not in (Qt.LeftButton, Qt.NoButton):
+                return
+            point = self.plot.getViewBox().mapSceneToView(pos)
+            self.set_profile_at_view(point.x(), point.y(), reset_view=False)
 
     def _on_mouse_moved(self, evt):
         pos = evt[0]
@@ -1198,7 +1716,6 @@ class InteractiveHeatmapPanel(QWidget):
             self.mouseMoved.emit(mouse_point)
         else:
             self.mouseMoved.emit(None)
-
     def _prompt_level(self, which):
         """which: 'min' or 'max'（輔助精調；主要仍建議拖曳色條）。"""
         try:

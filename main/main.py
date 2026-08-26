@@ -1,4 +1,5 @@
 import sys
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget
 
 # 匯入獨立分頁
@@ -44,6 +45,16 @@ class ModularMatrixApp(QMainWindow):
         
 
 if __name__ == "__main__":
+    # 換電腦／高 DPI 縮放時避免格線與刻度錯位、糊成一團
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+    except AttributeError:
+        pass
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion") # 讓外觀看起來更現代
     window = ModularMatrixApp()

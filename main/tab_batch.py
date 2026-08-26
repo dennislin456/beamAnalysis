@@ -28,6 +28,7 @@ from shared_components import (NoWheelSpinBox, NoWheelDoubleSpinBox,
                                apply_readable_plot_theme, configure_stable_plot_item,
                                lock_plot_ranges, set_heatmap_view_transparent,
                                configure_equal_profile_strips,
+                               LevelAlignedHistogramLUTItem,
                                enforce_square_heatmap_cell,
                                PROFILE_SIDE_AXIS_PX, PROFILE_EDGE_AXIS_PX)
 from batch_data_loader import load_numeric_matrix, scan_location_files
@@ -747,7 +748,7 @@ class DataRayBatchTab(QWidget):
         self.plot_batch_heat.addItem(self.batch_image_item)
         self.plot_batch_heat.scene().sigMouseClicked.connect(self.on_batch_process_mouse_clicked)
 
-        self.batch_hist = pg.HistogramLUTItem()
+        self.batch_hist = LevelAlignedHistogramLUTItem()
         self.batch_hist.setImageItem(self.batch_image_item)
         self.batch_hist.gradient.setColorMap(self.batch_jet_map)
         self.batch_hist.sigLevelsChanged.connect(self.on_colorbar_levels_changed)

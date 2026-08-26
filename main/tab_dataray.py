@@ -21,7 +21,8 @@ from batch_data_loader import load_numeric_matrix
 from shared_components import (NoWheelSpinBox, NoWheelDoubleSpinBox,
                                HeatmapViewerWindow, CrossProfileViewerWindow,
                                compute_auto_spot_center, build_robust_threshold_mask,
-                               split_y_index, apply_readable_plot_theme)
+                               split_y_index, apply_readable_plot_theme,
+                               LevelAlignedHistogramLUTItem)
 
 class DataRayTab(QWidget):
     def __init__(self, parent=None):
@@ -604,7 +605,7 @@ class DataRayTab(QWidget):
         self.plot_heat.scene().sigMouseMoved.connect(self.mouse_moved)
         self.plot_heat.scene().sigMouseClicked.connect(self.mouse_clicked)
         
-        self.hist = pg.HistogramLUTItem()
+        self.hist = LevelAlignedHistogramLUTItem()
         self.hist.setImageItem(self.image_item)
         self.hist.gradient.setColorMap(jet_map)
         self.hist.sigLevelsChanged.connect(self.on_colorbar_levels_changed)
@@ -654,7 +655,7 @@ class DataRayTab(QWidget):
         self.contour_image_item = pg.ImageItem()
         self.plot_contour.addItem(self.contour_image_item)
         
-        self.contour_hist = pg.HistogramLUTItem()
+        self.contour_hist = LevelAlignedHistogramLUTItem()
         self.contour_hist.setImageItem(self.contour_image_item)
         self.contour_hist.gradient.setColorMap(jet_map)
         self.contour_hist.sigLevelsChanged.connect(self.on_contour_colorbar_levels_changed)
@@ -1571,7 +1572,7 @@ class DataRayTab(QWidget):
         self.contour_curves.clear()
         
         min_v, max_v = float(np.min(self.smoothed_matrix)), float(np.max(self.smoothed_matrix))
-        self.contour_hist.setHistogramRange(min_v, max_v)
+        self.contour_hist.setHistogramRange(min_v, max_v, padding=0)
         self.contour_hist.setLevels(min_v, max_v)
         self.update_isocurves_and_waveform()
 
