@@ -17,7 +17,7 @@ from PyQt5.QtCore import Qt
 # 💡 匯入共用的元件 (稍後會在 shared_components.py 提供)
 from shared_components import (
     NoWheelSpinBox, NoWheelDoubleSpinBox, CrossProfileViewerWindow,
-    apply_readable_plot_theme,
+    apply_readable_plot_theme, LevelAlignedHistogramLUTItem,
 )
 
 class BaslerTab(QWidget):
@@ -414,7 +414,7 @@ class BaslerTab(QWidget):
         self.basler_v_line.hide()
         self.basler_h_line.hide()
         
-        self.basler_hist = pg.HistogramLUTItem()
+        self.basler_hist = LevelAlignedHistogramLUTItem()
         self.basler_hist.setImageItem(self.basler_image_item)
         self.basler_hist.gradient.setColorMap(jet_map)
         self.basler_hist.sigLevelsChanged.connect(self.on_basler_colorbar_changed)
@@ -634,7 +634,7 @@ class BaslerTab(QWidget):
             
             self.basler_image_item.setImage(self.basler_matrix.T)
             min_v, max_v = float(np.min(self.basler_matrix)), float(np.max(self.basler_matrix))
-            self.basler_hist.setHistogramRange(min_v, max_v)
+            self.basler_hist.setHistogramRange(min_v, max_v, padding=0)
             self.basler_hist.setLevels(min_v, max_v)
             
             self.btn_export_basler.setEnabled(True)

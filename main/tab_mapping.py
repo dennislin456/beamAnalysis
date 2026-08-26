@@ -39,6 +39,8 @@ class MappingRoiWindow(QMainWindow):
             title="Mapping ROI",
             x_label="X (mm)",
             y_label="Y (mm)",
+            aspect_locked=True,
+            with_profiles=True,
         )
         layout.addWidget(self.panel, 1)
 
@@ -56,7 +58,15 @@ class MappingRoiWindow(QMainWindow):
 
         rect = self._image_rect()
         vmin, vmax = self._finite_minmax()
-        self.panel.set_image(self.matrix.T, rect=rect, levels=(vmin, vmax), reset_view=True)
+        self.panel.set_image(
+            self.matrix.T,
+            rect=rect,
+            levels=(vmin, vmax),
+            reset_view=True,
+            source_matrix=self.matrix,
+            x_coords=self.x_coords,
+            y_coords=self.y_coords,
+        )
         self._configure_grid()
         self._add_extrema_markers()
         self.panel.mouseMoved.connect(self._on_mouse_moved)
@@ -87,11 +97,9 @@ class MappingRoiWindow(QMainWindow):
             x_label, x_grid = parent._tick_spacing(self.x_coords)
             y_label, y_grid = parent._tick_spacing(self.y_coords)
         else:
-            x_grid = float(np.median(np.diff(self.x_coords))) if self.x_coords.size > 1 else 1.0
-            y_grid = float(np.median(np.diff(self.y_coords))) if self.y_coords.size > 1 else 1.0
-        self.panel.plot.getAxis("bottom").setTickSpacing(major=x_label, minor=x_grid)
-        self.panel.plot.getAxis("left").setTickSpacing(major=y_label, minor=y_grid)
-        self.panel.plot.showGrid(x=True, y=True, alpha=0.35)
+            x_label, x_grid = axis_tick_spacing(self.x_coords)
+            y_label, y_grid = axis_tick_spacing(self.y_coords)
+        self.panel.set_tick_spacing(x_label, x_grid, y_label, y_grid, grid_alpha=0.25)
 
     def _add_extrema_markers(self):
         """在 ROI 內以 X 標示最大值與最小值。"""
@@ -163,6 +171,7 @@ class MappingRoiWindow(QMainWindow):
             f"已固定: X={self.x_coords[ix]:.3f}, "
             f"Y={self.y_coords[iy]:.3f}, Value={value_text}"
         )
+        self.panel.set_profile_point(ix, iy, reset_view=False)
 
         self._clear_selected_point()
         x, y = float(self.x_coords[ix]), float(self.y_coords[iy])
@@ -176,15 +185,8 @@ class MappingRoiWindow(QMainWindow):
         self.panel.plot.addItem(self.selected_point_item, ignoreBounds=True)
 
     def _reset_roi_view(self):
-        """雙擊 ROI 圖面時回到目前範圍的 X/Y 中心。"""
-        if self.x_coords.size == 0 or self.y_coords.size == 0:
-            return
-        x0, x1 = float(self.x_coords[0]), float(self.x_coords[-1])
-        y0, y1 = float(self.y_coords[0]), float(self.y_coords[-1])
-        vb = self.panel.plot.getViewBox()
-        vb.enableAutoRange(x=False, y=False)
-        vb.setAspectLocked(True, ratio=1.0)
-        vb.setRange(xRange=(x0, x1), yRange=(y0, y1), padding=0.02)
+        """雙擊 ROI 圖面時回到完整資料範圍（與主圖相同：解鎖比例鋪滿）。"""
+        self.panel.reset_view()
 
     @staticmethod
     def _cell_bounds(coords, index):
@@ -240,6 +242,550 @@ class MappingRoiWindow(QMainWindow):
             QMessageBox.critical(self, "匯出失敗", f"無法匯出範圍資料：\n{exc}")
 
 
+def _grid_step_from_coords(coords, fallback=1.0):
+    values = np.asarray(coords, dtype=float)
+    if values.size < 2:
+        return float(fallback)
+    diffs = np.abs(np.diff(values))
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if diffs.size == 0:
+        return float(fallback)
+    return float(np.median(diffs))
+
+
+def _nice_number(x):
+    """取 1/2/5×10^n，讓軸刻度在不同螢幕／縮放下都好讀。"""
+    x = float(x)
+    if not np.isfinite(x) or x <= 0:
+        return 1.0
+    exp = np.floor(np.log10(x))
+    frac = x / (10.0 ** exp)
+    if frac < 1.5:
+        nice = 1.0
+    elif frac < 3.0:
+        nice = 2.0
+    elif frac < 7.0:
+        nice = 5.0
+    else:
+        nice = 10.0
+    return float(nice * (10.0 ** exp))
+
+
+def axis_tick_spacing(coords, target_major_labels=8):
+    """回傳 (major, minor)。
+
+    不再把次格線設成資料 step(如 0.2mm)：視野一大就會畫出上百條線，
+    在另一台高 DPI／不同解析度電腦上特別容易糊成怪格線。
+    """
+    values = np.asarray(coords, dtype=float)
+    if values.size == 0:
+        return 1.0, 0.2
+    span = float(np.nanmax(values) - np.nanmin(values))
+    if not np.isfinite(span) or span <= 0:
+        step = _grid_step_from_coords(coords)
+        return step, step
+    major = _nice_number(span / max(float(target_major_labels), 1.0))
+    minor = major / 5.0
+    # 次格線也不要比資料步長細太多（避免無意義過密）
+    data_step = _grid_step_from_coords(coords)
+    if data_step > 0 and minor < data_step * 0.5:
+        minor = data_step
+        if major < minor:
+            major = _nice_number(minor * 5.0)
+    return float(major), float(minor)
+
+
+def compute_mapping_gradient_maps(matrix, x_coords, y_coords):
+    """計算四張梯度圖。
+
+    1) gx = [(x+1,y)-(x,y)] / step_x，省略每列最後一點
+    2) gy = [(x,y+1)-(x,y)] / step_y，省略每欄最後一點
+    3) (gx+gy)/2，兩者皆可算的格子（同時省略最後列與最後欄）
+    4) arctan(gy/gx) * 180/π
+    """
+    matrix = np.asarray(matrix, dtype=float)
+    x_coords = np.asarray(x_coords, dtype=float)
+    y_coords = np.asarray(y_coords, dtype=float)
+    if matrix.ndim != 2:
+        raise ValueError("矩陣必須是二維。")
+    ny, nx = matrix.shape
+    if nx < 2 or ny < 2:
+        raise ValueError("至少需要 2×2 個點才能計算梯度。")
+    if x_coords.size != nx or y_coords.size != ny:
+        raise ValueError("座標長度與矩陣尺寸不一致。")
+
+    step_x = _grid_step_from_coords(x_coords)
+    step_y = _grid_step_from_coords(y_coords)
+    if step_x <= 0 or step_y <= 0:
+        raise ValueError("無法從座標推算有效 step。")
+
+    left = matrix[:, :-1]
+    right = matrix[:, 1:]
+    gx = (right - left) / step_x
+
+    below = matrix[:-1, :]
+    above = matrix[1:, :]
+    gy = (above - below) / step_y
+
+    gx_c = gx[:-1, :]
+    gy_c = gy[:, :-1]
+    g_avg = (gx_c + gy_c) / 2.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        g_ang = np.degrees(np.arctan2(gy_c, gx_c))
+
+    return {
+        "step_x": step_x,
+        "step_y": step_y,
+        "gx": gx,
+        "gy": gy,
+        "g_avg": g_avg,
+        "g_ang": g_ang,
+        "x_gx": x_coords[:-1],
+        "y_gx": y_coords,
+        "x_gy": x_coords,
+        "y_gy": y_coords[:-1],
+        "x_c": x_coords[:-1],
+        "y_c": y_coords[:-1],
+    }
+
+
+class MappingGradientWindow(QMainWindow):
+    """顯示 Mapping 四張梯度／角度分析圖（可調平均半寬度、點選、分開匯出）。"""
+
+    _PLOT_SPECS = (
+        ("gx", "① X 向梯度"),
+        ("gy", "② Y 向梯度"),
+        ("g_avg", "③ 平均梯度"),
+        ("g_ang", "④ 梯度角度 [deg]"),
+    )
+
+    def __init__(self, matrix, x_coords, y_coords, parent=None, avg_size=1):
+        super().__init__(parent)
+        self.source_matrix = np.asarray(matrix, dtype=float)
+        self.x_coords = np.asarray(x_coords, dtype=float)
+        self.y_coords = np.asarray(y_coords, dtype=float)
+        self.maps = None
+        self.plot_slots = []  # per-panel state
+        self._exporting = False
+
+        self.setWindowTitle("Mapping 梯度分析")
+        self.resize(1400, 920)
+
+        host = QWidget(self)
+        root = QVBoxLayout(host)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+        toolbar.addWidget(QLabel("平均半寬度 (點數)"))
+        self.edit_avg_size = QLineEdit()
+        self.edit_avg_size.setFixedWidth(72)
+        self.edit_avg_size.setValidator(QIntValidator(1, 999, self))
+        self.edit_avg_size.setText(str(max(1, int(avg_size))))
+        self.edit_avg_size.setToolTip("1 = 不平滑；越大越平滑。變更後立即重算四張圖。")
+        self.edit_avg_size.editingFinished.connect(self._on_avg_changed)
+        toolbar.addWidget(self.edit_avg_size)
+
+        self.btn_apply_avg = QPushButton("套用平均")
+        self.btn_apply_avg.clicked.connect(self._on_avg_changed)
+        toolbar.addWidget(self.btn_apply_avg)
+
+        self.btn_export_all = QPushButton("匯出四張圖（分開檔案）")
+        self.btn_export_all.setStyleSheet(
+            "QPushButton { font-weight: bold; color: white; background-color: #0288D1; "
+            "border: none; border-radius: 4px; padding: 6px 12px; }"
+            "QPushButton:hover { background-color: #039BE5; }"
+        )
+        self.btn_export_all.setToolTip("各存一張 PNG；匯出時不會帶紅色選取框。")
+        self.btn_export_all.clicked.connect(self.export_four_plots)
+        toolbar.addWidget(self.btn_export_all)
+
+        self.lbl_step_info = QLabel("")
+        self.lbl_step_info.setStyleSheet("color: #546E7A; font-size: 12px;")
+        toolbar.addWidget(self.lbl_step_info, 1)
+        root.addLayout(toolbar)
+
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        root.addLayout(grid, 1)
+
+        positions = ((0, 0), (0, 1), (1, 0), (1, 1))
+        for (row, col), (key, title) in zip(positions, self._PLOT_SPECS):
+            cell = QWidget()
+            cell_layout = QVBoxLayout(cell)
+            cell_layout.setContentsMargins(0, 0, 0, 0)
+            cell_layout.setSpacing(2)
+
+            panel = InteractiveHeatmapPanel(
+                title=title,
+                x_label="X (mm)",
+                y_label="Y (mm)",
+                aspect_locked=True,
+                with_profiles=True,
+            )
+            # 個別「匯出當前圖檔」時也隱藏紅框
+            try:
+                panel.btn_export.clicked.disconnect()
+            except TypeError:
+                pass
+            panel.btn_export.clicked.connect(
+                lambda _checked=False, k=key: self._export_one_plot(k)
+            )
+
+            lbl_info = QLabel("點選: X=--, Y=--, Value=--")
+            lbl_info.setStyleSheet("color: #37474F; font-size: 11px;")
+            lbl_extrema = QLabel("最大/最小: --")
+            lbl_extrema.setStyleSheet("color: #37474F; font-size: 11px;")
+
+            cell_layout.addWidget(panel, 1)
+            cell_layout.addWidget(lbl_info)
+            cell_layout.addWidget(lbl_extrema)
+            grid.addWidget(cell, row, col)
+
+            slot = {
+                "key": key,
+                "title": title,
+                "panel": panel,
+                "lbl_info": lbl_info,
+                "lbl_extrema": lbl_extrema,
+                "matrix": None,
+                "x_coords": None,
+                "y_coords": None,
+                "selected_point": None,
+                "selected_item": None,
+                "extrema_items": [],
+            }
+            self.plot_slots.append(slot)
+            panel.mouseMoved.connect(
+                lambda pt, s=slot: self._on_panel_mouse_moved(s, pt)
+            )
+            panel.plot.scene().sigMouseClicked.connect(
+                lambda evt, s=slot: self._on_panel_clicked(s, evt)
+            )
+
+        self.setCentralWidget(host)
+        self._rebuild_plots(reset_view=True)
+
+    def _current_avg_size(self):
+        text = self.edit_avg_size.text().strip() or "1"
+        try:
+            return max(1, int(text))
+        except ValueError:
+            return 1
+
+    def _smooth_matrix(self, matrix, kernel_size):
+        matrix = np.asarray(matrix, dtype=float)
+        if kernel_size <= 1:
+            return matrix
+        parent = self.parentWidget()
+        if parent is not None and hasattr(parent, "_smooth_matrix"):
+            return parent._smooth_matrix(matrix, kernel_size)
+        padded = np.pad(matrix, kernel_size // 2, mode="reflect")
+        smoothed = np.full(matrix.shape, np.nan, dtype=float)
+        for yi in range(matrix.shape[0]):
+            for xi in range(matrix.shape[1]):
+                block = padded[yi:yi + kernel_size, xi:xi + kernel_size]
+                if np.isnan(block).all():
+                    smoothed[yi, xi] = np.nan
+                else:
+                    smoothed[yi, xi] = np.nanmean(block)
+        return smoothed
+
+    def _on_avg_changed(self):
+        size = self._current_avg_size()
+        self.edit_avg_size.setText(str(size))
+        self._rebuild_plots(reset_view=False)
+
+    def _rebuild_plots(self, reset_view=False):
+        avg = self._current_avg_size()
+        smoothed = self._smooth_matrix(self.source_matrix, avg)
+        maps = compute_mapping_gradient_maps(smoothed, self.x_coords, self.y_coords)
+        self.maps = maps
+        self.setWindowTitle(
+            f"Mapping 梯度分析  |  avg={avg}  |  "
+            f"step_x={maps['step_x']:.4g}  step_y={maps['step_y']:.4g}"
+        )
+        self.lbl_step_info.setText(
+            f"平均半寬度={avg}　｜　"
+            f"step_x={maps['step_x']:.6g} mm　｜　step_y={maps['step_y']:.6g} mm　｜　"
+            f"① X差分 ② Y差分 ③ 平均 ④ 角度"
+        )
+
+        data_by_key = {
+            "gx": (maps["gx"], maps["x_gx"], maps["y_gx"]),
+            "gy": (maps["gy"], maps["x_gy"], maps["y_gy"]),
+            "g_avg": (maps["g_avg"], maps["x_c"], maps["y_c"]),
+            "g_ang": (maps["g_ang"], maps["x_c"], maps["y_c"]),
+        }
+        for slot in self.plot_slots:
+            data, xs, ys = data_by_key[slot["key"]]
+            slot["matrix"] = data
+            slot["x_coords"] = np.asarray(xs, dtype=float)
+            slot["y_coords"] = np.asarray(ys, dtype=float)
+            self._clear_selected_point(slot)
+            self._clear_extrema_markers(slot)
+            slot["selected_point"] = None
+            slot["lbl_info"].setText("點選: X=--, Y=--, Value=--")
+            rect = self._image_rect(data, slot["x_coords"], slot["y_coords"])
+            vmin, vmax = self._finite_minmax(data)
+            slot["panel"].set_image(
+                data.T,
+                rect=rect,
+                levels=(vmin, vmax),
+                reset_view=reset_view,
+                source_matrix=data,
+                x_coords=slot["x_coords"],
+                y_coords=slot["y_coords"],
+            )
+            self._configure_grid(slot["panel"], slot["x_coords"], slot["y_coords"])
+            self._add_extrema_markers(slot)
+
+    def _on_panel_mouse_moved(self, slot, point):
+        if slot["selected_point"] is not None:
+            return
+        if point is None or slot["matrix"] is None:
+            slot["lbl_info"].setText("點選: X=--, Y=--, Value=--")
+            return
+        ix, iy = self._cell_index(slot, point.x(), point.y())
+        self._set_info_text(slot, ix, iy, prefix="滑鼠")
+
+    def _on_panel_clicked(self, slot, event):
+        if event.double():
+            return  # 雙擊交給 panel 復原視野
+        if event.button() not in (Qt.LeftButton, Qt.NoButton):
+            return
+        if slot["matrix"] is None:
+            return
+        pos = event.scenePos()
+        panel = slot["panel"]
+        try:
+            if panel.hist.sceneBoundingRect().contains(pos):
+                return
+        except Exception:
+            pass
+        if not panel.plot.sceneBoundingRect().contains(pos):
+            return
+        point = panel.plot.getViewBox().mapSceneToView(pos)
+        ix, iy = self._cell_index(slot, point.x(), point.y())
+        slot["selected_point"] = (ix, iy)
+        self._set_info_text(slot, ix, iy, prefix="已固定")
+        self._draw_selected_box(slot, ix, iy)
+        panel.set_profile_point(ix, iy, reset_view=False)
+
+    def _cell_index(self, slot, x, y):
+        xs = slot["x_coords"]
+        ys = slot["y_coords"]
+        ix = int(np.clip(np.abs(xs - float(x)).argmin(), 0, xs.size - 1))
+        iy = int(np.clip(np.abs(ys - float(y)).argmin(), 0, ys.size - 1))
+        return ix, iy
+
+    def _set_info_text(self, slot, ix, iy, prefix="點選"):
+        value = slot["matrix"][iy, ix]
+        value_text = "NaN" if not np.isfinite(value) else f"{float(value):.6g}"
+        slot["lbl_info"].setText(
+            f"{prefix}: X={slot['x_coords'][ix]:.3f}, "
+            f"Y={slot['y_coords'][iy]:.3f}, Value={value_text}"
+        )
+
+    def _draw_selected_box(self, slot, ix, iy):
+        self._clear_selected_point(slot)
+        x0, x1 = self._cell_bounds(slot["x_coords"], ix)
+        y0, y1 = self._cell_bounds(slot["y_coords"], iy)
+        item = pg.PlotDataItem(
+            [x0, x1, x1, x0, x0],
+            [y0, y0, y1, y1, y0],
+            pen=pg.mkPen("#FF0000", width=3),
+        )
+        slot["panel"].plot.addItem(item, ignoreBounds=True)
+        slot["selected_item"] = item
+
+    def _clear_selected_point(self, slot):
+        item = slot.get("selected_item")
+        if item is not None:
+            try:
+                slot["panel"].plot.removeItem(item)
+            except Exception:
+                pass
+            slot["selected_item"] = None
+
+    def _clear_extrema_markers(self, slot):
+        for item in slot.get("extrema_items") or []:
+            try:
+                slot["panel"].plot.removeItem(item)
+            except Exception:
+                pass
+        slot["extrema_items"] = []
+        lbl = slot.get("lbl_extrema")
+        if lbl is not None:
+            lbl.setText("最大/最小: --")
+
+    def _add_extrema_markers(self, slot):
+        """與範圍檢視相同：以 X 標示最大值與最小值位置。"""
+        self._clear_extrema_markers(slot)
+        matrix = slot.get("matrix")
+        xs = slot.get("x_coords")
+        ys = slot.get("y_coords")
+        lbl = slot.get("lbl_extrema")
+        if matrix is None or xs is None or ys is None:
+            return
+
+        finite_mask = np.isfinite(matrix)
+        if not np.any(finite_mask):
+            if lbl is not None:
+                lbl.setText("最大/最小: 無有效數值")
+            return
+
+        finite_values = np.where(finite_mask, matrix, np.nan)
+        max_y, max_x = np.unravel_index(np.nanargmax(finite_values), matrix.shape)
+        min_y, min_x = np.unravel_index(np.nanargmin(finite_values), matrix.shape)
+        max_value = float(matrix[max_y, max_x])
+        min_value = float(matrix[min_y, min_x])
+
+        max_item = pg.ScatterPlotItem(
+            x=[float(xs[max_x])], y=[float(ys[max_y])],
+            symbol="x", size=26,
+            pen=pg.mkPen("#7F0000", width=5),
+            brush=None,
+        )
+        min_item = pg.ScatterPlotItem(
+            x=[float(xs[min_x])], y=[float(ys[min_y])],
+            symbol="x", size=26,
+            pen=pg.mkPen("#001B5E", width=5),
+            brush=None,
+        )
+        slot["panel"].plot.addItem(max_item, ignoreBounds=True)
+        slot["panel"].plot.addItem(min_item, ignoreBounds=True)
+        slot["extrema_items"] = [max_item, min_item]
+        if lbl is not None:
+            lbl.setText(
+                f"最大 X: ({float(xs[max_x]):.3f}, {float(ys[max_y]):.3f}) "
+                f"= {max_value:.6g} ｜ 最小 X: ({float(xs[min_x]):.3f}, "
+                f"{float(ys[min_y]):.3f}) = {min_value:.6g}"
+            )
+
+    def _hide_all_selection_boxes(self):
+        hidden = []
+        for slot in self.plot_slots:
+            item = slot.get("selected_item")
+            if item is not None:
+                item.hide()
+                hidden.append(item)
+        return hidden
+
+    @staticmethod
+    def _show_items(items):
+        for item in items:
+            try:
+                item.show()
+            except Exception:
+                pass
+
+    def _export_one_plot(self, key):
+        slot = next((s for s in self.plot_slots if s["key"] == key), None)
+        if slot is None:
+            return
+        safe = slot["title"].replace(" ", "_").replace("/", "-")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            f"匯出 {slot['title']}",
+            f"{safe}.png",
+            "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)",
+        )
+        if not path:
+            return
+        hidden = self._hide_all_selection_boxes()
+        try:
+            target = getattr(slot["panel"].win, "ci", None) or slot["panel"].plot
+            exporter = pg_export.ImageExporter(target)
+            exporter.parameters()["width"] = max(int(slot["panel"].win.width()), 400)
+            exporter.parameters()["height"] = max(int(slot["panel"].win.height()), 300)
+            exporter.export(path)
+            QMessageBox.information(self, "匯出完成", f"已匯出：\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "匯出失敗", f"無法匯出圖檔：\n{exc}")
+        finally:
+            self._show_items(hidden)
+
+    def export_four_plots(self):
+        folder = QFileDialog.getExistingDirectory(self, "選擇四張圖的儲存資料夾", "")
+        if not folder:
+            return
+        avg = self._current_avg_size()
+        names = {
+            "gx": f"01_X_gradient_avg{avg}.png",
+            "gy": f"02_Y_gradient_avg{avg}.png",
+            "g_avg": f"03_mean_gradient_avg{avg}.png",
+            "g_ang": f"04_gradient_angle_avg{avg}.png",
+        }
+        hidden = self._hide_all_selection_boxes()
+        saved = []
+        try:
+            for slot in self.plot_slots:
+                path = os.path.join(folder, names[slot["key"]])
+                target = getattr(slot["panel"].win, "ci", None) or slot["panel"].plot
+                exporter = pg_export.ImageExporter(target)
+                exporter.parameters()["width"] = max(int(slot["panel"].win.width()), 400)
+                exporter.parameters()["height"] = max(int(slot["panel"].win.height()), 300)
+                exporter.export(path)
+                saved.append(path)
+            QMessageBox.information(
+                self,
+                "匯出完成",
+                "已分開匯出四張圖（不含紅色選取框）：\n" + "\n".join(saved),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "匯出失敗", f"無法匯出圖檔：\n{exc}")
+        finally:
+            self._show_items(hidden)
+
+    @staticmethod
+    def _cell_bounds(coords, index):
+        values = np.asarray(coords, dtype=float)
+        if values.size < 2:
+            value = float(values[0]) if values.size else 0.0
+            return value - 0.5, value + 0.5
+        left = (
+            values[index - 1]
+            if index > 0
+            else values[index] - (values[index + 1] - values[index])
+        )
+        right = (
+            values[index + 1]
+            if index < values.size - 1
+            else values[index] + (values[index] - values[index - 1])
+        )
+        return float((left + values[index]) / 2), float((values[index] + right) / 2)
+
+    @staticmethod
+    def _finite_minmax(matrix):
+        finite = np.asarray(matrix, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            return 0.0, 1.0
+        vmin, vmax = float(np.min(finite)), float(np.max(finite))
+        if vmin == vmax:
+            vmax = vmin + 1.0
+        return vmin, vmax
+
+    @staticmethod
+    def _image_rect(matrix, x_coords, y_coords):
+        dx = _grid_step_from_coords(x_coords)
+        dy = _grid_step_from_coords(y_coords)
+        return QRectF(
+            float(np.min(x_coords)) - dx / 2.0,
+            float(np.min(y_coords)) - dy / 2.0,
+            dx * matrix.shape[1],
+            dy * matrix.shape[0],
+        )
+
+    @staticmethod
+    def _configure_grid(panel, x_coords, y_coords):
+        x_major, x_minor = axis_tick_spacing(x_coords)
+        y_major, y_minor = axis_tick_spacing(y_coords)
+        panel.set_tick_spacing(x_major, x_minor, y_major, y_minor, grid_alpha=0.25)
+
+
 class MappingTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -259,6 +805,7 @@ class MappingTab(QWidget):
         self.contour_line_items = []
         self.roi_rect_item = None
         self.roi_window = None
+        self.gradient_window = None
         self.selected_point_item = None
         self.selected_point = None
         self._setup_ui()
@@ -376,6 +923,15 @@ class MappingTab(QWidget):
         self.btn_view_roi.setEnabled(False)
         left_layout.addWidget(self.btn_view_roi)
 
+        self.btn_view_gradient = QPushButton("查看梯度／角度分析圖")
+        self.btn_view_gradient.setStyleSheet(btn_style_default)
+        self.btn_view_gradient.setToolTip(
+            "① X 向梯度  ② Y 向梯度  ③ 平均  ④ 角度(度)"
+        )
+        self.btn_view_gradient.clicked.connect(self.show_gradient_window)
+        self.btn_view_gradient.setEnabled(False)
+        left_layout.addWidget(self.btn_view_gradient)
+
         avg_label = QLabel("平均半寬度 (點數)")
         avg_label.setStyleSheet("color: #424242; font-size: 12px;")
         left_layout.addWidget(avg_label)
@@ -412,11 +968,15 @@ class MappingTab(QWidget):
             title="Mapping Heatmap",
             x_label="X Pixels",
             y_label="Y Pixels",
+            aspect_locked=True,
+            with_profiles=True,
         )
         self.contour_panel = InteractiveHeatmapPanel(
             title="Contour Plot",
             x_label="X (mm)",
             y_label="Y (mm)",
+            aspect_locked=True,
+            with_profiles=True,
         )
 
         # 相容舊屬性名稱，供匯出與等高線邏輯使用
@@ -489,30 +1049,19 @@ class MappingTab(QWidget):
         return data_step
 
     def _tick_spacing(self, coords):
-        """回傳 (文字標籤間距, 格線間距)，避免軸標籤過度密集。"""
-        grid_spacing = self._grid_spacing(coords)
-        values = np.asarray(coords, dtype=float)
-        span = float(np.max(values) - np.min(values)) if values.size else 0.0
-        if span <= 0 or grid_spacing <= 0:
-            return grid_spacing, grid_spacing
-
-        label_count = 10.0
-        label_multiplier = max(1, int(np.ceil(span / (label_count * grid_spacing))))
-        label_spacing = grid_spacing * label_multiplier
-        return label_spacing, grid_spacing
+        """回傳 (文字標籤間距, 格線間距)，跨螢幕／DPI 保持可讀。"""
+        return axis_tick_spacing(coords)
 
     def _configure_mapping_grid(self):
-        """依讀入的 X/Y step 設定主要格線，避免自動次格線過密。"""
+        """設定主要／次要格線，避免依 0.2mm 畫出過密怪格。"""
         if self.x_coords is None or self.y_coords is None:
             return
 
         x_label_spacing, x_grid_spacing = self._tick_spacing(self.x_coords)
         y_label_spacing, y_grid_spacing = self._tick_spacing(self.y_coords)
-        x_axis = self.heatmap_panel.plot.getAxis("bottom")
-        y_axis = self.heatmap_panel.plot.getAxis("left")
-        x_axis.setTickSpacing(major=x_label_spacing, minor=x_grid_spacing)
-        y_axis.setTickSpacing(major=y_label_spacing, minor=y_grid_spacing)
-        self.heatmap_panel.plot.showGrid(x=True, y=True, alpha=0.35)
+        self.heatmap_panel.set_tick_spacing(
+            x_label_spacing, x_grid_spacing, y_label_spacing, y_grid_spacing, grid_alpha=0.25
+        )
 
     def _on_mapping_mode_changed(self):
         subtract = self.combo_mapping_mode.currentData() == "subtract"
@@ -527,6 +1076,7 @@ class MappingTab(QWidget):
             self.lbl_mapping_path.setText("未選擇 Mapping 檔案")
         self.btn_plot_mapping.setEnabled(False)
         self.btn_export_mapping.setEnabled(False)
+        self.btn_view_gradient.setEnabled(False)
         self.mapping_matrix = None
         self.mapping_matrix_f1 = None
         self.mapping_matrix_f2 = None
@@ -615,6 +1165,7 @@ class MappingTab(QWidget):
             self.btn_export_mapping.setEnabled(False)
             self.chk_roi_enabled.setEnabled(False)
             self.btn_view_roi.setEnabled(False)
+            self.btn_view_gradient.setEnabled(False)
             self._clear_roi_overlay()
 
     def load_mapping_file_f2(self):
@@ -673,6 +1224,9 @@ class MappingTab(QWidget):
             rect=rect,
             levels=(raw_min, raw_max),
             reset_view=True,
+            source_matrix=raw_matrix,
+            x_coords=self.x_coords,
+            y_coords=self.y_coords,
         )
         self._configure_mapping_grid()
 
@@ -681,6 +1235,7 @@ class MappingTab(QWidget):
         self.lbl_status.setText("狀態: Mapping 圖已繪製")
         self.plot_drawn = True
         self.btn_export_mapping.setEnabled(bool(self.export_dir))
+        self.btn_view_gradient.setEnabled(True)
         self._update_roi_overlay()
 
     def _set_roi_spin_ranges(self):
@@ -761,6 +1316,34 @@ class MappingTab(QWidget):
         )
         self.roi_window.show()
 
+    def show_gradient_window(self):
+        if self.mapping_matrix is None or self.x_coords is None or self.y_coords is None:
+            QMessageBox.warning(self, "提醒", "請先畫出 Mapping 圖。")
+            return
+        if not self.plot_drawn:
+            QMessageBox.warning(self, "提醒", "請先點「畫出 Mapping 圖」。")
+            return
+        try:
+            avg_text = self.edit_avg_size.text().strip() or "1"
+            avg_size = max(1, int(avg_text))
+            if getattr(self, "gradient_window", None) is not None:
+                try:
+                    self.gradient_window.close()
+                except Exception:
+                    pass
+            # 傳入原始矩陣；平均半寬度在分析視窗內即時調整
+            self.gradient_window = MappingGradientWindow(
+                self.mapping_matrix,
+                self.x_coords,
+                self.y_coords,
+                parent=self,
+                avg_size=avg_size,
+            )
+            self.gradient_window.show()
+            self.lbl_status.setText("狀態: 已開啟梯度／角度分析視窗")
+        except Exception as exc:
+            QMessageBox.critical(self, "無法計算梯度", f"{exc}")
+
     def select_export_directory(self):
         export_dir = QFileDialog.getExistingDirectory(self, "選擇儲存資料夾", "")
         if export_dir:
@@ -826,16 +1409,19 @@ class MappingTab(QWidget):
             rect=rect,
             levels=(contour_min, contour_max),
             reset_view=reset_view,
+            source_matrix=matrix,
+            x_coords=self.x_coords,
+            y_coords=self.y_coords,
         )
         contour_x_label_spacing, contour_x_grid_spacing = self._tick_spacing(self.x_coords)
         contour_y_label_spacing, contour_y_grid_spacing = self._tick_spacing(self.y_coords)
-        self.contour_panel.plot.getAxis("bottom").setTickSpacing(
-            major=contour_x_label_spacing, minor=contour_x_grid_spacing
+        self.contour_panel.set_tick_spacing(
+            contour_x_label_spacing,
+            contour_x_grid_spacing,
+            contour_y_label_spacing,
+            contour_y_grid_spacing,
+            grid_alpha=0.25,
         )
-        self.contour_panel.plot.getAxis("left").setTickSpacing(
-            major=contour_y_label_spacing, minor=contour_y_grid_spacing
-        )
-        self.contour_panel.plot.showGrid(x=True, y=True, alpha=0.35)
 
         self._clear_contour_lines()
         # 讓 contour 更連續：從 8 個 level 提升為 16~20 個，
@@ -948,6 +1534,8 @@ class MappingTab(QWidget):
     def _on_heatmap_clicked(self, event):
         if self.mapping_matrix is None or not self.plot_drawn:
             return
+        if event.double():
+            return
         if event.button() != Qt.LeftButton:
             return
         pos = event.scenePos()
@@ -966,6 +1554,7 @@ class MappingTab(QWidget):
             f"已固定範圍: X={x0:.3f}~{x1:.3f} mm, "
             f"Y={y0:.3f}~{y1:.3f} mm, Value={value_text}"
         )
+        self.heatmap_panel.set_profile_point(ix, iy, reset_view=False)
 
         self._clear_selected_point()
         self.selected_point_item = pg.PlotDataItem(
