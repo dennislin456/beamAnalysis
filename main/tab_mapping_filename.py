@@ -342,6 +342,7 @@ class MappingFilenameTab(MappingTab):
             self.chk_roi_enabled.setEnabled(True)
             self._set_roi_spin_ranges()
             self.plot_drawn = False
+            self._update_point_count_label(raw_files=len(paths))
         except Exception as exc:
             QMessageBox.critical(self, "匯入失敗", f"無法讀取檔案：\n{exc}")
             self.mapping_matrix = None
@@ -350,8 +351,25 @@ class MappingFilenameTab(MappingTab):
             self.y_coords = None
             self.btn_plot_mapping.setEnabled(False)
             self.btn_export_mapping.setEnabled(False)
+            self._update_point_count_label()
         finally:
             self.btn_load_mapping.setEnabled(True)
+
+    def _update_point_count_label(self, raw_files=None):
+        """顯示平均後 X/Y 點數；若有提供則附上匯入 JSON 筆數。"""
+        n_points = len(self._filename_groups) if self._filename_groups else 0
+        if n_points <= 0:
+            super()._update_point_count_label()
+            return
+        if raw_files is not None:
+            self.lbl_point_count.setText(
+                f"總點數: {n_points} 個 X/Y（匯入 {raw_files} 筆 JSON）"
+            )
+        else:
+            sample_n = sum(len(v) for v in self._filename_groups.values())
+            self.lbl_point_count.setText(
+                f"總點數: {n_points} 個 X/Y（樣本 {sample_n}）"
+            )
 
     def _update_roi_overlay(self):
         super()._update_roi_overlay()
@@ -381,6 +399,7 @@ class MappingFilenameTab(MappingTab):
             f"狀態: 已繪製平均 Mapping｜{len(self._filename_groups)} 個點"
             + (f"｜單位: {unit_text}" if unit_text else "")
         )
+        self._update_point_count_label()
 
     def _point_stats(self, x, y, mean_value):
         """回傳單一 X/Y 點的 mean / min / max / std（母體）。"""

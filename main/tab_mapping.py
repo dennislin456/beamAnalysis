@@ -5,7 +5,7 @@ import pyqtgraph as pg
 import pyqtgraph.exporters as pg_export
 
 from PyQt5.QtWidgets import (
-    QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel,
+    QApplication, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel,
     QFileDialog, QMessageBox, QSplitter, QFrame, QLineEdit,
     QDoubleSpinBox, QCheckBox, QMainWindow, QGridLayout, QComboBox,
 )
@@ -71,6 +71,7 @@ class MappingRoiWindow(QMainWindow):
         self._add_extrema_markers()
         self.panel.mouseMoved.connect(self._on_mouse_moved)
         self.panel.plot.scene().sigMouseClicked.connect(self._on_clicked)
+        self.panel.crossVisibilityChanged.connect(self._on_cross_visibility_changed)
 
     def _finite_minmax(self):
         finite = self.matrix[np.isfinite(self.matrix)]
@@ -136,6 +137,14 @@ class MappingRoiWindow(QMainWindow):
             f"= {max_value:.6f} ｜ 最小 X: ({self.x_coords[min_x]:.3f}, "
             f"{self.y_coords[min_y]:.3f}) = {min_value:.6f}"
         )
+
+    def _on_cross_visibility_changed(self, visible):
+        """隱藏十字時隱藏最大／最小 X 標記；文字說明仍保留。"""
+        for item in self.extrema_items:
+            try:
+                item.setVisible(visible)
+            except Exception:
+                pass
 
     def _on_mouse_moved(self, point):
         if self.selected_point is not None:
@@ -397,7 +406,9 @@ class MappingGradientWindow(QMainWindow):
             "border: none; border-radius: 4px; padding: 6px 12px; }"
             "QPushButton:hover { background-color: #039BE5; }"
         )
-        self.btn_export_all.setToolTip("各存一張 PNG；匯出時不會帶紅色選取框。")
+        self.btn_export_all.setToolTip(
+            "各存一張 PNG；匯出時不含十字、X 標示、colorbar 與紅色選取框。"
+        )
         self.btn_export_all.clicked.connect(self.export_four_plots)
         toolbar.addWidget(self.btn_export_all)
 
@@ -405,6 +416,16 @@ class MappingGradientWindow(QMainWindow):
         self.lbl_step_info.setStyleSheet("color: #546E7A; font-size: 12px;")
         toolbar.addWidget(self.lbl_step_info, 1)
         root.addLayout(toolbar)
+
+        # 操作提示只顯示一次（紅色方框區域），不在四個畫布各自重複
+        tip = QLabel(
+            "滾輪縮放主圖／剖面（剖面不跟主圖連動）· 點擊更新剖面 · "
+            "雙擊主圖依比例復原 · 雙擊剖面復原　｜　"
+            "隱藏十字及X標示時一併隱藏最大／最小 X 標記"
+        )
+        tip.setStyleSheet("color: #607D8B; font-size: 11px;")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
 
         grid = QGridLayout()
         grid.setSpacing(6)
@@ -417,12 +438,15 @@ class MappingGradientWindow(QMainWindow):
             cell_layout.setContentsMargins(0, 0, 0, 0)
             cell_layout.setSpacing(2)
 
+            # 色條保留；操作說明改放視窗上方共用
             panel = InteractiveHeatmapPanel(
                 title=title,
                 x_label="X (mm)",
                 y_label="Y (mm)",
                 aspect_locked=True,
                 with_profiles=True,
+                show_colorbar=True,
+                show_tip=False,
             )
             # 個別「匯出當前圖檔」時也隱藏紅框
             try:
@@ -462,6 +486,9 @@ class MappingGradientWindow(QMainWindow):
             )
             panel.plot.scene().sigMouseClicked.connect(
                 lambda evt, s=slot: self._on_panel_clicked(s, evt)
+            )
+            panel.crossVisibilityChanged.connect(
+                lambda visible, s=slot: self._on_cross_visibility_changed(s, visible)
             )
 
         self.setCentralWidget(host)
@@ -663,6 +690,25 @@ class MappingGradientWindow(QMainWindow):
                 f"= {max_value:.6g} ｜ 最小 X: ({float(xs[min_x]):.3f}, "
                 f"{float(ys[min_y]):.3f}) = {min_value:.6g}"
             )
+        # 若目前為「隱藏十字」，極值標記一併隱藏
+        self._apply_extrema_visibility(slot)
+
+    def _on_cross_visibility_changed(self, slot, visible):
+        """隱藏十字時，最大／最小 X 標記一併隱藏；下方文字說明仍保留。"""
+        self._apply_extrema_visibility(slot, visible=visible)
+
+    def _apply_extrema_visibility(self, slot, visible=None):
+        if visible is None:
+            panel = slot.get("panel")
+            visible = True if panel is None else bool(
+                getattr(panel, "_show_profile_cross", True)
+            )
+        for item in slot.get("extrema_items") or []:
+            try:
+                item.setVisible(visible)
+            except Exception:
+                pass
+        # 下方「最大/最小」文字說明不隱藏
 
     def _hide_all_selection_boxes(self):
         hidden = []
@@ -672,6 +718,63 @@ class MappingGradientWindow(QMainWindow):
                 item.hide()
                 hidden.append(item)
         return hidden
+
+    def _prepare_clean_export_overlays(self):
+        """四張一起匯出時暫時隱藏十字、X 標示、色條與選取框；回傳還原函式。"""
+        restore_fns = []
+
+        # 紅色選取框
+        for item in self._hide_all_selection_boxes():
+            restore_fns.append(lambda it=item: it.show())
+
+        for slot in self.plot_slots:
+            panel = slot.get("panel")
+            if panel is None:
+                continue
+
+            # 剖面十字
+            cross_items = list(getattr(panel, "_profile_cross_items", []) or [])
+            for item in cross_items:
+                try:
+                    was_visible = item.isVisible()
+                    item.hide()
+                    restore_fns.append(
+                        lambda it=item, vis=was_visible: it.setVisible(vis)
+                    )
+                except Exception:
+                    pass
+
+            # 最大／最小 X 標示
+            for item in slot.get("extrema_items") or []:
+                try:
+                    was_visible = item.isVisible()
+                    item.hide()
+                    restore_fns.append(
+                        lambda it=item, vis=was_visible: it.setVisible(vis)
+                    )
+                except Exception:
+                    pass
+
+            # colorbar
+            hist = getattr(panel, "hist", None)
+            if hist is not None:
+                try:
+                    was_visible = hist.isVisible()
+                    hist.hide()
+                    restore_fns.append(
+                        lambda h=hist, vis=was_visible: h.setVisible(vis)
+                    )
+                except Exception:
+                    pass
+
+        def _restore():
+            for fn in restore_fns:
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+        return _restore
 
     @staticmethod
     def _show_items(items):
@@ -718,7 +821,9 @@ class MappingGradientWindow(QMainWindow):
             "g_avg": f"03_mean_gradient_avg{avg}.png",
             "g_ang": f"04_gradient_angle_avg{avg}.png",
         }
-        hidden = self._hide_all_selection_boxes()
+        restore = self._prepare_clean_export_overlays()
+        # 等 layout 收掉 colorbar 再匯出，避免空白邊
+        QApplication.processEvents()
         saved = []
         try:
             for slot in self.plot_slots:
@@ -732,12 +837,14 @@ class MappingGradientWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "匯出完成",
-                "已分開匯出四張圖（不含紅色選取框）：\n" + "\n".join(saved),
+                "已分開匯出四張圖（不含十字、X 標示、colorbar）：\n"
+                + "\n".join(saved),
             )
         except Exception as exc:
             QMessageBox.critical(self, "匯出失敗", f"無法匯出圖檔：\n{exc}")
         finally:
-            self._show_items(hidden)
+            restore()
+            QApplication.processEvents()
 
     @staticmethod
     def _cell_bounds(coords, index):
@@ -950,6 +1057,10 @@ class MappingTab(QWidget):
         self.lbl_status.setStyleSheet("color: #1565C0; font-weight: bold; font-size: 12px;")
         left_layout.addWidget(self.lbl_status)
 
+        self.lbl_point_count = QLabel("總點數: --")
+        self.lbl_point_count.setStyleSheet("color: #37474F; font-size: 12px; font-weight: bold;")
+        left_layout.addWidget(self.lbl_point_count)
+
         self.lbl_mouse_info = QLabel("滑鼠位置: X=--, Y=--, Value=--")
         self.lbl_mouse_info.setStyleSheet("color: #424242; font-size: 11px;")
         self.lbl_mouse_info.setWordWrap(True)
@@ -1153,6 +1264,7 @@ class MappingTab(QWidget):
             self.chk_roi_enabled.setEnabled(True)
             self._set_roi_spin_ranges()
             self.plot_drawn = False
+            self._update_point_count_label()
         except Exception as exc:
             QMessageBox.critical(self, "匯入失敗", f"無法讀取檔案：\n{str(exc)}")
             self.lbl_status.setText("狀態: 匯入失敗，請選擇有效的 Mapping 檔案")
@@ -1164,6 +1276,7 @@ class MappingTab(QWidget):
             self.btn_plot_mapping.setEnabled(False)
             self.btn_export_mapping.setEnabled(False)
             self.chk_roi_enabled.setEnabled(False)
+            self._update_point_count_label()
             self.btn_view_roi.setEnabled(False)
             self.btn_view_gradient.setEnabled(False)
             self._clear_roi_overlay()
@@ -1233,10 +1346,26 @@ class MappingTab(QWidget):
         self._update_contour_plot(processed_matrix, reset_view=True)
 
         self.lbl_status.setText("狀態: Mapping 圖已繪製")
+        self._update_point_count_label()
         self.plot_drawn = True
         self.btn_export_mapping.setEnabled(bool(self.export_dir))
         self.btn_view_gradient.setEnabled(True)
         self._update_roi_overlay()
+
+    def _update_point_count_label(self):
+        """狀態下方顯示有效點數（非 NaN）。"""
+        matrix = self.mapping_matrix
+        if matrix is None:
+            matrix = self.mapping_matrix_f1
+        if matrix is None:
+            self.lbl_point_count.setText("總點數: --")
+            return
+        finite_n = int(np.sum(np.isfinite(matrix)))
+        total_n = int(np.asarray(matrix).size)
+        if finite_n == total_n:
+            self.lbl_point_count.setText(f"總點數: {finite_n}")
+        else:
+            self.lbl_point_count.setText(f"總點數: {finite_n}（網格 {total_n}）")
 
     def _set_roi_spin_ranges(self):
         if self.x_coords is None or self.y_coords is None:
