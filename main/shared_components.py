@@ -93,6 +93,141 @@ def configure_equal_profile_strips(
     layout.setRowStretchFactor(profile_row, 0)
 
 
+def _reserve_axis_slot(plot, axis_name, size_px, visible_values=False):
+    """保留軸佔位寬／高，使相鄰 PlotItem 的 ViewBox 邊緣對齊。"""
+    if plot is None:
+        return
+    try:
+        ax = plot.getAxis(axis_name)
+    except Exception:
+        return
+    plot.showAxis(axis_name, show=True)
+    if not visible_values:
+        try:
+            ax.setStyle(showValues=False, tickLength=0)
+        except Exception:
+            pass
+        try:
+            ax.setLabel("")
+        except Exception:
+            pass
+        try:
+            ax.setPen(pg.mkPen(None))
+            ax.setTextPen(pg.mkPen(None))
+        except Exception:
+            pass
+    size_px = int(max(0, size_px))
+    if axis_name in ("left", "right"):
+        ax.setWidth(size_px)
+    else:
+        ax.setHeight(size_px)
+
+
+def align_profile_viewboxes(
+    heat_plot,
+    x_profile,
+    y_profile,
+    corner=None,
+    side_axis_px=None,
+    edge_axis_px=None,
+):
+    """
+    統一熱圖／剖面軸佔位，讓：
+    - 下方橫剖面 ViewBox 左右緣對齊熱圖 ViewBox（同欄：左／右軸寬一致）
+    - 左側縱剖面 ViewBox 上下緣對齊熱圖 ViewBox（同列：上／下軸高＋標題列一致）
+    """
+    if heat_plot is None or x_profile is None or y_profile is None:
+        return
+    side = PROFILE_SIDE_AXIS_PX_COMPACT if side_axis_px is None else int(side_axis_px)
+    edge = PROFILE_EDGE_AXIS_PX_COMPACT if edge_axis_px is None else int(edge_axis_px)
+
+    # 同欄對齊：熱圖與橫剖面的左／右軸寬必須相同
+    heat_plot.showAxis("left", show=True)
+    heat_plot.showAxis("bottom", show=True)
+    heat_plot.getAxis("left").setWidth(side)
+    heat_plot.getAxis("bottom").setHeight(edge)
+    _reserve_axis_slot(heat_plot, "right", side, visible_values=False)
+    # 同列對齊：熱圖上緣佔位 = 縱剖面「Value」上軸高度
+    _reserve_axis_slot(heat_plot, "top", edge, visible_values=False)
+
+    x_profile.showAxis("bottom", show=True)
+    x_profile.showAxis("right", show=True)
+    x_profile.getAxis("bottom").setHeight(edge)
+    x_profile.getAxis("right").setWidth(side)
+    _reserve_axis_slot(x_profile, "left", side, visible_values=False)
+    _reserve_axis_slot(x_profile, "top", 0, visible_values=False)
+
+    y_profile.showAxis("left", show=True)
+    y_profile.showAxis("top", show=True)
+    y_profile.getAxis("left").setWidth(side)
+    y_profile.getAxis("top").setHeight(edge)
+    _reserve_axis_slot(y_profile, "bottom", edge, visible_values=False)
+    _reserve_axis_slot(y_profile, "right", 0, visible_values=False)
+
+    if corner is not None:
+        _reserve_axis_slot(corner, "left", side, visible_values=False)
+        _reserve_axis_slot(corner, "bottom", edge, visible_values=False)
+        _reserve_axis_slot(corner, "top", 0, visible_values=False)
+        _reserve_axis_slot(corner, "right", 0, visible_values=False)
+
+    for plot in (heat_plot, x_profile, y_profile, corner):
+        if plot is None:
+            continue
+        try:
+            plot.setContentsMargins(0, 0, 0, 0)
+        except Exception:
+            pass
+
+    # 標題留在熱圖畫布上方；縱剖面用同等高空白標題列佔位，ViewBox 才對齊
+    _sync_profile_title_rows(heat_plot, y_profile, x_profile, corner)
+
+
+def _sync_profile_title_rows(heat_plot, y_profile, x_profile=None, corner=None):
+    """熱圖顯示標題；左側／下方剖面保留相同標題列高度（空白）。"""
+    title_h = 22
+    try:
+        if hasattr(heat_plot, "titleLabel") and heat_plot.titleLabel is not None:
+            heat_plot.titleLabel.setMaximumHeight(16777215)
+            heat_plot.titleLabel.show()
+            br = heat_plot.titleLabel.boundingRect()
+            title_h = int(max(18.0, br.height()))
+    except Exception:
+        pass
+
+    # 縱剖面：空白標題列，高度與熱圖標題一致
+    try:
+        y_profile.setTitle(" ")  # 保留列高，不顯示文字感
+        if hasattr(y_profile, "titleLabel") and y_profile.titleLabel is not None:
+            y_profile.titleLabel.setMaximumHeight(title_h)
+            y_profile.titleLabel.setMinimumHeight(title_h)
+            y_profile.titleLabel.show()
+            # 透明／無字，避免旁邊多一行標題
+            try:
+                y_profile.titleLabel.setText("")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 橫剖面與角落：標題列高度歸零（它們在下一列，不影響同列對齊）
+    for plot in (x_profile, corner):
+        if plot is None:
+            continue
+        try:
+            if hasattr(plot, "titleLabel") and plot.titleLabel is not None:
+                plot.titleLabel.setMaximumHeight(0)
+                plot.titleLabel.hide()
+        except Exception:
+            pass
+
+    try:
+        if hasattr(heat_plot, "titleLabel") and heat_plot.titleLabel is not None:
+            heat_plot.titleLabel.setMinimumHeight(title_h)
+            heat_plot.titleLabel.setMaximumHeight(title_h)
+    except Exception:
+        pass
+
+
 def enforce_square_heatmap_cell(
     layout_widget,
     heat_plot,
@@ -927,10 +1062,12 @@ class InteractiveHeatmapPanel(QWidget):
     levelsChanged = pyqtSignal(float, float)
     mouseMoved = pyqtSignal(object)  # QPointF in view coords, or None
     profilePointChanged = pyqtSignal(int, int)  # ix, iy
+    crossVisibilityChanged = pyqtSignal(bool)  # True=顯示十字／極值, False=隱藏
     _HIST_RANGE_PAD = 0.08  # 輸入上下限後色條可視範圍相對該區間的外擴
 
     def __init__(self, title="Heatmap", parent=None, x_label="X", y_label="Y",
-                 aspect_locked=True, with_profiles=False):
+                 aspect_locked=True, with_profiles=False,
+                 show_colorbar=True, show_tip=True):
         super().__init__(parent)
         self._title = title
         self._default_levels = None  # (min, max)
@@ -939,6 +1076,8 @@ class InteractiveHeatmapPanel(QWidget):
         self._level_updating = False
         self._aspect_locked = bool(aspect_locked)
         self._with_profiles = bool(with_profiles)
+        self._show_colorbar = bool(show_colorbar)
+        self._show_tip = bool(show_tip)
         self._profile_matrix = None  # (ny, nx)
         self._profile_x = None
         self._profile_y = None
@@ -952,6 +1091,23 @@ class InteractiveHeatmapPanel(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(4)
+
+        if self._with_profiles:
+            tip_text = (
+                "滾輪縮放主圖／剖面（剖面不跟主圖連動）· 點擊更新剖面 · "
+                "雙擊主圖依比例復原 · 雙擊剖面復原"
+            )
+        else:
+            tip_text = (
+                "滾輪縮放 · 拖曳平移 · 雙擊圖面復原 · "
+                "色條拖曳藍色拉條調上下限 · 雙擊色條復原"
+            )
+        self.lbl_tip = QLabel(tip_text)
+        self.lbl_tip.setStyleSheet("color: #607D8B; font-size: 11px;")
+        self.lbl_tip.setWordWrap(True)
+        self.lbl_tip.setVisible(self._show_tip)
+        # 提示獨立一行，放在「匯出當前圖檔」上方，避免與按鈕擠在同一列
+        root.addWidget(self.lbl_tip)
 
         toolbar = QHBoxLayout()
         toolbar.setContentsMargins(0, 0, 0, 0)
@@ -971,11 +1127,13 @@ class InteractiveHeatmapPanel(QWidget):
         toolbar.addWidget(self.btn_export)
 
         # 放在匯出旁，避免擠在上下限右側造成工具列跳動
-        self.btn_toggle_cross = QPushButton("隱藏十字")
+        self.btn_toggle_cross = QPushButton("隱藏十字及X標示")
         self.btn_toggle_cross.setCheckable(True)
         self.btn_toggle_cross.setChecked(False)
         self.btn_toggle_cross.setCursor(QCursor(Qt.PointingHandCursor))
-        self.btn_toggle_cross.setToolTip("隱藏圖上十字標示；X/Y 剖面波形仍保留")
+        self.btn_toggle_cross.setToolTip(
+            "隱藏圖上十字與最大／最小 X 標記；下方文字說明與剖面波形仍保留"
+        )
         self.btn_toggle_cross.setStyleSheet(
             "QPushButton { font-size: 12px; font-weight: bold; color: #37474F; "
             "background-color: #ECEFF1; border: 1px solid #B0BEC5; border-radius: 4px; "
@@ -987,22 +1145,7 @@ class InteractiveHeatmapPanel(QWidget):
         self.btn_toggle_cross.toggled.connect(self._on_toggle_cross)
         self.btn_toggle_cross.setVisible(self._with_profiles)
         toolbar.addWidget(self.btn_toggle_cross)
-
-        if self._with_profiles:
-            tip_text = (
-                "滾輪縮放主圖／剖面（剖面不跟主圖連動）· 點擊更新剖面 · "
-                "雙擊主圖依比例復原 · 雙擊剖面復原"
-            )
-        else:
-            tip_text = (
-                "滾輪縮放 · 拖曳平移 · 雙擊圖面復原 · "
-                "色條拖曳藍色拉條調上下限 · 雙擊色條復原"
-            )
-        tip = QLabel(tip_text)
-        tip.setStyleSheet("color: #607D8B; font-size: 11px;")
-        tip.setMinimumWidth(0)
-        tip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        toolbar.addWidget(tip, 1)
+        toolbar.addStretch(1)
 
         self.lbl_level_max = QLabel("上限: --")
         self.lbl_level_min = QLabel("下限: --")
@@ -1057,40 +1200,28 @@ class InteractiveHeatmapPanel(QWidget):
             self.plot_y_profile = self.win.addPlot(row=0, col=0)
             self.plot_y_profile.setLabel("top", "Value")
             self.plot_y_profile.setLabel("left", y_label)
-            self.plot_y_profile.showAxis("bottom", show=False)
-            self.plot_y_profile.showAxis("top", show=True)
             self.plot_y_profile.showGrid(x=True, y=True, alpha=0.25)
-            self.plot_y_profile.titleLabel.hide()
             configure_stable_plot_item(self.plot_y_profile, mouse_enabled=True)
             self.plot_y_profile.getViewBox().setMouseEnabled(x=True, y=True)
 
-            self.win.addItem(self.hist, row=0, col=2)
+            if self._show_colorbar:
+                self.win.addItem(self.hist, row=0, col=2)
 
             self.plot_x_profile = self.win.addPlot(row=1, col=1)
             self.plot_x_profile.setLabel("bottom", x_label)
             self.plot_x_profile.setLabel("right", "Value")
-            self.plot_x_profile.showAxis("left", show=False)
-            self.plot_x_profile.showAxis("right", show=True)
             self.plot_x_profile.showGrid(x=True, y=True, alpha=0.25)
-            self.plot_x_profile.titleLabel.hide()
             configure_stable_plot_item(self.plot_x_profile, mouse_enabled=True)
             self.plot_x_profile.getViewBox().setMouseEnabled(x=True, y=True)
 
             corner = self.win.addPlot(row=1, col=0)
-            corner.hideAxis("left")
-            corner.hideAxis("bottom")
-            corner.hideAxis("top")
-            corner.hideAxis("right")
-            corner.titleLabel.hide()
             configure_stable_plot_item(corner, mouse_enabled=False)
             self.plot_profile_corner = corner
 
-            # 熱圖保留座標軸；剖面獨立（不 setXLink/setYLink）
-            self.plot.showAxis("bottom", show=True)
-            self.plot.showAxis("left", show=True)
             self.plot.setLabel("bottom", x_label)
             self.plot.setLabel("left", y_label)
 
+            # 剖面欄／列固定寬高；軸佔位對齊 ViewBox 邊緣
             configure_equal_profile_strips(
                 self.win,
                 profile_col=0,
@@ -1100,20 +1231,38 @@ class InteractiveHeatmapPanel(QWidget):
                 edge_axis_px=PROFILE_EDGE_AXIS_PX_COMPACT,
             )
             self.win.ci.layout.setColumnStretchFactor(1, 1)
-            self.win.ci.layout.setColumnStretchFactor(2, 0)
-            self.plot_y_profile.getAxis("left").setWidth(PROFILE_SIDE_AXIS_PX_COMPACT)
-            self.plot_y_profile.getAxis("top").setHeight(PROFILE_EDGE_AXIS_PX_COMPACT)
-            self.plot_x_profile.getAxis("right").setWidth(PROFILE_SIDE_AXIS_PX_COMPACT)
-            self.plot_x_profile.getAxis("bottom").setHeight(PROFILE_EDGE_AXIS_PX_COMPACT)
+            if self._show_colorbar:
+                self.win.ci.layout.setColumnStretchFactor(2, 0)
+            align_profile_viewboxes(
+                self.plot,
+                self.plot_x_profile,
+                self.plot_y_profile,
+                corner=self.plot_profile_corner,
+                side_axis_px=PROFILE_SIDE_AXIS_PX_COMPACT,
+                edge_axis_px=PROFILE_EDGE_AXIS_PX_COMPACT,
+            )
+            # 可見軸標籤在對齊後再設一次，避免被 reserve 清掉
+            self.plot.setLabel("bottom", x_label)
+            self.plot.setLabel("left", y_label)
+            self.plot_y_profile.setLabel("top", "Value")
+            self.plot_y_profile.setLabel("left", y_label)
+            self.plot_x_profile.setLabel("bottom", x_label)
+            self.plot_x_profile.setLabel("right", "Value")
 
             theme_plots = [self.plot, self.plot_x_profile, self.plot_y_profile]
         else:
             self.plot.setLabel("bottom", x_label)
             self.plot.setLabel("left", y_label)
-            self.win.addItem(self.hist, row=0, col=1)
+            if self._show_colorbar:
+                self.win.addItem(self.hist, row=0, col=1)
             theme_plots = [self.plot]
 
+        if not self._show_colorbar:
+            self.hist.hide()
+
         apply_readable_plot_theme(self.win, theme_plots)
+        if self._with_profiles:
+            self._realign_profile_geometry()
 
         self.hist.sigLevelsChanged.connect(self._on_hist_levels_changed)
         self.plot.scene().sigMouseClicked.connect(self._on_scene_clicked)
@@ -1168,6 +1317,58 @@ class InteractiveHeatmapPanel(QWidget):
     def set_plot_title(self, title):
         self._title = title
         self.plot.setTitle(title)
+        if self._with_profiles:
+            self._realign_profile_geometry()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._with_profiles:
+            self._realign_profile_geometry()
+
+    def _realign_profile_geometry(self):
+        if not self._with_profiles:
+            return
+        # 確保熱圖標題仍在畫布上方
+        try:
+            self.plot.setTitle(self._title or "")
+        except Exception:
+            pass
+        align_profile_viewboxes(
+            self.plot,
+            self.plot_x_profile,
+            self.plot_y_profile,
+            corner=self.plot_profile_corner,
+            side_axis_px=PROFILE_SIDE_AXIS_PX_COMPACT,
+            edge_axis_px=PROFILE_EDGE_AXIS_PX_COMPACT,
+        )
+        # 對齊後還原可見軸標籤，並再鎖一次寬高（避免 label 改變 preferred size）
+        try:
+            self.plot.setLabel("bottom", self._x_label)
+            self.plot.setLabel("left", self._y_label)
+            self.plot.getAxis("left").setWidth(PROFILE_SIDE_AXIS_PX_COMPACT)
+            self.plot.getAxis("bottom").setHeight(PROFILE_EDGE_AXIS_PX_COMPACT)
+            if self.plot_x_profile is not None:
+                self.plot_x_profile.setLabel("bottom", self._x_label)
+                self.plot_x_profile.setLabel("right", "Value")
+                self.plot_x_profile.getAxis("right").setWidth(PROFILE_SIDE_AXIS_PX_COMPACT)
+                self.plot_x_profile.getAxis("bottom").setHeight(PROFILE_EDGE_AXIS_PX_COMPACT)
+                self.plot_x_profile.getAxis("left").setWidth(PROFILE_SIDE_AXIS_PX_COMPACT)
+            if self.plot_y_profile is not None:
+                self.plot_y_profile.setLabel("left", self._y_label)
+                self.plot_y_profile.setLabel("top", "Value")
+                self.plot_y_profile.getAxis("left").setWidth(PROFILE_SIDE_AXIS_PX_COMPACT)
+                self.plot_y_profile.getAxis("top").setHeight(PROFILE_EDGE_AXIS_PX_COMPACT)
+                self.plot_y_profile.getAxis("bottom").setHeight(PROFILE_EDGE_AXIS_PX_COMPACT)
+            _reserve_axis_slot(self.plot, "top", PROFILE_EDGE_AXIS_PX_COMPACT, visible_values=False)
+            _reserve_axis_slot(self.plot, "right", PROFILE_SIDE_AXIS_PX_COMPACT, visible_values=False)
+            _sync_profile_title_rows(
+                self.plot,
+                self.plot_y_profile,
+                self.plot_x_profile,
+                self.plot_profile_corner,
+            )
+        except Exception:
+            pass
 
     def set_tick_spacing(self, x_major, x_minor, y_major, y_minor, show_grid=True, grid_alpha=0.25):
         """設定熱圖與剖面軸刻度。"""
@@ -1223,6 +1424,7 @@ class InteractiveHeatmapPanel(QWidget):
         self._apply_data_rect(self._data_rect)
         if self._with_profiles:
             self._bind_profile_data(image, source_matrix, x_coords, y_coords)
+            self._realign_profile_geometry()
         if reset_view:
             self.reset_view()
         if self._with_profiles and self._profile_matrix is not None:
@@ -1422,8 +1624,9 @@ class InteractiveHeatmapPanel(QWidget):
 
     def _on_toggle_cross(self, hidden):
         self._show_profile_cross = not bool(hidden)
-        self.btn_toggle_cross.setText("顯示十字" if hidden else "隱藏十字")
+        self.btn_toggle_cross.setText("顯示十字及X標示" if hidden else "隱藏十字及X標示")
         self._redraw_profile_cross()
+        self.crossVisibilityChanged.emit(self._show_profile_cross)
 
     def set_profile_at_view(self, x, y, reset_view=False):
         """依視圖座標（mm）對應最近網格點並更新剖面。"""
@@ -1521,10 +1724,19 @@ class InteractiveHeatmapPanel(QWidget):
                 pos=y_pos, angle=0, pen=pg.mkPen("#FF1744", width=1, style=Qt.DashLine)
             )
         )
-        self.plot_x_profile.titleLabel.hide()
-        self.plot_y_profile.titleLabel.hide()
         self.plot_x_profile.setToolTip(f"Horizontal profile at Y = {y_pos:.6g}")
         self.plot_y_profile.setToolTip(f"Vertical profile at X = {x_pos:.6g}")
+        # 橫剖面可藏標題；縱剖面需保留與熱圖同高的標題列佔位
+        try:
+            self.plot_x_profile.titleLabel.hide()
+        except Exception:
+            pass
+        _sync_profile_title_rows(
+            self.plot,
+            self.plot_y_profile,
+            self.plot_x_profile,
+            self.plot_profile_corner,
+        )
 
         finite = np.concatenate(
             [x_profile[np.isfinite(x_profile)], y_profile[np.isfinite(y_profile)]]
