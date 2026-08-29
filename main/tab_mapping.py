@@ -12,7 +12,12 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QIntValidator
 from PyQt5.QtCore import Qt, QRectF
 
-from shared_components import InteractiveHeatmapPanel
+from shared_components import (
+    InteractiveHeatmapPanel,
+    export_stamped_filename,
+    export_stamped_path,
+    export_timestamp_tag,
+)
 
 
 class MappingRoiWindow(QMainWindow):
@@ -216,7 +221,7 @@ class MappingRoiWindow(QMainWindow):
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "匯出 Mapping 範圍",
-            "mapping_roi.png",
+            export_stamped_filename("mapping_roi"),
             "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)",
         )
         if not save_path:
@@ -792,7 +797,7 @@ class MappingGradientWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             f"匯出 {slot['title']}",
-            f"{safe}.png",
+            export_stamped_filename(safe),
             "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)",
         )
         if not path:
@@ -815,11 +820,12 @@ class MappingGradientWindow(QMainWindow):
         if not folder:
             return
         avg = self._current_avg_size()
+        stamp = export_timestamp_tag()
         names = {
-            "gx": f"01_X_gradient_avg{avg}.png",
-            "gy": f"02_Y_gradient_avg{avg}.png",
-            "g_avg": f"03_mean_gradient_avg{avg}.png",
-            "g_ang": f"04_gradient_angle_avg{avg}.png",
+            "gx": f"01_X_gradient_avg{avg}_{stamp}.png",
+            "gy": f"02_Y_gradient_avg{avg}_{stamp}.png",
+            "g_avg": f"03_mean_gradient_avg{avg}_{stamp}.png",
+            "g_ang": f"04_gradient_angle_avg{avg}_{stamp}.png",
         }
         restore = self._prepare_clean_export_overlays()
         # 等 layout 收掉 colorbar 再匯出，避免空白邊
@@ -1709,7 +1715,7 @@ class MappingTab(QWidget):
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "匯出 Heatmap 檔名",
-            os.path.join(self.export_dir, "mapping_heatmap.png"),
+            export_stamped_path(self.export_dir, "mapping_heatmap"),
             "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)"
         )
         if not save_path:

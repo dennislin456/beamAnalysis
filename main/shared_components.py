@@ -1,3 +1,6 @@
+import os
+from datetime import datetime
+
 import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.exporters as pg_export
@@ -20,6 +23,20 @@ PLOT_AXIS_COLOR = "#263238"
 PLOT_WIDGET_STYLE = (
     f"border: 1px solid #90A4AE; background-color: {PLOT_WIDGET_BG};"
 )
+
+
+def export_timestamp_tag():
+    """匯出檔名用時間戳（本地時間）。"""
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def export_stamped_filename(base_name, ext=".png"):
+    """在檔名（不含副檔名）後加上時間戳，避免覆蓋舊檔。"""
+    return f"{base_name}_{export_timestamp_tag()}{ext}"
+
+
+def export_stamped_path(folder, base_name, ext=".png"):
+    return os.path.join(folder, export_stamped_filename(base_name, ext))
 # 剖面訊號區目標邊長（縱剖面寬 ≈ 橫剖面高）
 PROFILE_VIEW_PX = 130
 PROFILE_VIEW_PX_COMPACT = 88  # Mapping 等含剖面的面板，略縮以減少擁擠
@@ -1828,7 +1845,7 @@ class InteractiveHeatmapPanel(QWidget):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "匯出當前圖檔",
-            f"{safe_title}.png",
+            export_stamped_filename(safe_title),
             "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)",
         )
         if not path:

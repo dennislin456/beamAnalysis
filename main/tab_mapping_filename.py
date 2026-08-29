@@ -13,6 +13,7 @@ from PyQt5.QtGui import QBrush, QColor, QPen
 from PyQt5.QtCore import Qt, QRectF
 
 from tab_mapping import MappingTab, MappingRoiWindow
+from shared_components import export_stamped_path
 
 try:
     import orjson as _fast_json
@@ -426,7 +427,7 @@ class MappingFilenameTab(MappingTab):
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "匯出 Heatmap 檔名",
-            os.path.join(self.export_dir, "mapping_heatmap.png"),
+            export_stamped_path(self.export_dir, "mapping_heatmap"),
             "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)",
         )
         if not save_path:
