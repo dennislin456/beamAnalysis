@@ -242,10 +242,11 @@ class MappingRoiWindow(QMainWindow):
 
             csv_path = f"{base}.csv"
             with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
-                fh.write("x,y,value\n")
-                for iy, y in enumerate(self.y_coords):
-                    for ix, x in enumerate(self.x_coords):
-                        fh.write(f"{x:.6f},{y:.6f},{self.matrix[iy, ix]:.6f}\n")
+                fh.write("x_rel_mm,y_rel_mm,value\n")
+                for x, y, value in iter_finite_mapping_points(
+                    self.x_coords, self.y_coords, self.matrix
+                ):
+                    fh.write(f"{x:.6f},{y:.6f},{value:.6f}\n")
             np.save(f"{base}.npy", self.matrix)
             QMessageBox.information(
                 self,
@@ -254,6 +255,54 @@ class MappingRoiWindow(QMainWindow):
             )
         except Exception as exc:
             QMessageBox.critical(self, "匯出失敗", f"無法匯出範圍資料：\n{exc}")
+
+
+def iter_finite_mapping_points(x_coords, y_coords, matrix):
+    """只迭代有效（非 NaN）格點，避免匯出稀疏網格的空格。"""
+    if x_coords is None or y_coords is None or matrix is None:
+        return
+    mat = np.asarray(matrix, dtype=float)
+    for iy, y in enumerate(y_coords):
+        for ix, x in enumerate(x_coords):
+            value = mat[iy, ix]
+            if np.isfinite(value):
+                yield float(x), float(y), float(value)
+
+
+def _coord_lookup_tol(x_coords, y_coords):
+    xs = np.asarray(x_coords, dtype=float)
+    ys = np.asarray(y_coords, dtype=float)
+    tol_x = _grid_step_from_coords(xs) * 0.25 if xs.size else 1e-6
+    tol_y = _grid_step_from_coords(ys) * 0.25 if ys.size else 1e-6
+    return max(tol_x, tol_y, 1e-9)
+
+
+def lookup_mapping_value(matrix, x_coords, y_coords, x, y):
+    """依匯入時的 x/y 在矩陣上取值（容許微小浮點誤差）。"""
+    if matrix is None or x_coords is None or y_coords is None:
+        return float("nan")
+    xs = np.asarray(x_coords, dtype=float)
+    ys = np.asarray(y_coords, dtype=float)
+    tol = _coord_lookup_tol(xs, ys)
+    ix = int(np.argmin(np.abs(xs - float(x))))
+    iy = int(np.argmin(np.abs(ys - float(y))))
+    if abs(xs[ix] - float(x)) > tol or abs(ys[iy] - float(y)) > tol:
+        return float("nan")
+    return float(np.asarray(matrix, dtype=float)[iy, ix])
+
+
+def iter_source_mapping_export_points(source_points, x_coords, y_coords, matrix):
+    """依匯入順序與原始座標匯出，避免依排序網格從最小 Y 開始。"""
+    if source_points is None or x_coords is None or y_coords is None or matrix is None:
+        return
+    points = np.asarray(source_points, dtype=float)
+    if points.ndim != 2 or points.shape[1] < 2 or points.size == 0:
+        return
+    for row in points:
+        x, y = float(row[0]), float(row[1])
+        value = lookup_mapping_value(matrix, x_coords, y_coords, x, y)
+        if np.isfinite(value):
+            yield x, y, value
 
 
 def _grid_step_from_coords(coords, fallback=1.0):
@@ -921,6 +970,7 @@ class MappingTab(QWidget):
         self.gradient_window = None
         self.selected_point_item = None
         self.selected_point = None
+        self._source_points = None  # 匯入時原始 (x,y) 順序，匯出時沿用
         self._setup_ui()
 
     def _setup_ui(self):
@@ -1204,7 +1254,7 @@ class MappingTab(QWidget):
             matrix = np.asarray(np.load(file_path), dtype=float)
             if matrix.ndim != 2:
                 raise ValueError("NPY 必須是二維數值矩陣。")
-            return matrix, np.arange(matrix.shape[1], dtype=float), np.arange(matrix.shape[0], dtype=float)
+            return matrix, np.arange(matrix.shape[1], dtype=float), np.arange(matrix.shape[0], dtype=float), None
 
         df = pd.read_csv(file_path)
         normalized_columns = {
@@ -1225,6 +1275,7 @@ class MappingTab(QWidget):
         x_vals = np.asarray(df["x_rel_mm"], dtype=float)
         y_vals = np.asarray(df["y_rel_mm"], dtype=float)
         z_vals = np.asarray(df["value"], dtype=float)
+        source_points = np.column_stack([x_vals, y_vals])
         x_unique = np.sort(np.unique(x_vals))
         y_unique = np.sort(np.unique(y_vals))
         if x_unique.size < 2 or y_unique.size < 2:
@@ -1234,7 +1285,7 @@ class MappingTab(QWidget):
             np.searchsorted(y_unique, y_vals),
             np.searchsorted(x_unique, x_vals),
         ] = z_vals
-        return matrix, x_unique, y_unique
+        return matrix, x_unique, y_unique, source_points
 
     def _update_mapping_import_state(self):
         subtract = self.combo_mapping_mode.currentData() == "subtract"
@@ -1254,10 +1305,11 @@ class MappingTab(QWidget):
             return
 
         try:
-            matrix, x_coords, y_coords = self._read_mapping_file(file_path)
+            matrix, x_coords, y_coords, source_points = self._read_mapping_file(file_path)
             self.mapping_matrix_f1 = matrix
             self.x_coords = x_coords
             self.y_coords = y_coords
+            self._source_points = source_points
             self.mapping_f1_path = file_path
             if self.combo_mapping_mode.currentData() == "subtract":
                 self.lbl_mapping_path.setText(f"F1（Chuck）: {os.path.basename(file_path)}")
@@ -1279,6 +1331,7 @@ class MappingTab(QWidget):
             self.mapping_matrix_f2 = None
             self.x_coords = None
             self.y_coords = None
+            self._source_points = None
             self.btn_plot_mapping.setEnabled(False)
             self.btn_export_mapping.setEnabled(False)
             self.chk_roi_enabled.setEnabled(False)
@@ -1295,7 +1348,7 @@ class MappingTab(QWidget):
         if not file_path:
             return
         try:
-            matrix, x_coords, y_coords = self._read_mapping_file(file_path)
+            matrix, x_coords, y_coords, _source_points = self._read_mapping_file(file_path)
             if self.mapping_matrix_f1 is not None:
                 if not np.array_equal(self.x_coords, x_coords) or not np.array_equal(self.y_coords, y_coords):
                     raise ValueError("F1（Chuck）與 F2（Wafer）的 X/Y 座標網格不一致。")
@@ -1357,6 +1410,14 @@ class MappingTab(QWidget):
         self.btn_export_mapping.setEnabled(bool(self.export_dir))
         self.btn_view_gradient.setEnabled(True)
         self._update_roi_overlay()
+
+    def _iter_export_mapping_points(self, matrix):
+        """優先依匯入順序／原始座標匯出；無來源點時退回有效格點。"""
+        if self._source_points is not None and len(self._source_points):
+            return iter_source_mapping_export_points(
+                self._source_points, self.x_coords, self.y_coords, matrix
+            )
+        return iter_finite_mapping_points(self.x_coords, self.y_coords, matrix)
 
     def _update_point_count_label(self):
         """狀態下方顯示有效點數（非 NaN）。"""
@@ -1745,12 +1806,9 @@ class MappingTab(QWidget):
 
             csv_path = os.path.join(self.export_dir, f"{base_name}.csv")
             with open(csv_path, 'w', encoding='utf-8') as f:
-                f.write('x,y,value\n')
-                if self.x_coords is not None and self.y_coords is not None:
-                    for iy, y in enumerate(self.y_coords):
-                        for ix, x in enumerate(self.x_coords):
-                            value = avg_matrix[iy, ix]
-                            f.write(f"{x:.6f},{y:.6f},{value:.6f}\n")
+                f.write('x_rel_mm,y_rel_mm,value\n')
+                for x, y, value in self._iter_export_mapping_points(avg_matrix):
+                    f.write(f"{x:.6f},{y:.6f},{value:.6f}\n")
 
             self.lbl_status.setText("狀態: 已匯出 heatmap、contour 兩張圖與平均後 CSV")
             QMessageBox.information(
