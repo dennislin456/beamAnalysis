@@ -124,10 +124,11 @@ class MappingFilenameTab(MappingTab):
         return paths
 
     def _ingest_paths_parallel(self, paths):
-        """平行讀取 JSON，回傳 (groups, units, skipped)。"""
+        """平行讀取 JSON，回傳 (groups, units, skipped, source_points)。"""
         groups = {}
         units = set()
         skipped = []
+        path_coords = {}
         total = len(paths)
         done = 0
         workers = min(_IMPORT_WORKERS, max(1, total))
@@ -143,10 +144,21 @@ class MappingFilenameTab(MappingTab):
                 if err is not None:
                     skipped.append(f"{os.path.basename(path)}: {err}")
                     continue
+                path_coords[path] = (x_mm, y_mm)
                 groups.setdefault((x_mm, y_mm), []).append(distance)
                 if unit:
                     units.add(unit)
-        return groups, units, skipped
+
+        source_points = []
+        seen = set()
+        for path in paths:
+            key = path_coords.get(path)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            source_points.append([key[0], key[1]])
+        source_arr = np.asarray(source_points, dtype=float) if source_points else None
+        return groups, units, skipped, source_arr
 
     def _std_for_point(self, ix, iy):
         """取得目前 X/Y 點所有原始 dist_ifc 的母體標準差。"""
@@ -300,7 +312,7 @@ class MappingFilenameTab(MappingTab):
         self.lbl_status.setText(f"狀態: 開始平行匯入 {len(paths)} 筆 JSON …")
         QApplication.processEvents()
         try:
-            groups, units, skipped = self._ingest_paths_parallel(paths)
+            groups, units, skipped, source_points = self._ingest_paths_parallel(paths)
 
             if not groups:
                 detail = "\n".join(skipped[:8])
@@ -321,6 +333,7 @@ class MappingFilenameTab(MappingTab):
             self.mapping_matrix = None
             self.x_coords = x_coords
             self.y_coords = y_coords
+            self._source_points = source_points
             self.mapping_f1_path = paths[0]
             self.mapping_path = paths[0]
             self.lbl_mapping_path.setText(
@@ -350,6 +363,7 @@ class MappingFilenameTab(MappingTab):
             self.mapping_matrix_f1 = None
             self.x_coords = None
             self.y_coords = None
+            self._source_points = None
             self.btn_plot_mapping.setEnabled(False)
             self.btn_export_mapping.setEnabled(False)
             self._update_point_count_label()
@@ -455,17 +469,15 @@ class MappingFilenameTab(MappingTab):
 
             csv_path = os.path.join(self.export_dir, f"{base_name}.csv")
             with open(csv_path, "w", encoding="utf-8") as fh:
-                fh.write("x,y,value,min,max,std,count\n")
-                if self.x_coords is not None and self.y_coords is not None:
-                    for iy, y in enumerate(self.y_coords):
-                        for ix, x in enumerate(self.x_coords):
-                            mean_text, min_text, max_text, std_text, count = self._point_stats(
-                                x, y, avg_matrix[iy, ix]
-                            )
-                            fh.write(
-                                f"{x:.6f},{y:.6f},{mean_text},{min_text},"
-                                f"{max_text},{std_text},{count}\n"
-                            )
+                fh.write("x_rel_mm,y_rel_mm,value,min,max,std,count\n")
+                for x, y, value in self._iter_export_mapping_points(avg_matrix):
+                    mean_text, min_text, max_text, std_text, count = self._point_stats(
+                        x, y, value
+                    )
+                    fh.write(
+                        f"{x:.6f},{y:.6f},{mean_text},{min_text},"
+                        f"{max_text},{std_text},{count}\n"
+                    )
 
             self.lbl_status.setText(
                 "狀態: 已匯出 heatmap、contour 與含 min/max/std 的 CSV"
