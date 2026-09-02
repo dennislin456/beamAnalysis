@@ -9,7 +9,9 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox, QCheckBox, QMainWindow, QGridLayout, QComboBox,
 )
 from PyQt5.QtGui import QIntValidator
-from PyQt5.QtCore import Qt, QRectF
+from PyQt5.QtCore import Qt, QRectF, pyqtSignal
+
+from scipy.interpolate import RegularGridInterpolator
 
 from shared_components import (
     InteractiveHeatmapPanel,
@@ -22,6 +24,9 @@ from shared_components import (
     normalize_export_image_path,
     finite_value_minmax,
     sanitize_numeric_values,
+    apply_readable_plot_theme,
+    configure_stable_plot_item,
+    save_qpixmap_export,
 )
 
 
@@ -395,6 +400,679 @@ def axis_tick_spacing(coords, target_major_labels=8):
         if major < minor:
             major = _nice_number(minor * 5.0)
     return float(major), float(minor)
+
+
+def _mapping_interpolator(matrix, x_coords, y_coords):
+    """建立 (y, x) 雙線性插值器（座標軸需遞增）。"""
+    ys = np.asarray(y_coords, dtype=float)
+    xs = np.asarray(x_coords, dtype=float)
+    mat = np.asarray(matrix, dtype=float)
+    if ys.size < 2 or xs.size < 2:
+        return None
+    if xs[0] > xs[-1]:
+        xs = xs[::-1]
+        mat = mat[:, ::-1]
+    if ys[0] > ys[-1]:
+        ys = ys[::-1]
+        mat = mat[::-1, :]
+    return RegularGridInterpolator(
+        (ys, xs),
+        mat,
+        method="linear",
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+
+
+def sample_line_profile(matrix, x_coords, y_coords, x0, y0, x1, y1, n_samples=None):
+    """沿兩點連線（可斜向）取樣，回傳 (dist_mm, x_mm, y_mm, values)。"""
+    x0, y0, x1, y1 = map(float, (x0, y0, x1, y1))
+    line_len = float(np.hypot(x1 - x0, y1 - y0))
+    if line_len <= 0 or not np.isfinite(line_len):
+        return (
+            np.array([], dtype=float),
+            np.array([], dtype=float),
+            np.array([], dtype=float),
+            np.array([], dtype=float),
+        )
+
+    step_x = _grid_step_from_coords(x_coords)
+    step_y = _grid_step_from_coords(y_coords)
+    step = max(min(step_x, step_y) * 0.5, line_len / 500.0, 1e-6)
+    if n_samples is None:
+        n_samples = max(2, int(np.ceil(line_len / step)) + 1)
+
+    t = np.linspace(0.0, 1.0, int(n_samples))
+    xs = x0 + t * (x1 - x0)
+    ys = y0 + t * (y1 - y0)
+    dists = t * line_len
+
+    interp = _mapping_interpolator(matrix, x_coords, y_coords)
+    if interp is not None:
+        pts = np.column_stack([ys, xs])
+        values = np.asarray(interp(pts), dtype=float)
+    else:
+        values = np.array(
+            [
+                lookup_mapping_value(matrix, x_coords, y_coords, x, y)
+                for x, y in zip(xs, ys)
+            ],
+            dtype=float,
+        )
+    return dists, xs, ys, values
+
+
+def apply_value_clamp(values, mode, threshold, replace_value):
+    """依條件將數值替換為指定值。mode: gt / lt / eq。"""
+    out = np.asarray(values, dtype=float).copy()
+    finite = np.isfinite(out)
+    if not np.any(finite):
+        return out
+    th = float(threshold)
+    rep = float(replace_value)
+    if mode == "gt":
+        mask = finite & (out > th)
+    elif mode == "lt":
+        mask = finite & (out < th)
+    elif mode == "eq":
+        mask = finite & np.isclose(out, th, rtol=0.0, atol=max(abs(th) * 1e-9, 1e-12))
+    else:
+        mask = np.zeros(out.shape, dtype=bool)
+    out[mask] = rep
+    return out
+
+
+def _line_profile_axis(x0, y0, x1, y1):
+    """剖面橫軸與熱圖對齊：沿線段變化較大的座標軸。"""
+    if abs(float(x1) - float(x0)) >= abs(float(y1) - float(y0)):
+        return "x"
+    return "y"
+
+
+class LineProfilePlotPanel(QWidget):
+    """沿線段剖面：雙擊復原、點選固定、滑鼠顯示數值。"""
+
+    pointSelected = pyqtSignal(int)
+    viewReset = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dists = None
+        self._xs = None
+        self._ys = None
+        self._plot_x = None
+        self._profile_axis = "x"
+        self._raw = None
+        self._clamped = None
+        self._show_raw = True
+        self._clamp_enabled = False
+        self._selected_idx = None
+        self._fixed = False
+        self._default_x = None
+        self._default_y = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(4)
+        tip = QLabel("滾輪縮放 · 拖曳平移 · 雙擊復原 · 點擊顯示數值（無圖上標記）")
+        tip.setStyleSheet("color: #607D8B; font-size: 11px;")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+
+        self.plot = pg.PlotWidget(title="沿線段剖面")
+        self.plot.setLabel("bottom", "X (mm)")
+        self.plot.setLabel("left", "Value")
+        self.plot.showGrid(x=True, y=True, alpha=0.25)
+        configure_stable_plot_item(self.plot.getPlotItem(), mouse_enabled=True)
+        apply_readable_plot_theme(self.plot, [self.plot.getPlotItem()])
+        root.addWidget(self.plot, 1)
+
+        self.lbl_info = QLabel("滑鼠位置: --")
+        self.lbl_info.setStyleSheet("color: #37474F; font-size: 11px;")
+        self.lbl_info.setWordWrap(True)
+        root.addWidget(self.lbl_info)
+
+        self.plot.scene().sigMouseClicked.connect(self._on_clicked)
+        self._mouse_proxy = pg.SignalProxy(
+            self.plot.scene().sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved
+        )
+
+    def set_data(
+        self, dists, xs, ys, raw, clamped,
+        show_raw=True, clamp_enabled=False, profile_axis="x",
+    ):
+        self._dists = np.asarray(dists, dtype=float)
+        self._xs = np.asarray(xs, dtype=float)
+        self._ys = np.asarray(ys, dtype=float)
+        self._profile_axis = "y" if profile_axis == "y" else "x"
+        self._plot_x = self._ys if self._profile_axis == "y" else self._xs
+        axis_label = "Y (mm)" if self._profile_axis == "y" else "X (mm)"
+        self.plot.setLabel("bottom", axis_label)
+        self.plot.setTitle(
+            f"沿線段剖面（{axis_label.replace(' (mm)', '')}）"
+        )
+        self._raw = np.asarray(raw, dtype=float)
+        self._clamped = np.asarray(clamped, dtype=float)
+        self._show_raw = bool(show_raw)
+        self._clamp_enabled = bool(clamp_enabled)
+        self._fixed = False
+        self._selected_idx = None
+        self._redraw_curves()
+        self.reset_view()
+        self.lbl_info.setText("滑鼠位置: --")
+
+    def _redraw_curves(self):
+        self.plot.clear()
+        if self._dists is None or self._dists.size == 0:
+            return
+        if self._show_raw:
+            mask = np.isfinite(self._raw)
+            if np.any(mask):
+                self.plot.plot(
+                    self._plot_x[mask], self._raw[mask],
+                    pen=pg.mkPen("#90A4AE", width=1.5, style=Qt.DashLine),
+                )
+        mask_c = np.isfinite(self._clamped)
+        if np.any(mask_c):
+            self.plot.plot(
+                self._plot_x[mask_c], self._clamped[mask_c],
+                pen=pg.mkPen("#0288D1", width=2.0),
+            )
+        vals = []
+        if self._show_raw:
+            vals.append(self._raw[np.isfinite(self._raw)])
+        vals.append(self._clamped[np.isfinite(self._clamped)])
+        if vals:
+            merged = np.concatenate(vals)
+            lo, hi = float(np.min(merged)), float(np.max(merged))
+            if lo == hi:
+                lo -= 1.0
+                hi += 1.0
+            pad = 0.08 * (hi - lo)
+            self._default_y = (lo - pad, hi + pad)
+        else:
+            self._default_y = (0.0, 1.0)
+        self._default_x = (float(self._plot_x[0]), float(self._plot_x[-1]))
+
+    def reset_view(self):
+        if self._default_x and self._default_y:
+            self.plot.setXRange(*self._default_x, padding=0.02)
+            self.plot.setYRange(*self._default_y, padding=0)
+
+    def clear_fixed(self):
+        self._fixed = False
+
+    def set_selected_index(self, idx, fixed=False):
+        if self._dists is None or self._dists.size == 0:
+            return
+        idx = int(np.clip(int(idx), 0, self._dists.size - 1))
+        self._selected_idx = idx
+        if fixed:
+            self._fixed = True
+        self._update_info_label(idx, prefix="已固定" if self._fixed else "滑鼠位置")
+
+    def _profile_value(self, idx):
+        if self._clamp_enabled:
+            return float(self._clamped[idx])
+        return float(self._raw[idx])
+
+    def _nearest_index(self, coord):
+        if self._plot_x is None or self._plot_x.size == 0:
+            return 0
+        return int(np.argmin(np.abs(self._plot_x - float(coord))))
+
+    def _update_info_label(self, idx, prefix="滑鼠位置"):
+        d = float(self._dists[idx])
+        x = float(self._xs[idx])
+        y = float(self._ys[idx])
+        raw_v = float(self._raw[idx])
+        prof_v = float(self._clamped[idx]) if self._clamp_enabled else raw_v
+        raw_t = "NaN" if not np.isfinite(raw_v) else f"{raw_v:.6f}"
+        prof_t = "NaN" if not np.isfinite(prof_v) else f"{prof_v:.6f}"
+        self.lbl_info.setText(
+            f"{prefix}: 距離={d:.4f} mm, X={x:.3f}, Y={y:.3f}, "
+            f"原始={raw_t}, 剖面={prof_t}"
+        )
+
+    def _on_clicked(self, evt):
+        if evt.double():
+            self._fixed = False
+            self.reset_view()
+            self.viewReset.emit()
+            return
+        if evt.button() != Qt.LeftButton:
+            return
+        pos = evt.scenePos()
+        if not self.plot.sceneBoundingRect().contains(pos):
+            return
+        point = self.plot.getPlotItem().getViewBox().mapSceneToView(pos)
+        idx = self._nearest_index(point.x())
+        self.set_selected_index(idx, fixed=True)
+        self.pointSelected.emit(idx)
+
+    def _on_mouse_moved(self, evt):
+        if self._fixed or self._dists is None:
+            return
+        pos = evt[0]
+        if not self.plot.sceneBoundingRect().contains(pos):
+            self.lbl_info.setText("滑鼠位置: --")
+            return
+        point = self.plot.getPlotItem().getViewBox().mapSceneToView(pos)
+        idx = self._nearest_index(point.x())
+        self._update_info_label(idx, prefix="滑鼠位置")
+
+
+class MappingLineProfileWindow(QMainWindow):
+    """沿使用者指定兩點連線取樣，繪製趨勢／剖面並可條件替換數值。"""
+
+    _CLAMP_MODES = (
+        ("gt", "大於"),
+        ("lt", "小於"),
+        ("eq", "等於"),
+    )
+
+    def __init__(self, matrix, x_coords, y_coords, parent=None):
+        super().__init__(parent)
+        self.matrix = np.asarray(matrix, dtype=float)
+        self.x_coords = np.asarray(x_coords, dtype=float)
+        self.y_coords = np.asarray(y_coords, dtype=float)
+        self._line_item = None
+        self._endpoint_items = []
+        self._selected_point_item = None
+        self._selected_point = None
+        self._sample_xs = None
+        self._sample_ys = None
+        self._profile_axis = "x"
+        self._pick_fixed = False
+
+        self.setWindowTitle("Mapping 線段趨勢／剖面分析")
+        self.resize(1000, 900)
+
+        host = QWidget(self)
+        root = QVBoxLayout(host)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        row_pts = QHBoxLayout()
+        row_pts.setSpacing(6)
+        row_pts.addWidget(QLabel("起點 X"))
+        self.spin_x0 = self._make_coord_spin(self.x_coords)
+        row_pts.addWidget(self.spin_x0)
+        row_pts.addWidget(QLabel("Y"))
+        self.spin_y0 = self._make_coord_spin(self.y_coords)
+        row_pts.addWidget(self.spin_y0)
+        row_pts.addWidget(QLabel("　終點 X"))
+        self.spin_x1 = self._make_coord_spin(self.x_coords)
+        self.spin_x1.setValue(float(self.x_coords[-1]))
+        row_pts.addWidget(self.spin_x1)
+        row_pts.addWidget(QLabel("Y"))
+        self.spin_y1 = self._make_coord_spin(self.y_coords)
+        self.spin_y1.setValue(float(self.y_coords[-1]))
+        row_pts.addWidget(self.spin_y1)
+        row_pts.addStretch(1)
+        root.addLayout(row_pts)
+
+        row_clamp = QHBoxLayout()
+        row_clamp.setSpacing(6)
+        self.chk_clamp = QCheckBox("啟用條件替換")
+        self.chk_clamp.setChecked(False)
+        row_clamp.addWidget(self.chk_clamp)
+        row_clamp.addWidget(QLabel("當數值"))
+        self.combo_clamp = QComboBox()
+        for _key, label in self._CLAMP_MODES:
+            self.combo_clamp.addItem(label, _key)
+        row_clamp.addWidget(self.combo_clamp)
+        row_clamp.addWidget(QLabel("門檻"))
+        self.spin_threshold = QDoubleSpinBox()
+        self.spin_threshold.setDecimals(6)
+        self.spin_threshold.setRange(-1e12, 1e12)
+        self.spin_threshold.setSingleStep(0.1)
+        row_clamp.addWidget(self.spin_threshold)
+        row_clamp.addWidget(QLabel("時設為"))
+        self.spin_replace = QDoubleSpinBox()
+        self.spin_replace.setDecimals(6)
+        self.spin_replace.setRange(-1e12, 1e12)
+        self.spin_replace.setSingleStep(0.1)
+        row_clamp.addWidget(self.spin_replace)
+        self.chk_show_raw = QCheckBox("顯示原始趨勢")
+        self.chk_show_raw.setChecked(True)
+        row_clamp.addWidget(self.chk_show_raw)
+        self.btn_update = QPushButton("更新剖面")
+        self.btn_update.setStyleSheet(
+            "QPushButton { font-weight: bold; color: white; background-color: #2E7D32; "
+            "border: none; border-radius: 4px; padding: 6px 12px; }"
+        )
+        self.btn_update.clicked.connect(self._rebuild_profile)
+        row_clamp.addWidget(self.btn_update)
+        self.btn_export = QPushButton("匯出熱圖＋剖面 PNG／CSV")
+        self.btn_export.clicked.connect(self._export_profile)
+        row_clamp.addWidget(self.btn_export)
+        row_clamp.addStretch(1)
+        root.addLayout(row_clamp)
+
+        self.plots_splitter = QSplitter(Qt.Vertical)
+        self.heatmap_panel = InteractiveHeatmapPanel(
+            title="Mapping（取樣路徑）",
+            x_label="X (mm)",
+            y_label="Y (mm)",
+            aspect_locked=True,
+            with_profiles=False,
+            show_colorbar=True,
+            show_tip=True,
+        )
+        self.profile_panel = LineProfilePlotPanel()
+        self.plots_splitter.addWidget(self.heatmap_panel)
+        self.plots_splitter.addWidget(self.profile_panel)
+        self.plots_splitter.setStretchFactor(0, 2)
+        self.plots_splitter.setStretchFactor(1, 1)
+        root.addWidget(self.plots_splitter, 1)
+
+        self.lbl_heat_info = QLabel("熱圖: 滑鼠位置 --")
+        self.lbl_heat_info.setStyleSheet("color: #37474F; font-size: 11px;")
+        self.lbl_heat_info.setWordWrap(True)
+        root.addWidget(self.lbl_heat_info)
+
+        self.lbl_info = QLabel("—")
+        self.lbl_info.setStyleSheet("color: #37474F; font-size: 11px;")
+        self.lbl_info.setWordWrap(True)
+        root.addWidget(self.lbl_info)
+
+        self.setCentralWidget(host)
+        self._init_heatmap()
+        self._rebuild_profile()
+
+        self.heatmap_panel.mouseMoved.connect(self._on_heatmap_mouse_moved)
+        self.heatmap_panel.plot.scene().sigMouseClicked.connect(self._on_heatmap_clicked)
+        self.profile_panel.pointSelected.connect(self._on_profile_point_selected)
+
+        for spin in (
+            self.spin_x0, self.spin_y0, self.spin_x1, self.spin_y1,
+            self.spin_threshold, self.spin_replace,
+        ):
+            spin.valueChanged.connect(self._rebuild_profile)
+        self.combo_clamp.currentIndexChanged.connect(self._rebuild_profile)
+        self.chk_clamp.toggled.connect(self._rebuild_profile)
+        self.chk_show_raw.toggled.connect(self._rebuild_profile)
+
+    @staticmethod
+    def _make_coord_spin(coords):
+        spin = QDoubleSpinBox()
+        spin.setDecimals(6)
+        vals = np.asarray(coords, dtype=float)
+        if vals.size:
+            spin.setRange(float(np.min(vals)), float(np.max(vals)))
+            spin.setValue(float(vals[0]))
+        else:
+            spin.setRange(-1e9, 1e9)
+        spin.setSingleStep(_grid_step_from_coords(vals) if vals.size else 1.0)
+        return spin
+
+    def _init_heatmap(self):
+        rect = self._image_rect()
+        vmin, vmax = finite_value_minmax(self.matrix)
+        title = (
+            f"Mapping（取樣路徑）｜有效值 {int(np.sum(np.isfinite(self.matrix)))} 點"
+        )
+        self.heatmap_panel.set_plot_title(title)
+        self.heatmap_panel.set_image(
+            self.matrix.T,
+            rect=rect,
+            levels=(vmin, vmax),
+            reset_view=True,
+            source_matrix=self.matrix,
+            x_coords=self.x_coords,
+            y_coords=self.y_coords,
+        )
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_tick_spacing"):
+            x_label, x_grid = parent._tick_spacing(self.x_coords)
+            y_label, y_grid = parent._tick_spacing(self.y_coords)
+            self.heatmap_panel.set_tick_spacing(
+                x_label, x_grid, y_label, y_grid, grid_alpha=0.25
+            )
+
+    def _image_rect(self):
+        if self.x_coords.size == 0 or self.y_coords.size == 0:
+            return None
+        x0, x1 = float(self.x_coords[0]), float(self.x_coords[-1])
+        y0, y1 = float(self.y_coords[0]), float(self.y_coords[-1])
+        dx = (x1 - x0) / max(1, len(self.x_coords) - 1)
+        dy = (y1 - y0) / max(1, len(self.y_coords) - 1)
+        if abs(dx) < 1e-12:
+            dx = _grid_step_from_coords(self.x_coords)
+        if abs(dy) < 1e-12:
+            dy = _grid_step_from_coords(self.y_coords)
+        return QRectF(
+            x0 - dx / 2,
+            y0 - dy / 2,
+            dx * self.matrix.shape[1],
+            dy * self.matrix.shape[0],
+        )
+
+    def _rebuild_profile(self):
+        x0, y0 = self.spin_x0.value(), self.spin_y0.value()
+        x1, y1 = self.spin_x1.value(), self.spin_y1.value()
+        dists, xs, ys, raw = sample_line_profile(
+            self.matrix, self.x_coords, self.y_coords, x0, y0, x1, y1
+        )
+        if dists.size == 0:
+            self.lbl_info.setText("起點與終點相同或無法取樣。")
+            return
+
+        if self.chk_clamp.isChecked():
+            mode = self.combo_clamp.currentData()
+            clamped = apply_value_clamp(
+                raw, mode, self.spin_threshold.value(), self.spin_replace.value()
+            )
+        else:
+            clamped = raw.copy()
+
+        self._sample_xs = xs
+        self._sample_ys = ys
+        self._profile_axis = _line_profile_axis(x0, y0, x1, y1)
+        self._pick_fixed = False
+        self.profile_panel.clear_fixed()
+
+        self._draw_line_overlay(x0, y0, x1, y1, xs, ys)
+        self.profile_panel.set_data(
+            dists, xs, ys, raw, clamped,
+            show_raw=self.chk_show_raw.isChecked(),
+            clamp_enabled=self.chk_clamp.isChecked(),
+            profile_axis=self._profile_axis,
+        )
+
+        axis_name = "X" if self._profile_axis == "x" else "Y"
+        line_len = float(dists[-1]) if dists.size else 0.0
+        n_finite = int(np.sum(np.isfinite(clamped)))
+        n_replaced = int(np.sum(np.isfinite(raw) & (raw != clamped)))
+        mode_label = self.combo_clamp.currentText()
+        self.lbl_info.setText(
+            f"剖面橫軸={axis_name}（與熱圖對齊）｜線段長 {line_len:.4f} mm｜取樣 {dists.size} 點｜"
+            f"有效 {n_finite} 點｜"
+            + (
+                f"條件替換 {n_replaced} 點（{mode_label} {self.spin_threshold.value():g} → "
+                f"{self.spin_replace.value():g}）"
+                if self.chk_clamp.isChecked()
+                else "未啟用條件替換"
+            )
+        )
+
+    def _draw_line_overlay(self, x0, y0, x1, y1, xs, ys):
+        plot = self.heatmap_panel.plot
+        if self._line_item is not None:
+            plot.removeItem(self._line_item)
+        for item in self._endpoint_items:
+            try:
+                plot.removeItem(item)
+            except Exception:
+                pass
+        self._endpoint_items.clear()
+        if self._selected_point_item is not None:
+            try:
+                plot.removeItem(self._selected_point_item)
+            except Exception:
+                pass
+            self._selected_point_item = None
+
+        self._line_item = pg.PlotCurveItem(
+            xs, ys, pen=pg.mkPen("#FF1744", width=2.5)
+        )
+        plot.addItem(self._line_item, ignoreBounds=True)
+        for x, y, brush in (
+            (x0, y0, "#00C853"),
+            (x1, y1, "#2962FF"),
+        ):
+            item = pg.ScatterPlotItem(
+                x=[x], y=[y], size=12, symbol="o",
+                pen=pg.mkPen("w", width=1), brush=brush,
+            )
+            plot.addItem(item, ignoreBounds=True)
+            self._endpoint_items.append(item)
+
+    def _grid_index_at(self, x, y):
+        ix = int(np.abs(self.x_coords - float(x)).argmin())
+        iy = int(np.abs(self.y_coords - float(y)).argmin())
+        return ix, iy
+
+    def _draw_red_box(self, ix, iy):
+        plot = self.heatmap_panel.plot
+        if self._selected_point_item is not None:
+            plot.removeItem(self._selected_point_item)
+        x0, x1 = MappingRoiWindow._cell_bounds(self.x_coords, ix)
+        y0, y1 = MappingRoiWindow._cell_bounds(self.y_coords, iy)
+        self._selected_point_item = pg.PlotDataItem(
+            [x0, x1, x1, x0, x0],
+            [y0, y0, y1, y1, y0],
+            pen=pg.mkPen("#FF0000", width=3),
+        )
+        plot.addItem(self._selected_point_item, ignoreBounds=True)
+        self._selected_point = (ix, iy)
+
+    def _line_sample_index_for_grid(self, ix, iy):
+        if self._sample_xs is None or self._sample_ys is None:
+            return 0
+        if self._profile_axis == "x":
+            target = float(self.x_coords[ix])
+            return int(np.argmin(np.abs(self._sample_xs - target)))
+        target = float(self.y_coords[iy])
+        return int(np.argmin(np.abs(self._sample_ys - target)))
+
+    def _on_heatmap_mouse_moved(self, point):
+        if point is None:
+            self.lbl_heat_info.setText("熱圖: 滑鼠位置 --")
+            return
+        x, y = float(point.x()), float(point.y())
+        ix, iy = self._grid_index_at(x, y)
+        value = float(self.matrix[iy, ix])
+        value_text = "NaN" if not np.isfinite(value) else f"{value:.6f}"
+        if self._pick_fixed and self._selected_point is not None:
+            fix_ix, fix_iy = self._selected_point
+            x0, x1 = MappingRoiWindow._cell_bounds(self.x_coords, fix_ix)
+            y0, y1 = MappingRoiWindow._cell_bounds(self.y_coords, fix_iy)
+            fix_val = float(self.matrix[fix_iy, fix_ix])
+            fix_text = "NaN" if not np.isfinite(fix_val) else f"{fix_val:.6f}"
+            self.lbl_heat_info.setText(
+                f"已固定: X={x0:.3f}~{x1:.3f} mm, "
+                f"Y={y0:.3f}~{y1:.3f} mm, Value={fix_text}"
+            )
+            return
+        self.lbl_heat_info.setText(
+            f"熱圖: X={self.x_coords[ix]:.3f} mm, "
+            f"Y={self.y_coords[iy]:.3f} mm, Value={value_text}"
+        )
+        if self._sample_xs is not None:
+            idx = self._line_sample_index_for_grid(ix, iy)
+            self.profile_panel.set_selected_index(idx, fixed=False)
+
+    def _on_heatmap_clicked(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        pos = event.scenePos()
+        if not self.heatmap_panel.plot.sceneBoundingRect().contains(pos):
+            return
+        point = self.heatmap_panel.plot.getViewBox().mapSceneToView(pos)
+        ix, iy = self._grid_index_at(point.x(), point.y())
+        self._pick_fixed = True
+        self._draw_red_box(ix, iy)
+        x0, x1 = MappingRoiWindow._cell_bounds(self.x_coords, ix)
+        y0, y1 = MappingRoiWindow._cell_bounds(self.y_coords, iy)
+        value = float(self.matrix[iy, ix])
+        value_text = "NaN" if not np.isfinite(value) else f"{value:.6f}"
+        self.lbl_heat_info.setText(
+            f"已固定: X={x0:.3f}~{x1:.3f} mm, "
+            f"Y={y0:.3f}~{y1:.3f} mm, Value={value_text}"
+        )
+        if self._sample_xs is not None:
+            idx = self._line_sample_index_for_grid(ix, iy)
+            self.profile_panel.set_selected_index(idx, fixed=True)
+
+    def _on_profile_point_selected(self, idx):
+        if self._sample_xs is None:
+            return
+        x = float(self._sample_xs[idx])
+        y = float(self._sample_ys[idx])
+        ix, iy = self._grid_index_at(x, y)
+        self._pick_fixed = True
+        self._draw_red_box(ix, iy)
+
+    def _export_profile(self):
+        x0, y0 = self.spin_x0.value(), self.spin_y0.value()
+        x1, y1 = self.spin_x1.value(), self.spin_y1.value()
+        dists, xs, ys, raw = sample_line_profile(
+            self.matrix, self.x_coords, self.y_coords, x0, y0, x1, y1
+        )
+        if dists.size == 0:
+            QMessageBox.warning(self, "提醒", "無法取樣，請確認起點與終點。")
+            return
+        if self.chk_clamp.isChecked():
+            clamped = apply_value_clamp(
+                raw,
+                self.combo_clamp.currentData(),
+                self.spin_threshold.value(),
+                self.spin_replace.value(),
+            )
+        else:
+            clamped = raw.copy()
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "匯出線段分析",
+            export_stamped_filename("mapping_line_profile"),
+            "PNG 圖片 (*.png);;CSV (*.csv);;所有檔案 (*)",
+        )
+        if not path:
+            return
+        base, ext = os.path.splitext(path)
+        try:
+            csv_path = f"{base}.csv"
+            with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
+                fh.write("dist_mm,x_mm,y_mm,value_raw,value_profile\n")
+                for d, x, y, v0, v1 in zip(dists, xs, ys, raw, clamped):
+                    r0 = "" if not np.isfinite(v0) else f"{v0:.6f}"
+                    r1 = "" if not np.isfinite(v1) else f"{v1:.6f}"
+                    fh.write(f"{d:.6f},{x:.6f},{y:.6f},{r0},{r1}\n")
+
+            png_path = path if ext.lower() == ".png" else f"{base}{EXPORT_IMAGE_EXT}"
+            selected_item = self._selected_point_item
+            if selected_item is not None:
+                selected_item.hide()
+            QApplication.processEvents()
+            try:
+                pix = self.plots_splitter.grab()
+                if pix.isNull():
+                    raise RuntimeError("無法擷取熱圖與剖面合成畫面。")
+                save_qpixmap_export(pix, png_path)
+            finally:
+                if selected_item is not None:
+                    selected_item.show()
+
+            QMessageBox.information(
+                self,
+                "匯出完成",
+                f"合成圖：\n{normalize_export_image_path(png_path)}\n\nCSV：\n{csv_path}",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "匯出失敗", f"{exc}")
 
 
 def compute_mapping_gradient_maps(matrix, x_coords, y_coords):
@@ -1005,6 +1683,7 @@ class MappingTab(QWidget):
         self.roi_rect_item = None
         self.roi_window = None
         self.gradient_window = None
+        self.line_profile_window = None
         self.selected_point_item = None
         self.selected_point = None
         self._source_points = None  # 匯入時原始 (x,y) 順序，匯出時沿用
@@ -1130,7 +1809,18 @@ class MappingTab(QWidget):
         )
         self.btn_view_gradient.clicked.connect(self.show_gradient_window)
         self.btn_view_gradient.setEnabled(False)
+        if hasattr(self, "btn_view_line_profile"):
+            self.btn_view_line_profile.setEnabled(False)
         left_layout.addWidget(self.btn_view_gradient)
+
+        self.btn_view_line_profile = QPushButton("線段趨勢／剖面分析")
+        self.btn_view_line_profile.setStyleSheet(btn_style_default)
+        self.btn_view_line_profile.setToolTip(
+            "指定兩點連線（可斜向）取樣，繪製趨勢剖面；可條件替換數值後再繪圖。"
+        )
+        self.btn_view_line_profile.clicked.connect(self.show_line_profile_window)
+        self.btn_view_line_profile.setEnabled(False)
+        left_layout.addWidget(self.btn_view_line_profile)
 
         avg_label = QLabel("平均半寬度 (點數)")
         avg_label.setStyleSheet("color: #424242; font-size: 12px;")
@@ -1273,6 +1963,8 @@ class MappingTab(QWidget):
         self.btn_plot_mapping.setEnabled(False)
         self.btn_export_mapping.setEnabled(False)
         self.btn_view_gradient.setEnabled(False)
+        if hasattr(self, "btn_view_line_profile"):
+            self.btn_view_line_profile.setEnabled(False)
         self.mapping_matrix = None
         self.mapping_matrix_f1 = None
         self.mapping_matrix_f2 = None
@@ -1367,6 +2059,8 @@ class MappingTab(QWidget):
             self._update_point_count_label()
             self.btn_view_roi.setEnabled(False)
             self.btn_view_gradient.setEnabled(False)
+            if hasattr(self, "btn_view_line_profile"):
+                self.btn_view_line_profile.setEnabled(False)
             self._clear_roi_overlay()
 
     def load_mapping_file_f2(self):
@@ -1440,6 +2134,8 @@ class MappingTab(QWidget):
         self.plot_drawn = True
         self.btn_export_mapping.setEnabled(bool(self.export_dir))
         self.btn_view_gradient.setEnabled(True)
+        if hasattr(self, "btn_view_line_profile"):
+            self.btn_view_line_profile.setEnabled(True)
         self._update_roi_overlay()
 
     def _iter_export_mapping_points(self, matrix):
@@ -1542,6 +2238,31 @@ class MappingTab(QWidget):
             roi_matrix, self.x_coords[x_idx], self.y_coords[y_idx], parent=self
         )
         self.roi_window.show()
+
+    def show_line_profile_window(self):
+        if self.mapping_matrix is None or self.x_coords is None or self.y_coords is None:
+            QMessageBox.warning(self, "提醒", "請先畫出 Mapping 圖。")
+            return
+        if not self.plot_drawn:
+            QMessageBox.warning(self, "提醒", "請先點「畫出 Mapping 圖」。")
+            return
+        try:
+            matrix = self._get_processed_matrix()
+            if getattr(self, "line_profile_window", None) is not None:
+                try:
+                    self.line_profile_window.close()
+                except Exception:
+                    pass
+            self.line_profile_window = MappingLineProfileWindow(
+                matrix,
+                self.x_coords,
+                self.y_coords,
+                parent=self,
+            )
+            self.line_profile_window.show()
+            self.lbl_status.setText("狀態: 已開啟線段趨勢／剖面分析視窗")
+        except Exception as exc:
+            QMessageBox.critical(self, "無法開啟視窗", f"{exc}")
 
     def show_gradient_window(self):
         if self.mapping_matrix is None or self.x_coords is None or self.y_coords is None:
