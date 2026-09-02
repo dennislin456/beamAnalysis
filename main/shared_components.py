@@ -912,8 +912,12 @@ def _pack_valley_result(
     }
 
 
-def intersect_half_with_locate_band(matrix, split_y, half, locate_bounds=None):
-    """切分半區 ∩ 自動定位帶 → (子矩陣, x_offset, y_offset) 或 (None, 0, 0)。"""
+def intersect_half_with_locate_band(matrix, split_y, half, locate_bounds=None, *, y_only=False):
+    """切分半區 ∩ 自動定位帶 → (子矩陣, x_offset, y_offset) 或 (None, 0, 0)。
+
+    y_only=True 時僅在 Y 方向夾定位帶、保留半區全寬 X。
+    內切圓需完整 X 向 blob 才能算出正確半徑，不應過窄裁切 X。
+    """
     matrix = np.asarray(matrix)
     if matrix.size == 0:
         return None, 0, 0
@@ -928,9 +932,10 @@ def intersect_half_with_locate_band(matrix, split_y, half, locate_bounds=None):
     x0, x1 = 0, w
     if locate_bounds is not None:
         lx0, ly0, lx1, ly1 = locate_bounds
-        x0 = max(x0, int(lx0))
+        if not y_only:
+            x0 = max(x0, int(lx0))
+            x1 = min(x1, int(lx1))
         y0 = max(y0, int(ly0))
-        x1 = min(x1, int(lx1))
         y1 = min(y1, int(ly1))
     if y1 <= y0 or x1 <= x0:
         return None, 0, 0

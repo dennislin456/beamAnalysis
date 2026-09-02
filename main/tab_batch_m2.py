@@ -711,25 +711,10 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         return getattr(self, "batch_locate_bounds", None)
 
     def _find_inscribed_circle_below_y(self, matrix, y1, use_thresh, thresh_percent):
-        sub, x0, y0 = intersect_half_with_locate_band(
-            matrix, y1, "below", self._locate_bounds()
-        )
-        if sub is not None and sub.size > 0:
-            result = self._fit_inscribed_circle(sub, use_thresh, thresh_percent)
-            if result is not None:
-                cx, cy, radius = result
-                return (cx + x0, cy + y0, radius)
+        """內切圓須與門檻 overlay 同用全半區；裁切定位帶會改變 peak／blob 使圓超出 contour。"""
         return super()._find_inscribed_circle_below_y(matrix, y1, use_thresh, thresh_percent)
 
     def _find_inscribed_circle_above_y(self, matrix, y1, use_thresh, thresh_percent):
-        sub, x0, y0 = intersect_half_with_locate_band(
-            matrix, y1, "above", self._locate_bounds()
-        )
-        if sub is not None and sub.size > 0:
-            result = self._fit_inscribed_circle(sub, use_thresh, thresh_percent)
-            if result is not None:
-                cx, cy, radius = result
-                return (cx + x0, cy + y0, radius)
         return super()._find_inscribed_circle_above_y(matrix, y1, use_thresh, thresh_percent)
 
     def _find_center_below_y(self, matrix, y1, mode, use_thresh, thresh_percent, power=1.0):
