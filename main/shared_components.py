@@ -1,3 +1,4 @@
+import math
 import os
 from datetime import datetime
 import zipfile
@@ -576,133 +577,499 @@ def clip_roi_to_matrix(matrix, roi):
     return (x0, y0, x1, y1)
 
 
-def find_dual_peak_valley_y(matrix, cx=None, col_half_width=2, smooth_win=7,
-                            min_peak_distance=5, roi=None):
-    """沿質心 X 縱切取 1D profile，找雙峰之間波谷的 Y（用來區分 above／below）。
+def _smooth_1d_profile(y, win=7):
+    """1D 邊界延伸平滑（供波谷／雙峰偵測）。"""
+    y = np.asarray(y, dtype=np.float64)
+    k = max(1, int(win))
+    if k % 2 == 0:
+        k += 1
+    if k <= 1 or y.size < k:
+        return y.astype(np.float64, copy=True)
+    pad = k // 2
+    kernel = np.ones(k, dtype=np.float64) / float(k)
+    padded = np.pad(y, pad, mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
 
-    流程：
-      1. 若指定 roi=(x, y, width, height)，僅在該矩形內搜尋（可排除散射雜點）
-      2. 若未指定 cx，以（ROI 或全圖）質心（門檻 50%）估 X
-      3. 取 cx ± col_half_width 欄平均成垂直 profile
-      4. 背景扣除後平滑，找兩個主峰，取峰間最小值為波谷 Y
+
+def _local_maxima_1d(y, *, min_prominence_frac=0.12):
+    """找 1D 剖面上的局部極大（略過邊界 artifact）。"""
+    y = np.asarray(y, dtype=np.float64)
+    if y.size < 3:
+        return [int(np.argmax(y))] if y.size else []
+    peak = float(np.max(y))
+    if peak <= 0:
+        return []
+    min_prom = peak * float(min_prominence_frac)
+    margin = max(4, len(y) // 40)
+    idxs = []
+    for i in range(margin, len(y) - margin):
+        if y[i] >= y[i - 1] and y[i] >= y[i + 1] and y[i] >= min_prom:
+            if y[i] > y[i - 1] or y[i] > y[i + 1]:
+                idxs.append(i)
+    if not idxs:
+        band = y[margin: len(y) - margin]
+        if band.size:
+            idxs = [margin + int(np.argmax(band))]
+        else:
+            idxs = [int(np.argmax(y))]
+    return idxs
+
+
+def _min_lobe_separation(n, min_peak_distance):
+    """峰間最小距離；尊重 UI min_peak_distance。"""
+    if min_peak_distance is not None:
+        return max(1, int(min_peak_distance))
+    return max(3, min(8, max(3, n // 40)))
+
+
+def _peak_fwhm_1d(y, p):
+    """估算單峰 FWHM（px）；寬散射峰 → 較大值。"""
+    n = len(y)
+    if n < 3 or p < 0 or p >= n:
+        return float(n)
+    amp = float(y[p])
+    if amp <= 0:
+        return float(n)
+    half = 0.5 * amp
+    left = int(p)
+    while left > 0 and float(y[left]) >= half:
+        left -= 1
+    right = int(p)
+    while right < n - 1 and float(y[right]) >= half:
+        right += 1
+    return float(max(1, right - left))
+
+
+def _estimate_max_pair_sep(n, y, p1, min_sep, *, max_sep_cap_px=None):
+    """以 FWHM 推估伴峰搜尋窗寬；硬上限阻擋 dual+散射 (~700 µm) 誤配。"""
+    fwhm = _peak_fwhm_1d(y, p1)
+    est = max(min_sep * 3, int(4.0 * fwhm), 40)
+    default_cap = max(48, min(80, n // 5))
+    hard_cap = int(max_sep_cap_px) if max_sep_cap_px is not None else default_cap
+    hard_cap = max(min_sep + 1, hard_cap)
+    return int(np.clip(est, min_sep + 1, hard_cap))
+
+
+def _dual_peak_pair_score(y, a, b):
+    """局部雙峰配對分數：強度×平衡×波谷對比×銳度×緊緻度（不獎勵大間距）。"""
+    lo, hi = (a, b) if a < b else (b, a)
+    ya = float(y[a])
+    yb = float(y[b])
+    weaker = min(ya, yb)
+    stronger = max(ya, yb)
+    if stronger <= 0.0 or weaker <= 0.0:
+        return -1.0
+    global_peak = float(np.max(y)) if y.size else stronger
+    abs_w = weaker / max(global_peak, 1e-12)
+    if abs_w < 0.40:
+        return -1.0
+    balance = weaker / stronger
+    sep = int(hi - lo)
+    if sep < 2:
+        valley = 0.5 * (ya + yb)
+    else:
+        valley = float(np.min(y[lo: hi + 1]))
+    contrast = (weaker - valley) / max(weaker, 1e-12)
+    if contrast <= 0.0:
+        return -1.0
+    wa = _peak_fwhm_1d(y, a)
+    wb = _peak_fwhm_1d(y, b)
+    sharp = 1.0 / (1.0 + 0.35 * (wa + wb))
+    width_ref = max(wa, wb, 4.0)
+    compact = 1.0 / (1.0 + max(0.0, float(sep) - 3.0 * width_ref) / 16.0)
+    return weaker * abs_w * balance * contrast * sharp * compact
+
+
+def _find_dual_peak_valley_detail(
+    profile,
+    *,
+    smooth_win=7,
+    min_peak_distance=5,
+    max_sep_cap_px=None,
+    sep_lo_px=None,
+    sep_hi_px=None,
+):
+    """最佳局部雙峰對 → 波谷嚴格落在該對之間（見 docs/雙光斑波谷誤判與外圍散射修正.md）。"""
+    y = _smooth_1d_profile(profile, int(smooth_win) if smooth_win else 7)
+    n = len(y)
+    if n < 5:
+        if n == 0:
+            return None
+        mid = int(np.argmin(y))
+        return {
+            "valley": mid,
+            "peak_lo": mid,
+            "peak_hi": mid,
+            "max_pair_sep": max(8, n),
+        }
+
+    margin = max(4, n // 40)
+    min_sep = _min_lobe_separation(n, min_peak_distance)
+    global_peak = (
+        float(np.max(y[margin: n - margin])) if n > 2 * margin else float(np.max(y))
+    )
+    if global_peak <= 0:
+        return None
+
+    peaks = _local_maxima_1d(y, min_prominence_frac=0.12)
+    merged = []
+    for p in sorted(peaks, key=lambda i: float(y[i]), reverse=True):
+        if p < margin or p >= n - margin:
+            continue
+        if all(abs(p - q) >= min_sep for q in merged):
+            merged.append(p)
+        if len(merged) >= 10:
+            break
+    if not merged:
+        p1 = margin + int(np.argmax(y[margin: n - margin]))
+        merged = [p1]
+
+    candidates = []
+    anchors = [p for p in merged if float(y[p]) >= 0.35 * global_peak]
+    if not anchors:
+        anchors = merged[:3]
+
+    for p1 in anchors:
+        max_sep = _estimate_max_pair_sep(
+            n, y, p1, min_sep, max_sep_cap_px=max_sep_cap_px
+        )
+        if sep_hi_px is not None and math.isfinite(float(sep_hi_px)):
+            max_sep = min(max_sep, max(min_sep + 1, int(round(float(sep_hi_px)))))
+        amp1 = float(y[p1])
+        cands = [
+            p
+            for p in merged
+            if p != p1
+            and min_sep <= abs(p - p1) <= max_sep
+            and float(y[p]) >= 0.30 * amp1
+        ]
+        if not cands:
+            lo = max(margin, p1 - max_sep)
+            hi = min(n - margin, p1 + max_sep + 1)
+            left = y[lo: max(lo + 1, p1 - min_sep + 1)]
+            right = y[min(n - margin, p1 + min_sep): hi]
+            side = []
+            if left.size:
+                side.append(lo + int(np.argmax(left)))
+            if right.size:
+                side.append(int(p1 + min_sep + np.argmax(right)))
+            cands = [
+                c
+                for c in side
+                if min_sep <= abs(c - p1) <= max_sep
+                and float(y[c]) >= 0.25 * amp1
+            ]
+        for p2 in cands:
+            sep = abs(p1 - p2)
+            if sep_lo_px is not None and math.isfinite(float(sep_lo_px)):
+                if sep < float(sep_lo_px):
+                    continue
+            if sep_hi_px is not None and math.isfinite(float(sep_hi_px)):
+                if sep > float(sep_hi_px):
+                    continue
+            score = _dual_peak_pair_score(y, p1, p2)
+            if score <= 0:
+                continue
+            lo, hi = (p1, p2) if p1 < p2 else (p2, p1)
+            if hi - lo < 2:
+                valley = int((lo + hi) // 2)
+            else:
+                valley = int(lo + int(np.argmin(y[lo: hi + 1])))
+            if float(y[valley]) > 0.90 * min(float(y[lo]), float(y[hi])):
+                continue
+            valley = int(np.clip(valley, lo, hi))
+            candidates.append(
+                {
+                    "valley": valley,
+                    "peak_lo": int(lo),
+                    "peak_hi": int(hi),
+                    "max_pair_sep": int(max_sep),
+                    "score": float(score),
+                    "sep": int(sep),
+                }
+            )
+
+    if not candidates:
+        return None
+
+    best_score = max(float(c["score"]) for c in candidates)
+    near = [c for c in candidates if float(c["score"]) >= 0.82 * best_score]
+    near.sort(key=lambda c: (int(c["sep"]), -float(c["score"])))
+    best = near[0]
+    return {
+        "valley": int(best["valley"]),
+        "peak_lo": int(best["peak_lo"]),
+        "peak_hi": int(best["peak_hi"]),
+        "max_pair_sep": int(best["max_pair_sep"]),
+    }
+
+
+def _best_cut_x_for_valley(img, seed_x=None, *, valley_kw=None):
+    """在亮欄位掃描，選局部雙峰對比最強的縱切 X。"""
+    h, w = img.shape
+    col_max = img.max(axis=0)
+    thr = float(np.percentile(col_max, 75.0))
+    bright = np.where(col_max >= thr)[0]
+    if bright.size == 0:
+        bright = np.arange(w)
+    x0 = int(bright.min())
+    x1 = int(bright.max()) + 1
+
+    best_x = int(np.clip(
+        round(float(seed_x) if seed_x is not None else w / 2.0), 0, w - 1
+    ))
+    best_score = -1.0
+    step = max(1, (x1 - x0) // 40)
+    kw = dict(valley_kw or {})
+    kw.setdefault("smooth_win", 7)
+    kw.setdefault("min_peak_distance", 5)
+    for x in range(x0, x1, step):
+        half = 2
+        xa = max(0, x - half)
+        xb = min(w, x + half + 1)
+        prof = img[:, xa:xb].mean(axis=1)
+        detail = _find_dual_peak_valley_detail(prof, **kw)
+        if detail is None:
+            continue
+        lo = int(detail["peak_lo"])
+        hi = int(detail["peak_hi"])
+        ys = _smooth_1d_profile(prof, int(kw.get("smooth_win") or 7))
+        weaker = min(float(ys[lo]), float(ys[hi]))
+        valley = float(ys[int(detail["valley"])])
+        if weaker <= 0:
+            continue
+        contrast = (weaker - valley) / weaker
+        if contrast <= 0:
+            continue
+        score = contrast * weaker * _dual_peak_pair_score(ys, lo, hi)
+        if score > best_score:
+            best_score = score
+            best_x = int(x)
+    return best_x
+
+
+def _profile_from_matrix(work_mat, cut_x, col_half_width):
+    """沿 cut_x ± col_half_width 取垂直 profile（已 clip 至 work_mat 範圍）。"""
+    h, w = work_mat.shape
+    cx = float(np.clip(cut_x, 0.0, w - 1.0))
+    ci = int(round(cx))
+    c0 = max(0, ci - int(col_half_width))
+    c1 = min(w, ci + int(col_half_width) + 1)
+    profile = np.mean(work_mat[:, c0:c1], axis=1)
+    bg = float(np.median(profile)) if profile.size else 0.0
+    return np.clip(profile - bg, 0.0, None), profile
+
+
+def _pack_valley_result(
+    *,
+    full_h,
+    full_w,
+    valley,
+    cut_x,
+    detail,
+    profile_raw,
+    roi_bounds,
+    y_offset=0.0,
+):
+    """組裝 find_dual_peak_valley_y 回傳 dict（含自動定位帶）。"""
+    max_sep = int(detail["max_pair_sep"]) if detail else max(36, full_h // 10)
+    peak_ys = None
+    if detail is not None:
+        peak_ys = (
+            float(y_offset + int(detail["peak_lo"])),
+            float(y_offset + int(detail["peak_hi"])),
+        )
+
+    locate_y0 = int(np.clip(valley - max_sep, 0, full_h - 1))
+    locate_y1 = int(np.clip(valley + max_sep + 1, locate_y0 + 1, full_h))
+    pad_x = max(8, max_sep // 4)
+    locate_x0 = int(np.clip(cut_x - pad_x, 0, full_w - 1))
+    locate_x1 = int(np.clip(cut_x + pad_x + 1, locate_x0 + 1, full_w))
+    if peak_ys is not None:
+        pad_y = max(8, max_sep // 4)
+        locate_y0 = int(np.clip(min(peak_ys) - pad_y, 0, full_h - 1))
+        locate_y1 = int(np.clip(max(peak_ys) + pad_y + 1, locate_y0 + 1, full_h))
+
+    if roi_bounds is not None:
+        rx0, ry0, rx1, ry1 = roi_bounds
+        locate_x0 = max(locate_x0, rx0)
+        locate_y0 = max(locate_y0, ry0)
+        locate_x1 = min(locate_x1, rx1)
+        locate_y1 = min(locate_y1, ry1)
+        if locate_x1 <= locate_x0:
+            locate_x0, locate_x1 = rx0, rx1
+        if locate_y1 <= locate_y0:
+            locate_y0, locate_y1 = ry0, ry1
+
+    return {
+        "valley_y": float(valley),
+        "cx": float(cut_x),
+        "peak_ys": peak_ys,
+        "profile": profile_raw,
+        "roi": roi_bounds,
+        "max_pair_sep": float(max_sep),
+        "locate_bounds": (locate_x0, locate_y0, locate_x1, locate_y1),
+    }
+
+
+def intersect_half_with_locate_band(matrix, split_y, half, locate_bounds=None, *, y_only=False):
+    """切分半區 ∩ 自動定位帶 → (子矩陣, x_offset, y_offset) 或 (None, 0, 0)。
+
+    y_only=True 時僅在 Y 方向夾定位帶、保留半區全寬 X。
+    內切圓需完整 X 向 blob 才能算出正確半徑，不應過窄裁切 X。
+    """
+    matrix = np.asarray(matrix)
+    if matrix.size == 0:
+        return None, 0, 0
+    h, w = matrix.shape
+    y_i = split_y_index(split_y)
+    if half == "below":
+        y0, y1 = 0, y_i
+    elif half == "above":
+        y0, y1 = y_i + 1, h
+    else:
+        raise ValueError(f"unknown half: {half}")
+    x0, x1 = 0, w
+    if locate_bounds is not None:
+        lx0, ly0, lx1, ly1 = locate_bounds
+        if not y_only:
+            x0 = max(x0, int(lx0))
+            x1 = min(x1, int(lx1))
+        y0 = max(y0, int(ly0))
+        y1 = min(y1, int(ly1))
+    if y1 <= y0 or x1 <= x0:
+        return None, 0, 0
+    return matrix[y0:y1, x0:x1], x0, y0
+
+
+def find_dual_peak_valley_y(
+    matrix,
+    cx=None,
+    col_half_width=2,
+    smooth_win=7,
+    min_peak_distance=5,
+    roi=None,
+    expected_distance_min_um=None,
+    expected_distance_max_um=None,
+    pixel_pitch_um=5.5,
+    max_sep_cap_px=None,
+):
+    """沿質心 X 縱切取 1D profile，以「最佳局部雙峰對」找波谷 Y。
+    無 ROI 時仍可抗遠距外圍散射；啟用 ROI 時質心 seed、縱切與定位帶皆與框相交。
+
+    可選 expected_distance_min/max_um 以 µm 約束雙峰間距（DataRay pitch 預設 5.5）。
 
     Returns:
-        dict: {
-            "valley_y": float,   # 全圖座標
-            "cx": float,         # 全圖座標
-            "peak_ys": (y_lo, y_hi) 或 None,  # 全圖座標
-            "profile": 1d ndarray,  # ROI／全圖高度的原始縱切
-            "roi": (x0, y0, x1, y1) 或 None,  # 實際使用的半開裁切
-        }
-        失敗時 valley_y 回退為搜尋區中線。
+        dict: valley_y, cx, peak_ys, profile, roi,
+              max_pair_sep, locate_bounds (x0,y0,x1,y1 半開區間，全圖座標)
     """
-    from scipy.ndimage import uniform_filter1d
-    from scipy.signal import find_peaks
-
     matrix = np.asarray(matrix, dtype=np.float64)
     if matrix.size == 0:
         return {
             "valley_y": 0.0, "cx": 0.0, "peak_ys": None,
             "profile": np.array([]), "roi": None,
+            "max_pair_sep": 0.0, "locate_bounds": None,
         }
 
     full_h, full_w = matrix.shape
     roi_bounds = clip_roi_to_matrix(matrix, roi)
+
+    pitch = float(pixel_pitch_um) if pixel_pitch_um and pixel_pitch_um > 0 else 5.5
+    sep_lo_px = None
+    sep_hi_px = None
+    if expected_distance_min_um is not None and math.isfinite(float(expected_distance_min_um)):
+        sep_lo_px = float(expected_distance_min_um) / pitch
+    if expected_distance_max_um is not None and math.isfinite(float(expected_distance_max_um)):
+        sep_hi_px = float(expected_distance_max_um) / pitch
+
+    valley_kw = {
+        "smooth_win": int(smooth_win) if smooth_win else 7,
+        "min_peak_distance": min_peak_distance,
+        "max_sep_cap_px": max_sep_cap_px,
+        "sep_lo_px": sep_lo_px,
+        "sep_hi_px": sep_hi_px,
+    }
+    half_default = max(1, int(col_half_width) if col_half_width else 2)
+
     if roi_bounds is not None:
         x0, y0, x1, y1 = roi_bounds
         work_mat = matrix[y0:y1, x0:x1]
         y_offset = float(y0)
         x_offset = float(x0)
         if cx is not None:
-            cx = float(cx) - x_offset
-    else:
-        work_mat = matrix
-        y_offset = 0.0
-        x_offset = 0.0
-        roi_bounds = None
+            cut_x_local = float(cx) - x_offset
+        else:
+            try:
+                cut_x_local, _cy = compute_auto_spot_center(
+                    work_mat, "centroid", use_threshold=True, thresh_percent=50.0,
+                    bg_subtract=True, largest_cc_only=True, subpixel=True,
+                )
+            except Exception:
+                cut_x_local = (x1 - x0 - 1) / 2.0
+        cut_x_local = float(np.clip(cut_x_local, 0.0, x1 - x0 - 1.0))
+        half = max(1, min(half_default, max(1, (x1 - x0) // 4)))
+        prof_work, prof_raw = _profile_from_matrix(work_mat, cut_x_local, half)
+        detail = _find_dual_peak_valley_detail(prof_work, **valley_kw)
+        if detail is None:
+            valley = float((y0 + y1) // 2)
+        else:
+            valley = float(y0 + int(detail["valley"]))
+        cut_x_full = float(np.clip(cut_x_local + x_offset, 0.0, full_w - 1.0))
+        return _pack_valley_result(
+            full_h=full_h,
+            full_w=full_w,
+            valley=valley,
+            cut_x=cut_x_full,
+            detail=detail,
+            profile_raw=prof_raw,
+            roi_bounds=roi_bounds,
+            y_offset=y_offset,
+        )
 
-    h, w = work_mat.shape
-    if h < 1 or w < 1:
-        mid_y = (full_h - 1) / 2.0
-        mid_x = (full_w - 1) / 2.0
-        return {
-            "valley_y": mid_y, "cx": mid_x, "peak_ys": None,
-            "profile": np.array([]), "roi": roi_bounds,
-        }
-
-    if cx is None:
+    work_mat = matrix
+    seed_x = float(cx) if cx is not None else None
+    if seed_x is None:
         try:
-            cx, _cy = compute_auto_spot_center(
+            seed_x, _ = compute_auto_spot_center(
                 work_mat, "centroid", use_threshold=True, thresh_percent=50.0,
                 bg_subtract=True, largest_cc_only=True, subpixel=True,
             )
         except Exception:
-            cx = (w - 1) / 2.0
-    cx = float(np.clip(cx, 0.0, w - 1.0))
-    ci = int(round(cx))
-    c0 = max(0, ci - int(col_half_width))
-    c1 = min(w, ci + int(col_half_width) + 1)
-    profile = np.mean(work_mat[:, c0:c1], axis=1)
+            seed_x = (full_w - 1) / 2.0
 
-    bg = float(np.median(profile)) if profile.size else 0.0
-    work = np.clip(profile - bg, 0.0, None)
-    win = max(1, int(smooth_win))
-    if win % 2 == 0:
-        win += 1
-    if work.size >= win:
-        smooth = uniform_filter1d(work, size=win, mode="nearest")
-    else:
-        smooth = work
-
-    fallback_y = (h - 1) / 2.0
-    peak_ys = None
-    valley_y = fallback_y
-
-    if smooth.size >= 3 and float(np.max(smooth)) > 0:
-        prominence = max(float(np.max(smooth)) * 0.05, 1e-9)
-        peaks, props = find_peaks(
-            smooth,
-            distance=max(1, int(min_peak_distance)),
-            prominence=prominence,
+    cut_x = _best_cut_x_for_valley(work_mat, seed_x=seed_x, valley_kw=valley_kw)
+    prof_work, prof_raw = _profile_from_matrix(work_mat, cut_x, half_default)
+    detail = _find_dual_peak_valley_detail(prof_work, **valley_kw)
+    if detail is None:
+        sx = int(np.clip(round(float(seed_x)), 0, full_w - 1))
+        for hx in (6, 10, 16):
+            prof_work, prof_raw = _profile_from_matrix(work_mat, sx, hx)
+            detail = _find_dual_peak_valley_detail(prof_work, **valley_kw)
+            if detail is not None:
+                cut_x = float(sx)
+                break
+    if detail is None:
+        valley = float(full_h // 2)
+        return _pack_valley_result(
+            full_h=full_h,
+            full_w=full_w,
+            valley=valley,
+            cut_x=float(cut_x),
+            detail=None,
+            profile_raw=prof_raw,
+            roi_bounds=None,
         )
-        if len(peaks) < 2:
-            # 放寬條件再試一次
-            peaks, props = find_peaks(
-                smooth,
-                distance=max(1, int(min_peak_distance)),
-            )
-        if len(peaks) >= 2:
-            # 取 prominence 最高的兩個峰（若無 prominence 則取高度最高）
-            if "prominences" in props and props["prominences"] is not None:
-                order = np.argsort(props["prominences"])[::-1]
-            else:
-                order = np.argsort(smooth[peaks])[::-1]
-            top2 = sorted(int(peaks[i]) for i in order[:2])
-            y_lo, y_hi = top2[0], top2[1]
-            if y_hi > y_lo:
-                seg = smooth[y_lo:y_hi + 1]
-                min_val = float(np.min(seg))
-                # 平坦波谷取最低平台中點，避免偏到單側
-                tol = max(abs(min_val) * 0.02, float(np.max(seg)) * 0.005, 1e-12)
-                cands = np.where(seg <= min_val + tol)[0]
-                valley_local = int(np.round(np.median(cands))) if cands.size else int(np.argmin(seg))
-                valley_y = float(y_lo + valley_local)
-                peak_ys = (float(y_lo), float(y_hi))
 
-    valley_y = float(np.clip(valley_y, 0.0, h - 1.0))
-    # 轉回全圖座標
-    valley_y = float(np.clip(valley_y + y_offset, 0.0, full_h - 1.0))
-    cx_full = float(np.clip(cx + x_offset, 0.0, full_w - 1.0))
-    if peak_ys is not None:
-        peak_ys = (float(peak_ys[0] + y_offset), float(peak_ys[1] + y_offset))
-
-    return {
-        "valley_y": valley_y,
-        "cx": cx_full,
-        "peak_ys": peak_ys,
-        "profile": profile,
-        "roi": roi_bounds,
-    }
+    valley = float(detail["valley"])
+    return _pack_valley_result(
+        full_h=full_h,
+        full_w=full_w,
+        valley=valley,
+        cut_x=float(cut_x),
+        detail=detail,
+        profile_raw=prof_raw,
+        roi_bounds=None,
+    )
 
 
 # =========================================================================

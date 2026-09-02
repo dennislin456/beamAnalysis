@@ -133,33 +133,35 @@ function fit_inscribed_circle(matrix, use_threshold, thresh_percent):
 
 ---
 
-## 4. M2 Batch：波谷切分（補充）
+## 4. M2 Batch：波谷切分（最佳局部雙峰對）
 
 僅 **M2 Batch** 使用；Batch（M1+M2）以 M1 Y 切分，不走此路徑。
 
+詳細規格見 [雙光斑分析模組功能需求書.md](雙光斑分析模組功能需求書.md) 與 [雙光斑波谷誤判與外圍散射修正.md](雙光斑波谷誤判與外圍散射修正.md)。
+
 `find_dual_peak_valley_y`（`shared_components.py`）摘要：
 
-1. **可選框選 ROI** `roi=(x, y, width, height)`：僅在矩形內估質心與縱切（用來排除上方散射雜點）。回傳的 `valley_y`／`cx`／`peak_ys` 皆為**全圖座標**。
-2. 若未指定 `cx`，以（ROI 或全圖）質心（門檻 50%、背景扣除、最大連通）估 `cx`。
-3. 取 `cx ± col_half_width`（預設 ±2）欄位平均成垂直 profile。
-4. 扣除 profile 中位數後做 1D 平滑（預設窗長 7）。
-5. `find_peaks` 找雙峰；取 prominence（或高度）最高的兩峰。
-6. 兩峰之間取最小值為波谷；平坦底以容差內候選的中位數當波谷 Y。
-7. 失敗時回退搜尋區中線。
+1. **可選框選 ROI** `roi=(x, y, width, height)`：質心 seed、縱切 profile、定位帶 **皆與框相交**（centroid + valley）。回傳座標皆為**全圖座標**。
+2. 無 ROI 時以 `_best_cut_x_for_valley` 選最佳縱切 X；有 ROI 時在框內估質心 X。
+3. **`_find_dual_peak_valley_detail`**：各強峰僅在 FWHM 推得之 `max_pair_sep` 窗（硬上限約 48–80 px）內找伴峰；配對分數含銳度／緊緻度，**不獎勵大間距**；波谷嚴格落在該對之間。
+4. 產生 **`locate_bounds`** 自動定位帶（雙峰 Y ± pad、cut_x ± pad）；M2 Batch 的 above／below 定位在此帶 ∩ 切分半區內執行，抗外圍散射。
+5. 可選 **Expected Distance [min, max] µm** 約束雙峰間距（抑制偶發 ~700 µm 誤判）。
+6. 失敗時波谷回退搜尋區中線。
 
-得到的 `valley_y` 即作為上述 `split_y`，再對**全圖** above／below 各跑一次內切圓（框選只影響切分 Y 的判斷，不裁切後續定位）。
+得到的 `valley_y` 即作為 `split_y`；above／below 中心在定位帶內擬合（不再對全圖半區無限制掃描）。
 
 ### 4.1 UI：波谷搜尋框選
 
 | 控制項 | 說明 |
 |--------|------|
-| `chk_batch_valley_roi` | 啟用後才用框選；關閉則等同整張圖搜尋（舊行為） |
+| `chk_batch_valley_roi` | 啟用後 ROI 約束質心 + 波谷 + 定位帶；**預設關閉**（最佳局部雙峰對可自動抗散射） |
 | `spin_batch_valley_roi_x / y` | 框左上角（px） |
 | `spin_batch_valley_roi_w / h` | 框寬／高（px） |
+| `spin_expected_dist_min_um / max_um` | Expected Distance（µm）；0 = 不限制 |
 
 熱圖在啟用時以**橘色虛線**畫出實際裁切後的 ROI；紫色切分線／縱切線會限縮畫在框內。
 
-建議：框住上下兩顆主光斑，避免把上方散射光點納入縱切 profile。
+建議：一般批量 **關閉 ROI**；僅在雙峰極淡或散射貼近雙峰時，手動框住主光斑作備援。
 
 ---
 
@@ -212,7 +214,10 @@ function fit_inscribed_circle(matrix, use_threshold, thresh_percent):
    內切圓圓心不一定等於質心或外接圓中心；細長或 L 形區域時，圓心會偏向「最寬」處。
 
 3. **切分錯誤**  
-   波谷或 M1 Y 切錯時，上下 ROI 可能只含半顆光斑或兩顆擠在同一側，導致內切圓失敗或落點異常。M2 Batch 可啟用**波谷搜尋框選**，把縱切限制在主光斑附近，減少散射雜點干擾雙峰判斷。
+   波谷或 M1 Y 切錯時，上下 ROI 可能只含半顆光斑或兩顆擠在同一側，導致內切圓失敗或落點異常。M2 Batch 已改用 **最佳局部雙峰對** 與 **自動定位帶**，預設無需手動框選；極端情況可啟用波谷搜尋框選作備援（見 [雙光斑分析模組功能需求書.md](雙光斑分析模組功能需求書.md)）。
+
+4. **內切圓與定位帶**  
+   **內切圓模式不套用定位帶**，與門檻 overlay 相同，在 **整個 above／below 半區** 上計算。若在定位帶子矩陣上算 EDT，子區域的 peak／blob 與 overlay 不一致，畫面上的圓弧可能 **超出** 半透明 contour（實測如批量第 66 幀可漏出數百 px）。質心／幾何中心仍用 XY 定位帶抗散射。
 
 4. **尺寸一致性（Batch）**  
    M1 與 M2 矩陣 shape 需一致，否則自動抓取會警告並中止該次定位。
@@ -233,7 +238,8 @@ function fit_inscribed_circle(matrix, use_threshold, thresh_percent):
 | `update_batch_calculations` | 同上 | 串起切分 → below → above |
 | `estimate_border_background` | `shared_components.py` | 邊界中位數背景 |
 | `split_y_index` | `shared_components.py` | 亞像素 Y → 整數列 |
-| `find_dual_peak_valley_y` | `shared_components.py` | M2 Batch 波谷切分（可選 ROI） |
+| `find_dual_peak_valley_y` | `shared_components.py` | M2 Batch 波谷切分（最佳局部雙峰對；可選 ROI／Expected Distance） |
+| `intersect_half_with_locate_band` | `shared_components.py` | 切分半區 ∩ 自動定位帶 |
 | `clip_roi_to_matrix` | `shared_components.py` | 框選裁切到矩陣範圍 |
 
 ---
