@@ -16,28 +16,30 @@ def scan_location_files(root_dir):
     if not root_dir or not os.path.isdir(root_dir):
         return result
     try:
-        entries = os.listdir(root_dir)
+        entries = os.scandir(root_dir)
     except OSError:
         return result
 
     for entry in entries:
-        loc_path = os.path.join(root_dir, entry)
-        if not os.path.isdir(loc_path):
+        if not entry.is_dir():
             continue
-
+        loc_name = entry.name
         files = {}
         try:
-            for fname in os.listdir(loc_path):
+            for child in os.scandir(entry.path):
+                if not child.is_file():
+                    continue
+                fname = child.name
                 if fname.startswith("~$"):
                     continue
                 lower = fname.lower()
                 if lower.endswith((".xlsx", ".xls", ".csv", ".npy")):
-                    files[fname] = os.path.join(loc_path, fname)
+                    files[fname] = child.path
         except OSError:
             continue
 
         if files:
-            result[entry] = files
+            result[loc_name] = files
 
     return result
 

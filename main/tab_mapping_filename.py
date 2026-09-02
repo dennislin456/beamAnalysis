@@ -6,14 +6,20 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
-import pyqtgraph.exporters as pg_export
 
 from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox, QGraphicsRectItem
 from PyQt5.QtGui import QBrush, QColor, QPen
 from PyQt5.QtCore import Qt, QRectF
 
 from tab_mapping import MappingTab, MappingRoiWindow
-from shared_components import export_stamped_path
+from shared_components import (
+    export_stamped_path,
+    sanitize_numeric_values,
+    export_plot_image,
+    EXPORT_IMAGE_EXT,
+    EXPORT_IMAGE_FILTER,
+    normalize_export_image_path,
+)
 
 try:
     import orjson as _fast_json
@@ -48,7 +54,7 @@ def _read_one_mapping_json(file_path):
             value = {}
         dist = value.get("dist_ifc", data.get("dist_ifc"))
         unit = value.get("dist_ifc_unit", data.get("dist_ifc_unit", "")) or ""
-        dist_value = float(dist)
+        dist_value = float(sanitize_numeric_values([dist])[0])
         if not np.isfinite(dist_value):
             raise ValueError(f"JSON 沒有有效的 value.dist_ifc：{os.path.basename(file_path)}")
         x_value = data.get("x_mm")
@@ -442,7 +448,7 @@ class MappingFilenameTab(MappingTab):
             self,
             "匯出 Heatmap 檔名",
             export_stamped_path(self.export_dir, "mapping_heatmap"),
-            "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)",
+            EXPORT_IMAGE_FILTER,
         )
         if not save_path:
             return
@@ -450,22 +456,34 @@ class MappingFilenameTab(MappingTab):
         avg_matrix = self._get_processed_matrix()
         selected_item = self.selected_point_item
         try:
-            base_name = os.path.splitext(os.path.basename(save_path))[0]
-            ext = os.path.splitext(save_path)[1] or ".png"
-            heatmap_path = save_path
-            contour_path = os.path.join(self.export_dir, f"{base_name}_contour{ext}")
+            heatmap_path = normalize_export_image_path(save_path)
+            base_name = os.path.splitext(os.path.basename(heatmap_path))[0]
+            heatmap_base = os.path.join(self.export_dir, base_name)
+            contour_path = os.path.join(
+                self.export_dir, f"{base_name}_contour{EXPORT_IMAGE_EXT}"
+            )
 
             if selected_item is not None:
                 selected_item.hide()
-            for panel, out_path in (
-                (self.heatmap_panel, heatmap_path),
-                (self.contour_panel, contour_path),
-            ):
-                target = panel.plot
-                exporter = pg_export.ImageExporter(target)
-                exporter.parameters()["width"] = max(int(panel.plot.width()), 400)
-                exporter.parameters()["height"] = max(int(panel.plot.height()), 300)
-                exporter.export(out_path)
+            try:
+                exported_images = list(
+                    self.heatmap_panel.export_heatmap_only(heatmap_base)
+                )
+                restore_contour = self.contour_panel._prepare_clean_bundle_export()
+                try:
+                    QApplication.processEvents()
+                    export_plot_image(
+                        self.contour_panel.plot,
+                        contour_path,
+                        width=max(int(self.contour_panel.plot.width()), 400),
+                        height=max(int(self.contour_panel.plot.height()), 300),
+                    )
+                finally:
+                    restore_contour()
+                exported_images.append(contour_path)
+            finally:
+                if selected_item is not None:
+                    selected_item.show()
 
             csv_path = os.path.join(self.export_dir, f"{base_name}.csv")
             with open(csv_path, "w", encoding="utf-8") as fh:
@@ -482,10 +500,11 @@ class MappingFilenameTab(MappingTab):
             self.lbl_status.setText(
                 "狀態: 已匯出 heatmap、contour 與含 min/max/std 的 CSV"
             )
+            image_list = "\n".join(exported_images)
             QMessageBox.information(
                 self,
                 "匯出完成",
-                f"已匯出：\n{heatmap_path}\n{contour_path}\n\nCSV：\n{csv_path}",
+                f"已匯出：\n{image_list}\n\nCSV：\n{csv_path}",
             )
         except Exception as exc:
             QMessageBox.critical(self, "匯出失敗", f"無法匯出檔案：\n{exc}")

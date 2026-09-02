@@ -1,14 +1,15 @@
 import os
 from datetime import datetime
+import zipfile
 
 import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.exporters as pg_export
 from scipy.ndimage import label as ndi_label
 from PyQt5.QtWidgets import (
-    QSpinBox, QDoubleSpinBox, QMainWindow, QWidget, QVBoxLayout, QCheckBox,
-    QHBoxLayout, QPushButton, QLabel, QFileDialog, QMessageBox, QInputDialog,
-    QSizePolicy,
+    QApplication, QSpinBox, QDoubleSpinBox, QMainWindow, QWidget, QVBoxLayout,
+    QCheckBox, QHBoxLayout, QPushButton, QLabel, QFileDialog, QMessageBox,
+    QInputDialog, QSizePolicy,
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QRectF
 from PyQt5.QtGui import QCursor
@@ -30,13 +31,77 @@ def export_timestamp_tag():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def export_stamped_filename(base_name, ext=".png"):
+# 匯出圖檔預設 PNG（體積較小、相容性好；已改為直接匯出資料夾無需避開 ZIP 壓縮）。
+EXPORT_IMAGE_EXT = ".png"
+EXPORT_IMAGE_FILTER = "PNG 圖片 (*.png);;所有檔案 (*)"
+EXPORT_ZIP_COMPRESSION = zipfile.ZIP_STORED
+
+
+def export_stamped_filename(base_name, ext=EXPORT_IMAGE_EXT):
     """在檔名（不含副檔名）後加上時間戳，避免覆蓋舊檔。"""
     return f"{base_name}_{export_timestamp_tag()}{ext}"
 
 
-def export_stamped_path(folder, base_name, ext=".png"):
+def export_stamped_path(folder, base_name, ext=EXPORT_IMAGE_EXT):
     return os.path.join(folder, export_stamped_filename(base_name, ext))
+
+
+
+def normalize_export_image_path(path: str) -> str:
+    """統一匯出為 PNG。"""
+    base, ext = os.path.splitext(path)
+    if ext.lower() in (".bmp", ".jpg", ".jpeg", ".tif", ".tiff", ""):
+        return f"{base}{EXPORT_IMAGE_EXT}"
+    return path
+
+
+def export_plot_image(target, path, width=None, height=None) -> None:
+    """匯出 pyqtgraph 圖面為 PNG。"""
+    out_path = normalize_export_image_path(path)
+    exporter = pg_export.ImageExporter(target)
+    if width is not None:
+        exporter.parameters()["width"] = int(width)
+    if height is not None:
+        exporter.parameters()["height"] = int(height)
+    exporter.export(out_path)
+
+
+def save_qpixmap_export(pix, path) -> bool:
+    """QPixmap 匯出為 PNG。"""
+    out_path = normalize_export_image_path(path)
+    return bool(pix.save(out_path, "PNG"))
+
+
+
+# Mapping 合理量測值上限；超出或非有限值視為無效（如 DBL_MIN 哨兵值）
+MAPPING_VALUE_ABS_MAX = 1e6
+
+
+def sanitize_numeric_values(values, abs_max=MAPPING_VALUE_ABS_MAX):
+    """將非有限值與極端值改為 NaN。"""
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return arr
+    out = arr.copy()
+    bad = ~np.isfinite(out) | (np.abs(out) > float(abs_max))
+    out[bad] = np.nan
+    return out
+
+
+def finite_value_minmax(values, default=(0.0, 1.0)):
+    """回傳有效數值的 min/max，供色階與 histogram 使用。"""
+    clean = sanitize_numeric_values(values)
+    finite = clean[np.isfinite(clean)]
+    if finite.size == 0:
+        return default
+    vmin, vmax = float(np.min(finite)), float(np.max(finite))
+    if not (np.isfinite(vmin) and np.isfinite(vmax)):
+        return default
+    if vmin == vmax:
+        vmin -= 1.0
+        vmax += 1.0
+    return vmin, vmax
+
 # 剖面訊號區目標邊長（縱剖面寬 ≈ 橫剖面高）
 PROFILE_VIEW_PX = 130
 PROFILE_VIEW_PX_COMPACT = 88  # Mapping 等含剖面的面板，略縮以減少擁擠
@@ -1429,14 +1494,8 @@ class InteractiveHeatmapPanel(QWidget):
         if levels is not None:
             self.set_default_levels(levels[0], levels[1], apply=True)
         elif image is not None:
-            finite = np.asarray(image, dtype=float)
-            finite = finite[np.isfinite(finite)]
-            if finite.size:
-                vmin, vmax = float(np.min(finite)), float(np.max(finite))
-                if vmin == vmax:
-                    vmin -= 1.0
-                    vmax += 1.0
-                self.set_default_levels(vmin, vmax, apply=True)
+            vmin, vmax = finite_value_minmax(image)
+            self.set_default_levels(vmin, vmax, apply=True)
         # levels 更新後再套一次 rect，避免 transform 被重設
         self._apply_data_rect(self._data_rect)
         if self._with_profiles:
@@ -1508,6 +1567,7 @@ class InteractiveHeatmapPanel(QWidget):
             self.image_item.setRect(self._data_rect)
 
     def set_default_levels(self, vmin, vmax, apply=True):
+        vmin, vmax = finite_value_minmax([vmin, vmax], default=(0.0, 1.0))
         if vmin > vmax:
             vmin, vmax = vmax, vmin
         if vmin == vmax:
@@ -1519,6 +1579,7 @@ class InteractiveHeatmapPanel(QWidget):
             self.apply_levels(vmin, vmax, update_hist_range=True)
 
     def apply_levels(self, vmin, vmax, update_hist_range=False):
+        vmin, vmax = finite_value_minmax([vmin, vmax], default=(0.0, 1.0))
         if vmin > vmax:
             vmin, vmax = vmax, vmin
         if vmin == vmax:
@@ -1838,6 +1899,106 @@ class InteractiveHeatmapPanel(QWidget):
         if self.plot_y_profile is not None:
             self.plot_y_profile.getViewBox().setMouseEnabled(x=True, y=True)
 
+    def _profile_marker_items(self):
+        """剖面圖上的位置指示線。"""
+        items = []
+        for plot in (self.plot_x_profile, self.plot_y_profile):
+            if plot is None:
+                continue
+            for item in plot.items:
+                if isinstance(item, pg.InfiniteLine):
+                    items.append(item)
+        return items
+
+    def _prepare_clean_bundle_export(self):
+        """匯出 heatmap+剖面 bundle 時暫藏 colorbar 與十字／位置線。回傳 restore。"""
+        restore_fns = []
+
+        if self.hist is not None:
+            try:
+                was_visible = self.hist.isVisible()
+                self.hist.hide()
+                restore_fns.append(
+                    lambda h=self.hist, vis=was_visible: h.setVisible(vis)
+                )
+            except Exception:
+                pass
+
+        for item in list(self._profile_cross_items or []):
+            try:
+                was_visible = item.isVisible()
+                item.hide()
+                restore_fns.append(
+                    lambda it=item, vis=was_visible: it.setVisible(vis)
+                )
+            except Exception:
+                pass
+
+        for item in self._profile_marker_items():
+            try:
+                was_visible = item.isVisible()
+                item.hide()
+                restore_fns.append(
+                    lambda it=item, vis=was_visible: it.setVisible(vis)
+                )
+            except Exception:
+                pass
+
+        def _restore():
+            for fn in restore_fns:
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+        return _restore
+
+    def export_heatmap_only(self, base_path, width=None, height=None):
+        """匯出主熱圖（不含 colorbar、十字、剖面）。"""
+        out_path = os.path.splitext(normalize_export_image_path(base_path))[0]
+        out_path = f"{out_path}{EXPORT_IMAGE_EXT}"
+        restore = self._prepare_clean_bundle_export()
+        try:
+            QApplication.processEvents()
+            export_plot_image(
+                self.plot,
+                out_path,
+                width=width or max(int(self.plot.width()), 400),
+                height=height or max(int(self.plot.height()), 300),
+            )
+            return [out_path]
+        finally:
+            restore()
+
+    def export_plot_bundle(self, base_path, width=None, height=None):
+        """匯出熱圖＋剖面合成圖（不含 colorbar 與十字標示；供範圍圖等使用）。
+
+        base_path 不含副檔名，例如 .../mapping_roi。
+        「匯出當前圖檔」仍使用 export_current_image()，會保留 colorbar 與十字。
+        """
+        out_path = os.path.splitext(normalize_export_image_path(base_path))[0]
+        out_path = f"{out_path}{EXPORT_IMAGE_EXT}"
+        if not self._with_profiles:
+            return self.export_heatmap_only(base_path, width=width, height=height)
+
+        restore = self._prepare_clean_bundle_export()
+        try:
+            QApplication.processEvents()
+            if self.win is not None:
+                pix = self.win.grab()
+                if not pix.isNull():
+                    save_qpixmap_export(pix, out_path)
+                    return [out_path]
+            export_plot_image(
+                self.plot,
+                out_path,
+                width=width or max(int(self.plot.width()), 400),
+                height=height or max(int(self.plot.height()), 300),
+            )
+            return [out_path]
+        finally:
+            restore()
+
     def export_current_image(self):
         safe_title = (
             self._title.replace(" ", "_").replace("/", "-").replace("\\", "-")
@@ -1846,20 +2007,17 @@ class InteractiveHeatmapPanel(QWidget):
             self,
             "匯出當前圖檔",
             export_stamped_filename(safe_title),
-            "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)",
+            EXPORT_IMAGE_FILTER,
         )
         if not path:
             return False
         try:
-            # 優先匯出整組圖面＋色條
             target = getattr(self.win, "ci", None) or self.plot
-            exporter = pg_export.ImageExporter(target)
             w = max(int(self.win.width()), 400)
             h = max(int(self.win.height()), 300)
-            exporter.parameters()["width"] = w
-            exporter.parameters()["height"] = h
-            exporter.export(path)
-            QMessageBox.information(self, "匯出完成", f"已匯出：\n{path}")
+            export_plot_image(target, path, width=w, height=h)
+            out_path = normalize_export_image_path(path)
+            QMessageBox.information(self, "匯出完成", f"已匯出：\n{out_path}")
             return True
         except Exception as exc:
             QMessageBox.critical(self, "匯出失敗", f"無法匯出圖檔：\n{exc}")

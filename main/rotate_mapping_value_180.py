@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from shared_components import sanitize_numeric_values
+
 
 def _coord_key(x: float, y: float) -> tuple[float, float]:
     return round(float(x), 6), round(float(y), 6)
@@ -22,6 +24,7 @@ def _read_mapping_csv(path: Path) -> pd.DataFrame:
         raise ValueError(f"缺少欄位：{', '.join(missing)}")
     out = df[[rename[name] for name in required]].copy()
     out.columns = list(required)
+    out["value"] = sanitize_numeric_values(out["value"])
     return out
 
 

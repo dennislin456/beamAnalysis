@@ -3,7 +3,6 @@ import json
 import pandas as pd
 import numpy as np
 import pyqtgraph as pg
-import pyqtgraph.exporters as pg_export
 from scipy.ndimage import uniform_filter, map_coordinates
 
 from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QPushButton, 
@@ -22,7 +21,8 @@ from shared_components import (NoWheelSpinBox, NoWheelDoubleSpinBox,
                                HeatmapViewerWindow, CrossProfileViewerWindow,
                                compute_auto_spot_center, build_robust_threshold_mask,
                                split_y_index, apply_readable_plot_theme,
-                               LevelAlignedHistogramLUTItem)
+                               LevelAlignedHistogramLUTItem,
+                               export_plot_image, EXPORT_IMAGE_EXT)
 
 class DataRayTab(QWidget):
     def __init__(self, parent=None):
@@ -1762,11 +1762,11 @@ class DataRayTab(QWidget):
             wb_spot.save(spot_analysis_excel_path)
             spot_analysis_msg = f"光斑與量測數據 Excel: {os.path.basename(spot_analysis_excel_path)}\n"
 
-            contour_img_path = f"{base_path}_Contour.png"
-            pg_export.ImageExporter(self.plot_contour).export(contour_img_path)
+            contour_img_path = f"{base_path}_Contour{EXPORT_IMAGE_EXT}"
+            export_plot_image(self.plot_contour, contour_img_path)
 
-            heatmap_img_path = f"{base_path}_Heatmap.png"
-            pg_export.ImageExporter(self.plot_heat).export(heatmap_img_path)
+            heatmap_img_path = f"{base_path}_Heatmap{EXPORT_IMAGE_EXT}"
+            export_plot_image(self.plot_heat, heatmap_img_path)
 
             waveform_excel_msg = ""
             if len(self.contour_click_points) == 2 and self.smoothed_matrix is not None:
