@@ -40,7 +40,9 @@ BeamAnalysis/
 ├── README.md
 ├── requirements.txt
 ├── docs/
-│   └── inscribed_circle.md   # M2 above／below 內切圓演算法說明
+│   ├── inscribed_circle.md     # M2 above／below 內切圓演算法說明
+│   ├── 雙光斑分析模組功能需求書.md
+│   └── 雙光斑波谷誤判與外圍散射修正.md
 └── main/
     ├── main.py                 # 程式入口（主視窗＋分頁）
     ├── shared_components.py    # 共用 UI 與光斑定位演算法
@@ -58,6 +60,8 @@ BeamAnalysis/
 |------|------|
 | [README.md](README.md) | 安裝、啟動、使用概要（本檔） |
 | [docs/inscribed_circle.md](docs/inscribed_circle.md) | M2 above／below 門檻 contour 內切圓演算法、切分流程、參數與已知限制 |
+| [docs/雙光斑分析模組功能需求書.md](docs/雙光斑分析模組功能需求書.md) | 雙光斑波谷、定位帶、ROI、Expected Distance、API 與驗收 |
+| [docs/雙光斑波谷誤判與外圍散射修正.md](docs/雙光斑波谷誤判與外圍散射修正.md) | 根因分析、改善前後行為對照 |
 
 ---
 

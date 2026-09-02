@@ -1,6 +1,7 @@
-"""DataRay M2-only Batch：僅載入 M2 Excel，以質心縱切雙峰波谷 Y 區分 above／below。
+"""DataRay M2-only Batch：僅載入 M2 Excel，以最佳局部雙峰波谷 Y 區分 above／below。
 
-可選框選 ROI（X/Y/Width/Height）：僅在固定矩形內做縱切找波谷，避免散射雜點干擾。
+可選框選 ROI：質心 seed、縱切與定位帶皆與框相交（centroid + valley）。
+無 ROI 時以最佳局部雙峰對自動抗外圍散射（見 docs/雙光斑分析模組功能需求書.md）。
 """
 import os
 import csv
@@ -17,7 +18,8 @@ from PyQt5.QtCore import Qt
 
 from shared_components import (
     HeatmapViewerWindow, find_dual_peak_valley_y, split_y_index,
-    NoWheelSpinBox, clip_roi_to_matrix,
+    NoWheelSpinBox, NoWheelDoubleSpinBox, clip_roi_to_matrix,
+    intersect_half_with_locate_band,
     save_qpixmap_export, EXPORT_IMAGE_EXT, export_timestamp_tag,
 )
 from batch_data_loader import load_numeric_matrix, scan_location_files
@@ -33,6 +35,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.batch_split_y = None          # 波谷 Y（取代 M1 Y）
         self.batch_split_cx = None         # 縱切所用質心 X
         self.batch_split_peak_ys = None    # (y_lo, y_hi)
+        self.batch_locate_bounds = None    # 自動定位帶 (x0,y0,x1,y1)，抗散射
         self.batch_valley_roi_bounds = None  # 實際使用的 (x0,y0,x1,y1)
         self._export_in_progress = False
         self._export_pause_requested = False
@@ -110,12 +113,13 @@ class DataRayBatchM2Tab(DataRayBatchTab):
 
         # 波谷搜尋框選：僅調整 XYWH 輸入排成緊湊 2×2
         self.chk_batch_valley_roi = QCheckBox(
-            "啟用波谷搜尋框選（僅在框內縱切找低谷，區分 above／below）"
+            "啟用波谷搜尋框選（centroid + valley，約束切分與定位）"
         )
         self.chk_batch_valley_roi.setChecked(False)
         self.chk_batch_valley_roi.setStyleSheet("color: #6A1B9A; font-weight: bold;")
         self.chk_batch_valley_roi.setToolTip(
-            "框住上下主光斑，避開上方散射雜點；切分後 above／below 仍對全圖計算。"
+            "框住上下主光斑、排除散射；質心 seed、縱切波谷與 above／below 定位帶皆與框相交。"
+            "預設關閉時仍可自動抗散射（最佳局部雙峰對）。"
         )
         self.chk_batch_valley_roi.toggled.connect(self._on_valley_roi_toggled)
         left_layout.insertWidget(insert_idx, self.chk_batch_valley_roi)
@@ -158,6 +162,37 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         roi_grid.addWidget(self.lbl_batch_valley_roi_h, 1, 2)
         roi_grid.addWidget(self.spin_batch_valley_roi_h, 1, 3)
         left_layout.insertLayout(insert_idx, roi_grid)
+        insert_idx += 1
+
+        exp_row = QHBoxLayout()
+        exp_row.setContentsMargins(0, 0, 0, 0)
+        lbl_exp = QLabel("Expected Distance (µm):")
+        lbl_exp.setStyleSheet("color: #455A64; font-weight: bold;")
+        lbl_exp.setToolTip(
+            "可選：以 µm 約束雙峰間距，抑制偶發 ~700 µm 誤判。"
+            "Min／Max 皆為 0 表示不限制；建議真值約 155 µm 時設 80～250。"
+        )
+        self.spin_expected_dist_min_um = NoWheelDoubleSpinBox()
+        self.spin_expected_dist_min_um.setRange(0.0, 10000.0)
+        self.spin_expected_dist_min_um.setDecimals(1)
+        self.spin_expected_dist_min_um.setValue(0.0)
+        self.spin_expected_dist_min_um.setFixedWidth(72)
+        self.spin_expected_dist_min_um.setToolTip(lbl_exp.toolTip())
+        self.spin_expected_dist_min_um.valueChanged.connect(self._on_expected_dist_changed)
+        self.spin_expected_dist_max_um = NoWheelDoubleSpinBox()
+        self.spin_expected_dist_max_um.setRange(0.0, 10000.0)
+        self.spin_expected_dist_max_um.setDecimals(1)
+        self.spin_expected_dist_max_um.setValue(0.0)
+        self.spin_expected_dist_max_um.setFixedWidth(72)
+        self.spin_expected_dist_max_um.setToolTip(lbl_exp.toolTip())
+        self.spin_expected_dist_max_um.valueChanged.connect(self._on_expected_dist_changed)
+        exp_row.addWidget(lbl_exp)
+        exp_row.addWidget(QLabel("Min"))
+        exp_row.addWidget(self.spin_expected_dist_min_um)
+        exp_row.addWidget(QLabel("Max"))
+        exp_row.addWidget(self.spin_expected_dist_max_um)
+        exp_row.addStretch(1)
+        left_layout.insertLayout(insert_idx, exp_row)
 
         self.lbl_batch_valley_roi_hint = QLabel("")
         self.lbl_batch_valley_roi_hint.hide()
@@ -416,48 +451,53 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         thresh_percent = self.spin_batch_p2_thresh_percent.value()
         power = self._centroid_power_for_mode(p2_mode)
 
-        info = find_dual_peak_valley_y(matrix2, roi=self._get_valley_roi_tuple())
+        info = find_dual_peak_valley_y(matrix2, **self._get_dual_valley_kwargs())
         split_y = info["valley_y"]
         split_y_i = split_y_index(split_y)
         split_cx = info["cx"]
 
-        m2_x, m2_y = None, None
-        if p2_mode == "manual":
-            if manual_below:
-                m2_x, m2_y = manual_below
+        saved_locate = self.batch_locate_bounds
+        self.batch_locate_bounds = info.get("locate_bounds")
+        try:
+            m2_x, m2_y = None, None
+            if p2_mode == "manual":
+                if manual_below:
+                    m2_x, m2_y = manual_below
+                else:
+                    m2_x = split_cx if split_cx is not None else matrix2.shape[1] // 2
+                    m2_y = max(0, split_y_i - 1)
+            elif p2_mode == "auto_min":
+                p2 = self._find_min_below_y(matrix2, split_y)
+                if p2 is not None:
+                    m2_x, m2_y = p2
+            elif p2_mode == "m2_inscribed":
+                p2 = self._find_inscribed_circle_below_y(
+                    matrix2, split_y, use_thresh, thresh_percent
+                )
+                if p2 is not None:
+                    m2_x, m2_y, _r = p2
             else:
-                m2_x = split_cx if split_cx is not None else matrix2.shape[1] // 2
-                m2_y = max(0, split_y_i - 1)
-        elif p2_mode == "auto_min":
-            p2 = self._find_min_below_y(matrix2, split_y)
-            if p2 is not None:
-                m2_x, m2_y = p2
-        elif p2_mode == "m2_inscribed":
-            p2 = self._find_inscribed_circle_below_y(
-                matrix2, split_y, use_thresh, thresh_percent
+                center_mode = "thresh_geom" if p2_mode == "m2_thresh_geom" else "centroid"
+                p2 = self._find_center_below_y(
+                    matrix2, split_y, center_mode, use_thresh, thresh_percent, power=power
+                )
+                if p2 is not None:
+                    m2_x, m2_y = p2
+
+            if m2_x is None or m2_y is None:
+                return None, None
+
+            if p2_mode == "manual" and manual_above:
+                return (m2_x, m2_y), manual_above
+
+            m2a = self._compute_m2_above_point_for_matrix(
+                matrix2, split_y, p2_mode, use_thresh, thresh_percent, power=power
             )
-            if p2 is not None:
-                m2_x, m2_y, _r = p2
-        else:
-            center_mode = "thresh_geom" if p2_mode == "m2_thresh_geom" else "centroid"
-            p2 = self._find_center_below_y(
-                matrix2, split_y, center_mode, use_thresh, thresh_percent, power=power
-            )
-            if p2 is not None:
-                m2_x, m2_y = p2
-
-        if m2_x is None or m2_y is None:
-            return None, None
-
-        if p2_mode == "manual" and manual_above:
-            return (m2_x, m2_y), manual_above
-
-        m2a = self._compute_m2_above_point_for_matrix(
-            matrix2, split_y, p2_mode, use_thresh, thresh_percent, power=power
-        )
-        if m2a is None:
-            return (m2_x, m2_y), None
-        return (m2_x, m2_y), m2a
+            if m2a is None:
+                return (m2_x, m2_y), None
+            return (m2_x, m2_y), m2a
+        finally:
+            self.batch_locate_bounds = saved_locate
 
     def _compute_distance_um_for_group(self, idx, p2_mode=None):
         if idx < 0 or idx >= self.batch_total_count:
@@ -647,6 +687,100 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             return
         if hasattr(self, "matrix2") and self.matrix2 is not None:
             self.update_batch_calculations(silent=True)
+
+    def _on_expected_dist_changed(self, _value=None):
+        self.update_batch_calculations()
+
+    def _get_dual_valley_kwargs(self):
+        kwargs = {
+            "roi": self._get_valley_roi_tuple(),
+            "min_peak_distance": 5,
+            "pixel_pitch_um": self.batch_pixel_pitch_um,
+        }
+        if hasattr(self, "spin_expected_dist_min_um"):
+            vmin = float(self.spin_expected_dist_min_um.value())
+            if vmin > 0:
+                kwargs["expected_distance_min_um"] = vmin
+        if hasattr(self, "spin_expected_dist_max_um"):
+            vmax = float(self.spin_expected_dist_max_um.value())
+            if vmax > 0:
+                kwargs["expected_distance_max_um"] = vmax
+        return kwargs
+
+    def _locate_bounds(self):
+        return getattr(self, "batch_locate_bounds", None)
+
+    def _find_inscribed_circle_below_y(self, matrix, y1, use_thresh, thresh_percent):
+        sub, x0, y0 = intersect_half_with_locate_band(
+            matrix, y1, "below", self._locate_bounds()
+        )
+        if sub is not None and sub.size > 0:
+            result = self._fit_inscribed_circle(sub, use_thresh, thresh_percent)
+            if result is not None:
+                cx, cy, radius = result
+                return (cx + x0, cy + y0, radius)
+        return super()._find_inscribed_circle_below_y(matrix, y1, use_thresh, thresh_percent)
+
+    def _find_inscribed_circle_above_y(self, matrix, y1, use_thresh, thresh_percent):
+        sub, x0, y0 = intersect_half_with_locate_band(
+            matrix, y1, "above", self._locate_bounds()
+        )
+        if sub is not None and sub.size > 0:
+            result = self._fit_inscribed_circle(sub, use_thresh, thresh_percent)
+            if result is not None:
+                cx, cy, radius = result
+                return (cx + x0, cy + y0, radius)
+        return super()._find_inscribed_circle_above_y(matrix, y1, use_thresh, thresh_percent)
+
+    def _find_center_below_y(self, matrix, y1, mode, use_thresh, thresh_percent, power=1.0):
+        sub, x0, y0 = intersect_half_with_locate_band(
+            matrix, y1, "below", self._locate_bounds()
+        )
+        if sub is not None and sub.size > 0:
+            pt = self._compute_auto_spot_center(
+                sub, mode, use_thresh, thresh_percent, power=power
+            )
+            if pt is not None:
+                return (pt[0] + x0, pt[1] + y0)
+        return super()._find_center_below_y(
+            matrix, y1, mode, use_thresh, thresh_percent, power=power
+        )
+
+    def _find_center_above_y(self, matrix, y1, mode, use_thresh, thresh_percent, power=1.0):
+        sub, x0, y0 = intersect_half_with_locate_band(
+            matrix, y1, "above", self._locate_bounds()
+        )
+        if sub is not None and sub.size > 0:
+            pt = self._compute_auto_spot_center(
+                sub, mode, use_thresh, thresh_percent, power=power
+            )
+            if pt is not None:
+                return (pt[0] + x0, pt[1] + y0)
+        return super()._find_center_above_y(
+            matrix, y1, mode, use_thresh, thresh_percent, power=power
+        )
+
+    def _find_min_below_y(self, matrix, y1):
+        sub, x0, y0 = intersect_half_with_locate_band(
+            matrix, y1, "below", self._locate_bounds()
+        )
+        if sub is not None and sub.size > 0:
+            min_val = np.min(sub)
+            ys, xs = np.where(sub == min_val)
+            if len(xs) > 0:
+                return (float(np.mean(xs)) + x0, float(np.mean(ys)) + y0)
+        return super()._find_min_below_y(matrix, y1)
+
+    def _find_min_above_y(self, matrix, y1):
+        sub, x0, y0 = intersect_half_with_locate_band(
+            matrix, y1, "above", self._locate_bounds()
+        )
+        if sub is not None and sub.size > 0:
+            min_val = np.min(sub)
+            ys, xs = np.where(sub == min_val)
+            if len(xs) > 0:
+                return (float(np.mean(xs)) + x0, float(np.mean(ys)) + y0)
+        return super()._find_min_above_y(matrix, y1)
 
     def _get_valley_roi_tuple(self):
         """回傳使用者輸入的 (x, y, width, height)；未啟用則 None。"""
@@ -1094,13 +1228,13 @@ class DataRayBatchM2Tab(DataRayBatchTab):
     # 核心：波谷切分 + M2 above／below
     # ------------------------------------------------------------------
     def _compute_split_y_from_m2(self):
-        """以 M2 質心 X 縱切，找雙峰波谷 Y（可限於框選 ROI）。"""
-        roi = self._get_valley_roi_tuple()
-        info = find_dual_peak_valley_y(self.matrix2, roi=roi)
+        """以 M2 最佳局部雙峰波谷 Y 切分（可限於框選 ROI + 自動定位帶）。"""
+        info = find_dual_peak_valley_y(self.matrix2, **self._get_dual_valley_kwargs())
         self.batch_split_y = info["valley_y"]
         self.batch_split_cx = info["cx"]
         self.batch_split_peak_ys = info["peak_ys"]
         self.batch_valley_roi_bounds = info.get("roi")
+        self.batch_locate_bounds = info.get("locate_bounds")
         # 相容：把「切分點」放在 batch_m1_center_point，供匯出／十字複用欄位語意
         self.batch_m1_center_point = (self.batch_split_cx, self.batch_split_y)
         return self.batch_split_y
@@ -1458,6 +1592,8 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             "valley_roi_y": self.spin_batch_valley_roi_y.value(),
             "valley_roi_w": self.spin_batch_valley_roi_w.value(),
             "valley_roi_h": self.spin_batch_valley_roi_h.value(),
+            "expected_dist_min_um": self.spin_expected_dist_min_um.value(),
+            "expected_dist_max_um": self.spin_expected_dist_max_um.value(),
         }
         QMessageBox.information(
             self, "暫存成功", f"第 {self.batch_current_idx + 1} 組參數與位置已暫存！"
@@ -1505,6 +1641,19 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                 spin.blockSignals(True)
                 spin.setValue(int(params.get(key, default)))
                 spin.blockSignals(False)
+
+        if hasattr(self, "spin_expected_dist_min_um"):
+            self.spin_expected_dist_min_um.blockSignals(True)
+            self.spin_expected_dist_min_um.setValue(
+                float(params.get("expected_dist_min_um", 0.0))
+            )
+            self.spin_expected_dist_min_um.blockSignals(False)
+        if hasattr(self, "spin_expected_dist_max_um"):
+            self.spin_expected_dist_max_um.blockSignals(True)
+            self.spin_expected_dist_max_um.setValue(
+                float(params.get("expected_dist_max_um", 0.0))
+            )
+            self.spin_expected_dist_max_um.blockSignals(False)
 
         self.batch_m2_center_point = params.get("m2_center_point")
         self.batch_m2_above_point = params.get("m2_above_point")
