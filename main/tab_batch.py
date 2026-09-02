@@ -1,13 +1,9 @@
 import os
 import json
 import csv
-import zipfile
-import tempfile
-import shutil
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
-import pyqtgraph.exporters as pg_export
 from scipy.ndimage import uniform_filter, label as ndi_label, distance_transform_edt
 
 from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QPushButton, 
@@ -30,7 +26,9 @@ from shared_components import (NoWheelSpinBox, NoWheelDoubleSpinBox,
                                configure_equal_profile_strips,
                                LevelAlignedHistogramLUTItem,
                                enforce_square_heatmap_cell,
-                               PROFILE_SIDE_AXIS_PX, PROFILE_EDGE_AXIS_PX)
+                               PROFILE_SIDE_AXIS_PX, PROFILE_EDGE_AXIS_PX,
+                               export_plot_image, save_qpixmap_export,
+                               EXPORT_IMAGE_EXT, export_timestamp_tag)
 from batch_data_loader import load_numeric_matrix, scan_location_files
 
 
@@ -706,7 +704,7 @@ class DataRayBatchTab(QWidget):
         self.btn_batch_view_m2.clicked.connect(self.show_batch_m2_heatmap)
         top_bar.addWidget(self.btn_batch_view_m2)
 
-        self.btn_batch_export = QPushButton("一鍵匯出 (ZIP 壓縮包)")
+        self.btn_batch_export = QPushButton("一鍵匯出到資料夾")
         self.btn_batch_export.setStyleSheet(btn_style_export)
         self.btn_batch_export.setMinimumHeight(38)
         self.btn_batch_export.setFixedWidth(240)
@@ -855,6 +853,8 @@ class DataRayBatchTab(QWidget):
         self.batch_available_locations = []
         self.batch_matrix_cache.clear()
         self.batch_result_cache.clear()
+        self._last_m1_loc_map = {}
+        self._last_m2_loc_map = {}
 
         if not self.batch_m1_root or not self.batch_m2_root:
             if hasattr(self, "lbl_batch_pair_info"):
@@ -867,6 +867,8 @@ class DataRayBatchTab(QWidget):
 
         m1_map = self._scan_location_files(self.batch_m1_root)
         m2_map = self._scan_location_files(self.batch_m2_root)
+        self._last_m1_loc_map = m1_map
+        self._last_m2_loc_map = m2_map
         common_locs = sorted(set(m1_map.keys()) & set(m2_map.keys()), key=self._natural_sort_key)
 
         pairs_by_loc = {}
@@ -980,17 +982,32 @@ class DataRayBatchTab(QWidget):
         dir_path = QFileDialog.getExistingDirectory(self, "選擇 M1 主資料夾（內含位置子資料夾）", "")
         if not dir_path:
             return
-        loc_map = self._scan_location_files(dir_path)
-        if not loc_map:
-            QMessageBox.warning(
-                self, "警告",
-                "此資料夾下找不到「位置子資料夾／Excel或CSV」結構。\n"
-                "預期格式：M1/<位置名>/<檔名>.xlsx 或 <檔名>.csv"
-            )
-            return
         self.batch_m1_root = dir_path
-        n_files = sum(len(v) for v in loc_map.values())
+        if not self.batch_m2_root:
+            loc_map = self._scan_location_files(dir_path)
+            if not loc_map:
+                self.batch_m1_root = ""
+                QMessageBox.warning(
+                    self, "警告",
+                    "此資料夾下找不到「位置子資料夾／Excel或CSV」結構。\n"
+                    "預期格式：M1/<位置名>/<檔名>.xlsx 或 <檔名>.csv"
+                )
+                return
+            locs = sorted(loc_map.keys(), key=self._natural_sort_key)
+            n_files = sum(len(v) for v in loc_map.values())
+            self.lbl_batch_m1_info.setText(
+                f"{os.path.basename(dir_path)}｜位置 {len(locs)} 個｜檔案 {n_files} 筆\n"
+                f"位置: {', '.join(locs[:10])}{'...' if len(locs) > 10 else ''}"
+            )
+            if not self.save_dir_path:
+                self.save_dir_path = dir_path
+                self.lbl_batch_dir_path.setText(f"{dir_path}")
+            return
+
+        self._rebuild_batch_pairs()
+        loc_map = getattr(self, "_last_m1_loc_map", {})
         locs = sorted(loc_map.keys(), key=self._natural_sort_key)
+        n_files = sum(len(v) for v in loc_map.values())
         self.lbl_batch_m1_info.setText(
             f"{os.path.basename(dir_path)}｜位置 {len(locs)} 個｜檔案 {n_files} 筆\n"
             f"位置: {', '.join(locs[:10])}{'...' if len(locs) > 10 else ''}"
@@ -998,28 +1015,38 @@ class DataRayBatchTab(QWidget):
         if not self.save_dir_path:
             self.save_dir_path = dir_path
             self.lbl_batch_dir_path.setText(f"{dir_path}")
-        self._rebuild_batch_pairs()
 
     def load_batch_m2_folder(self):
         dir_path = QFileDialog.getExistingDirectory(self, "選擇 M2 主資料夾（內含位置子資料夾）", "")
         if not dir_path:
             return
-        loc_map = self._scan_location_files(dir_path)
-        if not loc_map:
-            QMessageBox.warning(
-                self, "警告",
-                "此資料夾下找不到「位置子資料夾／Excel或CSV」結構。\n"
-                "預期格式：M2/<位置名>/<檔名>.xlsx 或 <檔名>.csv"
+        self.batch_m2_root = dir_path
+        if not self.batch_m1_root:
+            loc_map = self._scan_location_files(dir_path)
+            if not loc_map:
+                self.batch_m2_root = ""
+                QMessageBox.warning(
+                    self, "警告",
+                    "此資料夾下找不到「位置子資料夾／Excel或CSV」結構。\n"
+                    "預期格式：M2/<位置名>/<檔名>.xlsx 或 <檔名>.csv"
+                )
+                return
+            locs = sorted(loc_map.keys(), key=self._natural_sort_key)
+            n_files = sum(len(v) for v in loc_map.values())
+            self.lbl_batch_m2_info.setText(
+                f"{os.path.basename(dir_path)}｜位置 {len(locs)} 個｜檔案 {n_files} 筆\n"
+                f"位置: {', '.join(locs[:10])}{'...' if len(locs) > 10 else ''}"
             )
             return
-        self.batch_m2_root = dir_path
-        n_files = sum(len(v) for v in loc_map.values())
+
+        self._rebuild_batch_pairs()
+        loc_map = getattr(self, "_last_m2_loc_map", {})
         locs = sorted(loc_map.keys(), key=self._natural_sort_key)
+        n_files = sum(len(v) for v in loc_map.values())
         self.lbl_batch_m2_info.setText(
             f"{os.path.basename(dir_path)}｜位置 {len(locs)} 個｜檔案 {n_files} 筆\n"
             f"位置: {', '.join(locs[:10])}{'...' if len(locs) > 10 else ''}"
         )
-        self._rebuild_batch_pairs()
 
     def process_batch_data(self):
         if not self.batch_m1_root or not self.batch_m2_root:
@@ -1322,18 +1349,18 @@ class DataRayBatchTab(QWidget):
             QMessageBox.warning(self, "警告", "請先點擊「選擇儲存資料夾」按鈕以指定儲存路徑！")
             return
 
-        zip_path = os.path.join(self.save_dir_path, "DataRay_Batch_Results.zip")
-        summary_csv_path = os.path.join(self.save_dir_path, "Result_Spot_Analysis.csv")
+        ts = export_timestamp_tag()
+        export_root = os.path.join(self.save_dir_path, f"DataRay_Batch_Results_{ts}")
+        summary_csv_path = os.path.join(export_root, "Result_Spot_Analysis.csv")
         prev_idx = self.batch_current_idx
-        tmp_root = None
 
         try:
-            self.lbl_batch_status.setText("狀態: 正在匯出 ZIP...")
+            self.lbl_batch_status.setText("狀態: 正在匯出到資料夾...")
             self.lbl_batch_status.setStyleSheet("color: #F57C00; font-weight: bold; font-size: 12px;")
             self.btn_batch_export.setEnabled(False)
             QApplication.processEvents()
 
-            tmp_root = tempfile.mkdtemp(prefix="dataray_batch_export_")
+            os.makedirs(export_root, exist_ok=True)
             summary_columns = []  # [(col_name, {item: value, ...}, {item: unit, ...})]
             item_order = []
 
@@ -1348,7 +1375,7 @@ class DataRayBatchTab(QWidget):
                     safe_loc = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(loc))
                     safe_fname = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(fname))
                     group_name = f"Group_{idx + 1:02d}_{safe_loc}_{safe_fname}"
-                group_dir = os.path.join(tmp_root, group_name)
+                group_dir = os.path.join(export_root, group_name)
                 os.makedirs(group_dir, exist_ok=True)
                 base_path = os.path.join(group_dir, "Result")
 
@@ -1363,19 +1390,9 @@ class DataRayBatchTab(QWidget):
                             item_order.append(item)
                     summary_columns.append((group_name, value_map, unit_map))
 
-            # 主資料夾彙整 CSV：欄位 = Item / Unit / 各組名稱
             self._write_spot_analysis_summary_csv(
                 summary_csv_path, item_order, summary_columns
             )
-            # 同步放一份進 ZIP 根目錄，方便帶走
-            shutil.copy2(summary_csv_path, os.path.join(tmp_root, "Result_Spot_Analysis.csv"))
-
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for root, _dirs, files in os.walk(tmp_root):
-                    for name in files:
-                        abs_path = os.path.join(root, name)
-                        arcname = os.path.relpath(abs_path, tmp_root)
-                        zipf.write(abs_path, arcname)
 
             self.load_batch_group(prev_idx)
             self.lbl_batch_status.setText("狀態: 所有檔案匯出成功！")
@@ -1384,7 +1401,7 @@ class DataRayBatchTab(QWidget):
             QMessageBox.information(
                 self, "成功",
                 f"匯出完成！\n\n"
-                f"ZIP：\n{zip_path}\n\n"
+                f"資料夾：\n{export_root}\n\n"
                 f"彙整統計 CSV：\n{summary_csv_path}\n\n"
                 f"每組內容：\n"
                 f"• Result.json\n"
@@ -1392,11 +1409,11 @@ class DataRayBatchTab(QWidget):
                 f"• Result_Result.csv\n"
                 f"• Result_Result.npy\n"
                 f"• Result_Spot_Analysis.xlsx\n"
-                f"• Result_Heatmap.png\n"
-                f"• Result_V_Profile.png（縱剖面）\n"
-                f"• Result_H_Profile.png（橫剖面）\n"
-                f"• Result_Heatmap_With_Profiles.png（熱圖＋剖面合成）\n"
-                f"• Result_Contour.png"
+                f"• Result_Heatmap{EXPORT_IMAGE_EXT}\n"
+                f"• Result_V_Profile{EXPORT_IMAGE_EXT}（縱剖面）\n"
+                f"• Result_H_Profile{EXPORT_IMAGE_EXT}（橫剖面）\n"
+                f"• Result_Heatmap_With_Profiles{EXPORT_IMAGE_EXT}（熱圖＋剖面合成）\n"
+                f"• Result_Contour{EXPORT_IMAGE_EXT}"
             )
         except Exception as e:
             try:
@@ -1407,9 +1424,6 @@ class DataRayBatchTab(QWidget):
             self.lbl_batch_status.setStyleSheet("color: #C62828; font-weight: bold; font-size: 12px;")
             self.btn_batch_export.setEnabled(True)
             QMessageBox.critical(self, "匯出錯誤", f"匯出過程發生錯誤：\n{str(e)}")
-        finally:
-            if tmp_root and os.path.isdir(tmp_root):
-                shutil.rmtree(tmp_root, ignore_errors=True)
 
     def _write_spot_analysis_summary_csv(self, csv_path, item_order, summary_columns):
         """
@@ -1606,13 +1620,13 @@ class DataRayBatchTab(QWidget):
             ws_spot.append(r)
         wb_spot.save(spot_analysis_excel_path)
 
-        heatmap_img_path = f"{base_path}_Heatmap.png"
-        pg_export.ImageExporter(self.plot_batch_heat).export(heatmap_img_path)
+        heatmap_img_path = f"{base_path}_Heatmap{EXPORT_IMAGE_EXT}"
+        export_plot_image(self.plot_batch_heat, heatmap_img_path)
 
         # 一併匯出當下點選的縱／橫剖面與合成圖
         self._export_batch_profile_images(base_path)
 
-        contour_img_path = f"{base_path}_Contour.png"
+        contour_img_path = f"{base_path}_Contour{EXPORT_IMAGE_EXT}"
         smoothed = uniform_filter(self.batch_result_matrix, size=31, mode='nearest')
         temp_win = pg.GraphicsLayoutWidget()
         plot_contour = temp_win.addPlot(title="Smoothed Contour Map")
@@ -1627,7 +1641,7 @@ class DataRayBatchTab(QWidget):
             iso = pg.IsocurveItem(data=smoothed.T, level=level, pen=pg.mkPen('w', width=0.8))
             plot_contour.addItem(iso)
         QApplication.processEvents()
-        pg_export.ImageExporter(plot_contour).export(contour_img_path)
+        export_plot_image(plot_contour, contour_img_path)
         temp_win.close()
         temp_win.deleteLater()
         return spot_rows
@@ -1651,23 +1665,22 @@ class DataRayBatchTab(QWidget):
 
         QApplication.processEvents()
 
-        v_path = f"{base_path}_V_Profile.png"
-        h_path = f"{base_path}_H_Profile.png"
-        composite_path = f"{base_path}_Heatmap_With_Profiles.png"
+        v_path = f"{base_path}_V_Profile{EXPORT_IMAGE_EXT}"
+        h_path = f"{base_path}_H_Profile{EXPORT_IMAGE_EXT}"
+        composite_path = f"{base_path}_Heatmap_With_Profiles{EXPORT_IMAGE_EXT}"
 
         try:
-            pg_export.ImageExporter(self.plot_batch_y_profile).export(v_path)
+            export_plot_image(self.plot_batch_y_profile, v_path)
         except Exception:
             pass
         try:
-            pg_export.ImageExporter(self.plot_batch_x_profile).export(h_path)
+            export_plot_image(self.plot_batch_x_profile, h_path)
         except Exception:
             pass
         try:
-            # 合成：熱圖 + 左／下剖面 + 色條（與畫面所見一致）
             pix = self.win_batch_top.grab()
             if not pix.isNull():
-                pix.save(composite_path, "PNG")
+                save_qpixmap_export(pix, composite_path)
         except Exception:
             pass
 

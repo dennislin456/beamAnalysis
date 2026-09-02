@@ -2,7 +2,6 @@ import os
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
-import pyqtgraph.exporters as pg_export
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel,
@@ -17,6 +16,12 @@ from shared_components import (
     export_stamped_filename,
     export_stamped_path,
     export_timestamp_tag,
+    export_plot_image,
+    EXPORT_IMAGE_EXT,
+    EXPORT_IMAGE_FILTER,
+    normalize_export_image_path,
+    finite_value_minmax,
+    sanitize_numeric_values,
 )
 
 
@@ -217,26 +222,50 @@ class MappingRoiWindow(QMainWindow):
             self.panel.plot.removeItem(self.selected_point_item)
             self.selected_point_item = None
 
+    def _sync_roi_profile_point_for_export(self):
+        """匯出前同步剖面至目前選點或中心。"""
+        ny, nx = self.matrix.shape
+        if self.selected_point is not None:
+            ix, iy = self.selected_point
+        elif self.panel._profile_point is not None:
+            ix, iy = self.panel._profile_point
+        else:
+            ix, iy = nx // 2, ny // 2
+        self.panel.set_profile_point(ix, iy, reset_view=False)
+        QApplication.processEvents()
+
     def export_roi(self):
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "匯出 Mapping 範圍",
             export_stamped_filename("mapping_roi"),
-            "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)",
+            EXPORT_IMAGE_FILTER,
         )
         if not save_path:
             return
+        selected_item = self.selected_point_item
         try:
+            save_path = normalize_export_image_path(save_path)
             base = os.path.splitext(save_path)[0]
-            exporter = pg_export.ImageExporter(self.panel.plot)
-            exporter.parameters()["width"] = max(int(self.panel.plot.width()), 400)
-            exporter.parameters()["height"] = max(int(self.panel.plot.height()), 300)
-            selected_item = self.selected_point_item
+
+            self._sync_roi_profile_point_for_export()
+
             if selected_item is not None:
                 selected_item.hide()
+            for item in self.extrema_items:
+                try:
+                    item.hide()
+                except Exception:
+                    pass
             try:
-                exporter.export(save_path)
+                exported_images = list(self.panel.export_plot_bundle(base))
             finally:
+                show_extrema = bool(getattr(self.panel, "_show_profile_cross", True))
+                for item in self.extrema_items:
+                    try:
+                        item.setVisible(show_extrema)
+                    except Exception:
+                        pass
                 if selected_item is not None:
                     selected_item.show()
 
@@ -248,13 +277,23 @@ class MappingRoiWindow(QMainWindow):
                 ):
                     fh.write(f"{x:.6f},{y:.6f},{value:.6f}\n")
             np.save(f"{base}.npy", self.matrix)
+            image_list = "\n".join(exported_images)
             QMessageBox.information(
                 self,
                 "匯出完成",
-                f"圖片：\n{save_path}\n\nCSV：\n{csv_path}\n\nNPY：\n{base}.npy",
+                f"圖片：\n{image_list}\n\nCSV：\n{csv_path}\n\nNPY：\n{base}.npy",
             )
         except Exception as exc:
             QMessageBox.critical(self, "匯出失敗", f"無法匯出範圍資料：\n{exc}")
+        finally:
+            if selected_item is not None:
+                selected_item.show()
+            show_extrema = bool(getattr(self.panel, "_show_profile_cross", True))
+            for item in self.extrema_items:
+                try:
+                    item.setVisible(show_extrema)
+                except Exception:
+                    pass
 
 
 def iter_finite_mapping_points(x_coords, y_coords, matrix):
@@ -847,18 +886,21 @@ class MappingGradientWindow(QMainWindow):
             self,
             f"匯出 {slot['title']}",
             export_stamped_filename(safe),
-            "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)",
+            EXPORT_IMAGE_FILTER,
         )
         if not path:
             return
         hidden = self._hide_all_selection_boxes()
         try:
             target = getattr(slot["panel"].win, "ci", None) or slot["panel"].plot
-            exporter = pg_export.ImageExporter(target)
-            exporter.parameters()["width"] = max(int(slot["panel"].win.width()), 400)
-            exporter.parameters()["height"] = max(int(slot["panel"].win.height()), 300)
-            exporter.export(path)
-            QMessageBox.information(self, "匯出完成", f"已匯出：\n{path}")
+            export_plot_image(
+                target,
+                path,
+                width=max(int(slot["panel"].win.width()), 400),
+                height=max(int(slot["panel"].win.height()), 300),
+            )
+            out_path = normalize_export_image_path(path)
+            QMessageBox.information(self, "匯出完成", f"已匯出：\n{out_path}")
         except Exception as exc:
             QMessageBox.critical(self, "匯出失敗", f"無法匯出圖檔：\n{exc}")
         finally:
@@ -871,10 +913,10 @@ class MappingGradientWindow(QMainWindow):
         avg = self._current_avg_size()
         stamp = export_timestamp_tag()
         names = {
-            "gx": f"01_X_gradient_avg{avg}_{stamp}.png",
-            "gy": f"02_Y_gradient_avg{avg}_{stamp}.png",
-            "g_avg": f"03_mean_gradient_avg{avg}_{stamp}.png",
-            "g_ang": f"04_gradient_angle_avg{avg}_{stamp}.png",
+            "gx": f"01_X_gradient_avg{avg}_{stamp}{EXPORT_IMAGE_EXT}",
+            "gy": f"02_Y_gradient_avg{avg}_{stamp}{EXPORT_IMAGE_EXT}",
+            "g_avg": f"03_mean_gradient_avg{avg}_{stamp}{EXPORT_IMAGE_EXT}",
+            "g_ang": f"04_gradient_angle_avg{avg}_{stamp}{EXPORT_IMAGE_EXT}",
         }
         restore = self._prepare_clean_export_overlays()
         # 等 layout 收掉 colorbar 再匯出，避免空白邊
@@ -884,10 +926,12 @@ class MappingGradientWindow(QMainWindow):
             for slot in self.plot_slots:
                 path = os.path.join(folder, names[slot["key"]])
                 target = getattr(slot["panel"].win, "ci", None) or slot["panel"].plot
-                exporter = pg_export.ImageExporter(target)
-                exporter.parameters()["width"] = max(int(slot["panel"].win.width()), 400)
-                exporter.parameters()["height"] = max(int(slot["panel"].win.height()), 300)
-                exporter.export(path)
+                export_plot_image(
+                    target,
+                    path,
+                    width=max(int(slot["panel"].win.width()), 400),
+                    height=max(int(slot["panel"].win.height()), 300),
+                )
                 saved.append(path)
             QMessageBox.information(
                 self,
@@ -921,14 +965,7 @@ class MappingGradientWindow(QMainWindow):
 
     @staticmethod
     def _finite_minmax(matrix):
-        finite = np.asarray(matrix, dtype=float)
-        finite = finite[np.isfinite(finite)]
-        if finite.size == 0:
-            return 0.0, 1.0
-        vmin, vmax = float(np.min(finite)), float(np.max(finite))
-        if vmin == vmax:
-            vmax = vmin + 1.0
-        return vmin, vmax
+        return finite_value_minmax(matrix)
 
     @staticmethod
     def _image_rect(matrix, x_coords, y_coords):
@@ -1191,15 +1228,7 @@ class MappingTab(QWidget):
         return QRectF(x0 - dx / 2, y0 - dy / 2, dx * matrix.shape[1], dy * matrix.shape[0])
 
     def _finite_minmax(self, matrix):
-        finite = np.asarray(matrix, dtype=float)
-        finite = finite[np.isfinite(finite)]
-        if finite.size == 0:
-            return 0.0, 1.0
-        vmin, vmax = float(np.min(finite)), float(np.max(finite))
-        if vmin == vmax:
-            vmin -= 1.0
-            vmax += 1.0
-        return vmin, vmax
+        return finite_value_minmax(matrix)
 
     def _grid_spacing(self, coords):
         """直接使用座標資料 step 畫主要格線。"""
@@ -1251,7 +1280,7 @@ class MappingTab(QWidget):
 
     def _read_mapping_file(self, file_path):
         if file_path.lower().endswith(".npy"):
-            matrix = np.asarray(np.load(file_path), dtype=float)
+            matrix = sanitize_numeric_values(np.asarray(np.load(file_path), dtype=float))
             if matrix.ndim != 2:
                 raise ValueError("NPY 必須是二維數值矩陣。")
             return matrix, np.arange(matrix.shape[1], dtype=float), np.arange(matrix.shape[0], dtype=float), None
@@ -1274,7 +1303,7 @@ class MappingTab(QWidget):
             raise ValueError("CSV 檔案不含有效的 x_rel_mm / y_rel_mm / value 資料。")
         x_vals = np.asarray(df["x_rel_mm"], dtype=float)
         y_vals = np.asarray(df["y_rel_mm"], dtype=float)
-        z_vals = np.asarray(df["value"], dtype=float)
+        z_vals = sanitize_numeric_values(np.asarray(df["value"], dtype=float))
         source_points = np.column_stack([x_vals, y_vals])
         x_unique = np.sort(np.unique(x_vals))
         y_unique = np.sort(np.unique(y_vals))
@@ -1373,10 +1402,12 @@ class MappingTab(QWidget):
             if self.mapping_matrix_f2 is None:
                 QMessageBox.warning(self, "提醒", "請先匯入 F2（Wafer）檔案。")
                 return
-            self.mapping_matrix = self.mapping_matrix_f1 - self.mapping_matrix_f2
+            self.mapping_matrix = sanitize_numeric_values(
+                self.mapping_matrix_f1 - self.mapping_matrix_f2
+            )
             plot_title = "Mapping Heatmap（F1 Chuck - F2 Wafer）"
         else:
-            self.mapping_matrix = self.mapping_matrix_f1.copy()
+            self.mapping_matrix = sanitize_numeric_values(self.mapping_matrix_f1.copy())
             plot_title = "Mapping Heatmap (mm)"
 
         raw_matrix = self.mapping_matrix
@@ -1777,32 +1808,42 @@ class MappingTab(QWidget):
             self,
             "匯出 Heatmap 檔名",
             export_stamped_path(self.export_dir, "mapping_heatmap"),
-            "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg);;所有檔案 (*)"
+            EXPORT_IMAGE_FILTER,
         )
         if not save_path:
             return
 
         avg_matrix = self._get_processed_matrix()
+        selected_item = self.selected_point_item
         try:
-            base_name = os.path.splitext(os.path.basename(save_path))[0]
-            ext = os.path.splitext(save_path)[1] or ".png"
-            heatmap_path = save_path
-            contour_path = os.path.join(self.export_dir, f"{base_name}_contour{ext}")
+            heatmap_path = normalize_export_image_path(save_path)
+            base_name = os.path.splitext(os.path.basename(heatmap_path))[0]
+            heatmap_base = os.path.join(self.export_dir, base_name)
+            contour_path = os.path.join(
+                self.export_dir, f"{base_name}_contour{EXPORT_IMAGE_EXT}"
+            )
 
-            # 選點紅框只供畫面判讀，匯出圖片時暫時移除。
-            selected_item = self.selected_point_item
             if selected_item is not None:
                 selected_item.hide()
-            for panel, out_path in (
-                (self.heatmap_panel, heatmap_path),
-                (self.contour_panel, contour_path),
-            ):
-                # 匯出主圖區域（含座標與格線），不包含右側 colorbar。
-                target = panel.plot
-                exporter = pg_export.ImageExporter(target)
-                exporter.parameters()["width"] = max(int(panel.plot.width()), 400)
-                exporter.parameters()["height"] = max(int(panel.plot.height()), 300)
-                exporter.export(out_path)
+            try:
+                exported_images = list(
+                    self.heatmap_panel.export_heatmap_only(heatmap_base)
+                )
+                restore_contour = self.contour_panel._prepare_clean_bundle_export()
+                try:
+                    QApplication.processEvents()
+                    export_plot_image(
+                        self.contour_panel.plot,
+                        contour_path,
+                        width=max(int(self.contour_panel.plot.width()), 400),
+                        height=max(int(self.contour_panel.plot.height()), 300),
+                    )
+                finally:
+                    restore_contour()
+                exported_images.append(contour_path)
+            finally:
+                if selected_item is not None:
+                    selected_item.show()
 
             csv_path = os.path.join(self.export_dir, f"{base_name}.csv")
             with open(csv_path, 'w', encoding='utf-8') as f:
@@ -1810,11 +1851,14 @@ class MappingTab(QWidget):
                 for x, y, value in self._iter_export_mapping_points(avg_matrix):
                     f.write(f"{x:.6f},{y:.6f},{value:.6f}\n")
 
-            self.lbl_status.setText("狀態: 已匯出 heatmap、contour 兩張圖與平均後 CSV")
+            self.lbl_status.setText(
+                "狀態: 已匯出 heatmap、contour 與平均後 CSV"
+            )
+            image_list = "\n".join(exported_images)
             QMessageBox.information(
                 self,
                 "匯出完成",
-                f"已匯出：\n{heatmap_path}\n{contour_path}\n\nCSV：\n{csv_path}"
+                f"已匯出：\n{image_list}\n\nCSV：\n{csv_path}",
             )
         except Exception as exc:
             QMessageBox.critical(self, "匯出失敗", f"無法匯出檔案：\n{str(exc)}")

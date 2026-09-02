@@ -4,10 +4,8 @@
 """
 import os
 import csv
-from datetime import datetime
 import numpy as np
 import pyqtgraph as pg
-import pyqtgraph.exporters as pg_export
 from scipy.ndimage import uniform_filter
 
 from PyQt5.QtWidgets import (
@@ -20,6 +18,7 @@ from PyQt5.QtCore import Qt
 from shared_components import (
     HeatmapViewerWindow, find_dual_peak_valley_y, split_y_index,
     NoWheelSpinBox, clip_roi_to_matrix,
+    save_qpixmap_export, EXPORT_IMAGE_EXT, export_timestamp_tag,
 )
 from batch_data_loader import load_numeric_matrix, scan_location_files
 from tab_batch import DataRayBatchTab, LocationConfigDialog
@@ -696,6 +695,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self.batch_available_locations = []
         self.batch_matrix_cache.clear()
         self.batch_result_cache.clear()
+        self._last_m2_loc_map = {}
 
         if not self.batch_m2_root:
             if hasattr(self, "lbl_batch_pair_info"):
@@ -707,6 +707,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             return
 
         m2_map = self._scan_location_files(self.batch_m2_root)
+        self._last_m2_loc_map = m2_map
         locs = sorted(m2_map.keys(), key=self._natural_sort_key)
 
         pairs_by_loc = {}
@@ -790,18 +791,17 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         if not root_dir or not os.path.isdir(root_dir):
             return nested
         try:
-            entries = os.listdir(root_dir)
+            entries = os.scandir(root_dir)
         except OSError:
             return nested
 
         buckets = {}
         for entry in entries:
-            mid_path = os.path.join(root_dir, entry)
-            if not os.path.isdir(mid_path):
+            if not entry.is_dir():
                 continue
-            child_map = scan_location_files(mid_path)
+            child_map = scan_location_files(entry.path)
             for loc, files in child_map.items():
-                buckets.setdefault(loc, []).append((entry, files))
+                buckets.setdefault(loc, []).append((entry.name, files))
         for loc, items in buckets.items():
             if len(items) == 1:
                 nested[loc] = items[0][1]
@@ -813,11 +813,14 @@ class DataRayBatchM2Tab(DataRayBatchTab):
 
         files = {}
         try:
-            for fname in os.listdir(root_dir):
+            for entry in os.scandir(root_dir):
+                if not entry.is_file():
+                    continue
+                fname = entry.name
                 if fname.startswith("~$"):
                     continue
                 if fname.lower().endswith((".xlsx", ".xls", ".csv", ".npy")):
-                    files[fname] = os.path.join(root_dir, fname)
+                    files[fname] = entry.path
         except OSError:
             return {}
         if files:
@@ -834,8 +837,14 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         )
         if not dir_path:
             return
-        loc_map = self._scan_location_files(dir_path)
-        if not loc_map:
+        self.batch_m2_root = dir_path
+        self.batch_m1_root = ""  # 明確不使用
+        if not self.save_dir_path:
+            self.save_dir_path = dir_path
+            self.lbl_batch_dir_path.setText(f"{dir_path}")
+        self._rebuild_batch_pairs()
+        if not self.batch_available_locations:
+            self.batch_m2_root = ""
             QMessageBox.warning(
                 self, "警告",
                 "此資料夾下找不到「位置子資料夾／資料檔」結構。\n"
@@ -843,18 +852,13 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                 "也可選上一層（會自動往下找位置資料夾），或直接選含資料檔的資料夾。"
             )
             return
-        self.batch_m2_root = dir_path
-        self.batch_m1_root = ""  # 明確不使用
-        n_files = sum(len(v) for v in loc_map.values())
-        locs = sorted(loc_map.keys(), key=self._natural_sort_key)
+        m2_map = getattr(self, "_last_m2_loc_map", {})
+        locs = sorted(m2_map.keys(), key=self._natural_sort_key)
+        n_files = sum(len(v) for v in m2_map.values())
         self.lbl_batch_m2_info.setText(
             f"{os.path.basename(dir_path)}｜位置 {len(locs)} 個｜檔案 {n_files} 筆\n"
             f"位置: {', '.join(locs[:10])}{'...' if len(locs) > 10 else ''}"
         )
-        if not self.save_dir_path:
-            self.save_dir_path = dir_path
-            self.lbl_batch_dir_path.setText(f"{dir_path}")
-        self._rebuild_batch_pairs()
 
     def process_batch_data(self):
         if not self.batch_m2_root:
@@ -1509,29 +1513,13 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         return "valley_split"
 
     def _finalize_export_snapshot(self, session):
-        import shutil
-        import zipfile
-
         self._write_spot_analysis_summary_csv(
             session["summary_csv_path"],
             session["item_order"],
             session["summary_columns"],
         )
 
-        # PNG 已經壓縮過；使用 ZIP_STORED，避免再次壓縮造成大量等待。
-        with zipfile.ZipFile(session["zip_path"], "w", zipfile.ZIP_STORED) as zipf:
-            for root, _dirs, files in os.walk(session["tmp_root"]):
-                for name in files:
-                    abs_path = os.path.join(root, name)
-                    arcname = os.path.relpath(abs_path, session["tmp_root"])
-                    zipf.write(abs_path, arcname)
-
     def _cleanup_export_session(self):
-        import shutil
-
-        session = self._export_session
-        if session and session.get("tmp_root") and os.path.isdir(session["tmp_root"]):
-            shutil.rmtree(session["tmp_root"], ignore_errors=True)
         self._export_session = None
 
     def _run_export_loop(self):
@@ -1565,19 +1553,19 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                     group_name = f"Group_{idx + 1:02d}_{safe_loc}_{safe_fname}"
 
                 # 同一位置的所有資料放在同一個資料夾，每筆資料使用獨立檔名。
-                group_dir = os.path.join(session["tmp_root"], safe_loc)
+                group_dir = os.path.join(session["export_root"], safe_loc)
                 os.makedirs(group_dir, exist_ok=True)
                 base_path = os.path.join(group_dir, f"Group_{idx + 1:04d}_{safe_fname}")
 
                 spot_rows = self._export_single_group_like_dataray(base_path, idx)
-                # 匯出只保留無 colorbar/標示的 Heatmap；參數與其他中間檔不放入 ZIP。
+                # 匯出只保留無 colorbar/標示的 Heatmap；略過其他中間檔。
                 for suffix in (
                     ".json",
                     "_Result.xlsx",
                     "_Spot_Analysis.xlsx",
-                    "_V_Profile.png",
-                    "_H_Profile.png",
-                    "_Contour.png",
+                    f"_V_Profile{EXPORT_IMAGE_EXT}",
+                    f"_H_Profile{EXPORT_IMAGE_EXT}",
+                    f"_Contour{EXPORT_IMAGE_EXT}",
                 ):
                     extra_path = f"{base_path}{suffix}"
                     if os.path.exists(extra_path):
@@ -1633,7 +1621,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
                     self,
                     "已暫停並輸出",
                     f"目前進度已匯出，可先查看：\n\n"
-                    f"ZIP：\n{session['zip_path']}\n\n"
+                    f"資料夾：\n{session['export_root']}\n\n"
                     f"彙整統計 CSV：\n{session['summary_csv_path']}\n\n"
                     f"目前進度：{session['next_idx']}/{self.batch_total_count}"
                 )
@@ -1648,9 +1636,9 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             self._set_export_controls(running=False, paused=False)
             QMessageBox.information(
                 self, "成功",
-                f"匯出完成！\n\nZIP：\n{session['zip_path']}\n\n"
+                f"匯出完成！\n\n資料夾：\n{session['export_root']}\n\n"
                 f"彙整統計 CSV：\n{session['summary_csv_path']}\n\n"
-                f"每個位置資料夾含各筆 Heatmap_With_Profiles.png（保留 X/Y 剖面，無 colorbar 與定位標示）"
+                f"每個位置資料夾含各筆 Heatmap_With_Profiles{EXPORT_IMAGE_EXT}（保留 X/Y 剖面，無 colorbar 與定位標示）"
             )
             self._cleanup_export_session()
             self._export_paused = False
@@ -1686,17 +1674,15 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             QMessageBox.information(self, "提示", "目前為暫停狀態，請按『續跑匯出』。")
             return
 
-        # 加上時間戳，避免同名覆蓋。
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_path = os.path.join(self.save_dir_path, f"DataRay_Batch_M2_Results_{ts}.zip")
-        summary_csv_path = os.path.join(self.save_dir_path, f"Result_Spot_Analysis_M2_{ts}.csv")
-        import tempfile
+        ts = export_timestamp_tag()
+        export_root = os.path.join(self.save_dir_path, f"DataRay_Batch_M2_Results_{ts}")
+        os.makedirs(export_root, exist_ok=True)
+        summary_csv_path = os.path.join(export_root, "Result_Spot_Analysis.csv")
 
         self._export_session = {
-            "zip_path": zip_path,
+            "export_root": export_root,
             "summary_csv_path": summary_csv_path,
             "prev_idx": self.batch_current_idx,
-            "tmp_root": tempfile.mkdtemp(prefix="dataray_batch_m2_export_"),
             "summary_columns": [],
             "item_order": [],
             "next_idx": 0,
@@ -1705,7 +1691,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
         self._export_in_progress = False
         self._export_pause_requested = False
         self._export_paused = False
-        self.lbl_batch_status.setText("狀態: 正在匯出 ZIP...")
+        self.lbl_batch_status.setText("狀態: 正在匯出到資料夾...")
         self.lbl_batch_status.setStyleSheet(
             "color: #F57C00; font-weight: bold; font-size: 12px;"
         )
@@ -1784,7 +1770,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             pix = self.win_batch_top.grab()
             if pix.isNull():
                 raise RuntimeError("無法擷取 Heatmap 圖片。")
-            if not pix.save(output_path, "PNG"):
+            if not save_qpixmap_export(pix, output_path):
                 raise RuntimeError("無法儲存 Heatmap 圖片。")
         finally:
             layout.setColumnFixedWidth(2, hist_width)
@@ -1865,7 +1851,7 @@ class DataRayBatchM2Tab(DataRayBatchTab):
             ["M2Above to M2Below Total Distance (Real)", dist_ab_um, "μm"],
             ["Cross Marker Size", 40, "px"],
         ]
-        heatmap_img_path = f"{base_path}_Heatmap_With_Profiles.png"
+        heatmap_img_path = f"{base_path}_Heatmap_With_Profiles{EXPORT_IMAGE_EXT}"
         self._export_heatmap_without_crosses(heatmap_img_path)
 
         return spot_rows

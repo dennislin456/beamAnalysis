@@ -3,7 +3,6 @@ import json
 import pandas as pd
 import numpy as np
 import pyqtgraph as pg
-import pyqtgraph.exporters as pg_export
 from PIL import Image
 import openpyxl
 from openpyxl.chart import LineChart, Reference
@@ -18,6 +17,7 @@ from PyQt5.QtCore import Qt
 from shared_components import (
     NoWheelSpinBox, NoWheelDoubleSpinBox, CrossProfileViewerWindow,
     apply_readable_plot_theme, LevelAlignedHistogramLUTItem,
+    export_plot_image, EXPORT_IMAGE_EXT,
 )
 
 class BaslerTab(QWidget):
@@ -1286,9 +1286,8 @@ class BaslerTab(QWidget):
 
             wb.save(excel_path)
 
-            img_path = f"{base_path}_Spot_Map.png"
-            exporter = pg_export.ImageExporter(self.plot_basler)
-            exporter.export(img_path)
+            img_path = f"{base_path}_Spot_Map{EXPORT_IMAGE_EXT}"
+            export_plot_image(self.plot_basler, img_path)
 
             QMessageBox.information(
                 self, 
