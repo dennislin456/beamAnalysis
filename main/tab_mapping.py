@@ -513,11 +513,7 @@ class LineProfilePlotPanel(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(4)
-        tip = QLabel("滾輪縮放 · 拖曳平移 · 雙擊復原 · 點擊顯示數值（無圖上標記）")
-        tip.setStyleSheet("color: #607D8B; font-size: 11px;")
-        tip.setWordWrap(True)
-        root.addWidget(tip)
+        root.setSpacing(0)
 
         self.plot = pg.PlotWidget(title="沿線段剖面")
         self.plot.setLabel("bottom", "X (mm)")
@@ -751,6 +747,11 @@ class MappingLineProfileWindow(QMainWindow):
         root.addLayout(row_clamp)
 
         self.plots_splitter = QSplitter(Qt.Vertical)
+        self.plots_splitter.setChildrenCollapsible(False)
+        self.plots_splitter.setHandleWidth(2)
+        self.plots_splitter.setStyleSheet(
+            "QSplitter::handle { background: #CFD8DC; margin: 0; }"
+        )
         self.heatmap_panel = InteractiveHeatmapPanel(
             title="Mapping（取樣路徑）",
             x_label="X (mm)",
@@ -759,6 +760,10 @@ class MappingLineProfileWindow(QMainWindow):
             with_profiles=False,
             show_colorbar=True,
             show_tip=True,
+        )
+        self.heatmap_panel.lbl_tip.setText(
+            "滾輪縮放 · 拖曳平移 · 雙擊復原 · 點擊熱圖顯示數值（紅框）· "
+            "剖面無圖上標記"
         )
         self.profile_panel = LineProfilePlotPanel()
         self.plots_splitter.addWidget(self.heatmap_panel)
