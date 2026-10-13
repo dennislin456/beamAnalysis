@@ -1,7 +1,8 @@
-"""Basler JSON Batch：位置資料夾（L01…）＋單一 NPY Heatmap＋JSON 距離清單。"""
+"""Basler JSON Batch：位置資料夾（L01…）＋ JSON 距離清單；NPY Heatmap 可選。"""
 
 import csv
 import json
+import math
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -38,6 +39,8 @@ from PyQt5.QtWidgets import (
 from shared_components import (
     EXPORT_IMAGE_EXT,
     InteractiveHeatmapPanel,
+    PROFILE_EDGE_AXIS_PX_COMPACT,
+    PROFILE_SIDE_AXIS_PX_COMPACT,
     export_timestamp_tag,
     normalize_export_image_path,
 )
@@ -48,7 +51,22 @@ except ImportError:  # pragma: no cover
     _fast_json = None
 
 
-_JSON_FIELDS = ("x_mm", "y_mm", "r_deg", "exposure_ms", "distance_um")
+_JSON_FIELDS = (
+    "x_mm",
+    "y_mm",
+    "r1_deg",
+    "r2_deg",
+    "exposure_ms",
+    "distance_um",
+    "dist_ifc",
+)
+_POSITION_FIELDS = ("x_mm", "y_mm", "r1_deg", "r2_deg")
+_ABOVE_BELOW_PX_FIELDS = (
+    ("above_x_px", "above", "x_px"),
+    ("above_y_px", "above", "y_px"),
+    ("below_x_px", "below", "x_px"),
+    ("below_y_px", "below", "y_px"),
+)
 _IMPORT_WORKERS = min(32, max(4, (os.cpu_count() or 4) * 2))
 _COORD_RE = re.compile(
     r"X(?P<x_sign>-?)(?P<x_int>\d+(?:p\d+)?)_Y(?P<y_sign>-?)(?P<y_int>\d+(?:p\d+)?)",
@@ -117,13 +135,61 @@ def _format_xy_label(x, y):
     return f"X={_format_json_value(x)} Y={_format_json_value(y)}"
 
 
+def _nice_tick_step(span, target_labels=8):
+    if span <= 0:
+        return 1.0
+    raw = span / max(float(target_labels), 1.0)
+    magnitude = 10 ** math.floor(math.log10(raw))
+    for nice in (1, 2, 5, 10):
+        step = nice * magnitude
+        if step >= raw:
+            return float(step)
+    return float(10 * magnitude)
+
+
+def _pixel_tick_spacing(count, target_labels=8):
+    span = max(float(count) - 1.0, 1.0)
+    return _pixel_tick_spacing_for_span(span, target_labels)
+
+
+def _pixel_tick_spacing_for_span(span, target_labels=8):
+    span = max(float(span), 1.0)
+    major = _nice_tick_step(span, target_labels)
+    return major, major / 5.0
+
+
 def _pick_json_field(data, key):
-    """優先頂層欄位，其次 value 內同名欄位。"""
-    if isinstance(data, dict) and key in data:
+    """優先 position（座標／角度）、其次頂層，再其次 value。"""
+    if not isinstance(data, dict):
+        return None
+    if key in _POSITION_FIELDS:
+        position = data.get("position")
+        if isinstance(position, dict) and key in position:
+            return position.get(key)
+    if key in data:
         return data.get(key)
-    value = data.get("value") if isinstance(data, dict) else None
+    value = data.get("value")
     if isinstance(value, dict) and key in value:
         return value.get(key)
+    return None
+
+
+def _pick_value_nested(data, *path):
+    """讀取 value 內巢狀欄位（如 value.above.x_px）；也相容頂層同路徑。"""
+    if not isinstance(data, dict):
+        return None
+    for root_key in ("value", None):
+        cur = data.get("value") if root_key == "value" else data
+        if not isinstance(cur, dict):
+            continue
+        ok = True
+        for key in path:
+            if not isinstance(cur, dict) or key not in cur:
+                ok = False
+                break
+            cur = cur.get(key)
+        if ok:
+            return cur
     return None
 
 
@@ -133,6 +199,8 @@ def _read_one_distance_json(file_path):
         row = {"file": os.path.basename(file_path)}
         for key in _JSON_FIELDS:
             row[key] = _pick_json_field(data, key)
+        for out_key, section, field in _ABOVE_BELOW_PX_FIELDS:
+            row[out_key] = _pick_value_nested(data, section, field)
         return file_path, row, None
     except Exception as exc:
         return file_path, None, exc
@@ -147,7 +215,7 @@ class _NoFocusDelegate(QStyledItemDelegate):
 
 
 class LocationOnlyConfigDialog(QDialog):
-    """僅勾選位置資料夾（每點一個 NPY，不需 cycle）。"""
+    """僅勾選位置資料夾（JSON 必要；NPY 可選）。"""
 
     def __init__(self, locations, current_config=None, parent=None):
         super().__init__(parent)
@@ -161,7 +229,8 @@ class LocationOnlyConfigDialog(QDialog):
         root = QVBoxLayout(self)
         tip = QLabel(
             "勾選要載入的位置資料夾（L01、L02…）。"
-            "載入後會依 JSON 的 x_mm / y_mm 拆成點位；點選點位只顯示該點 Heatmap 與距離清單。"
+            "載入後會依 JSON 的 x_mm / y_mm 拆成點位；"
+            "NPY 可選；同資料夾有多個 NPY 時只取第一筆畫 Heatmap。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #546E7A; font-size: 12px;")
@@ -222,7 +291,7 @@ class LocationOnlyConfigDialog(QDialog):
 
 
 class BaslerJsonBatchTab(QWidget):
-    """匯入含 L01/L02… 的主資料夾：JSON 距離清單 + NPY Heatmap（不抓光斑）。"""
+    """匯入含 L01/L02… 的主資料夾：JSON 距離清單（必要）＋ NPY Heatmap（可選）。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -235,6 +304,7 @@ class BaslerJsonBatchTab(QWidget):
         self.points = []  # [{location, x_mm, y_mm, npy_path, rows, matrix, label, cross}, ...]
         self.current_idx = -1
         self._suppress_cross_save = False
+        self._heatmap_range_sync_guard = False
         self._export_in_progress = False
         self._export_pause_requested = False
         self._export_paused = False
@@ -372,7 +442,7 @@ class BaslerJsonBatchTab(QWidget):
         self.list_points.currentRowChanged.connect(self._on_point_selected)
         left_layout.addWidget(self.list_points, 1)
 
-        self.lbl_point_stats = QLabel("distance_um  平均值: --　STD: --")
+        self.lbl_point_stats = QLabel("平均值: --\nSTD: --")
         self.lbl_point_stats.setWordWrap(True)
         self.lbl_point_stats.setStyleSheet(
             "color: #37474F; font-size: 12px; background: #FAFAFA; "
@@ -458,6 +528,16 @@ class BaslerJsonBatchTab(QWidget):
         )
         self.heatmap_panel.mouseMoved.connect(self._on_heatmap_mouse_moved)
         self.heatmap_panel.profilePointChanged.connect(self._on_profile_point_changed)
+        # realign 後再套用軸調整，避免剖面／熱圖對齊被覆寫
+        _orig_realign = self.heatmap_panel._realign_profile_geometry
+
+        def _realign_then_tweak(*args, **kwargs):
+            _orig_realign(*args, **kwargs)
+            self._apply_heatmap_axis_tweaks()
+            self._sync_profile_pixel_axes()
+
+        self.heatmap_panel._realign_profile_geometry = _realign_then_tweak
+        self._hook_heatmap_view_sync()
         self._reserve_colorbar_column_space()
         self._apply_heatmap_axis_tweaks()
         heat_layout.addWidget(self.heatmap_panel, 1)
@@ -467,7 +547,6 @@ class BaslerJsonBatchTab(QWidget):
         view_splitter.addWidget(heat_host)
 
         table_panel = QWidget()
-        table_panel.setMinimumWidth(380)
         table_layout = QVBoxLayout(table_panel)
         table_layout.setContentsMargins(6, 0, 0, 0)
         table_layout.setSpacing(4)
@@ -477,40 +556,56 @@ class BaslerJsonBatchTab(QWidget):
         )
         self.lbl_distance_title.setWordWrap(True)
         table_layout.addWidget(self.lbl_distance_title)
-        self.distance_table = QTableWidget(0, 6)
+        self.distance_table = QTableWidget(0, 8)
         self.distance_table.setHorizontalHeaderLabels(
-            ["#", "x_mm", "y_mm", "r_deg", "exposure_ms", "distance_um"]
+            [
+                "#",
+                "x_mm",
+                "y_mm",
+                "r1_deg",
+                "r2_deg",
+                "exposure_ms",
+                "distance_um",
+                "dist_mm",
+            ]
         )
         self.distance_table.setAlternatingRowColors(True)
         self.distance_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.distance_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.distance_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.distance_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.distance_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.distance_table.verticalHeader().setVisible(False)
         self.distance_table.setStyleSheet(
             "QTableWidget { background: white; border: 1px solid #d0d0d0; font-size: 12px; }"
             "QHeaderView::section { background: #f0f0f0; font-weight: bold; padding: 3px; "
             "border: 1px solid #d0d0d0; }"
         )
+        col_widths = (34, 62, 62, 60, 60, 90, 88, 70)
         header = self.distance_table.horizontalHeader()
         header.setDefaultAlignment(Qt.AlignCenter)
         header.setMinimumSectionSize(36)
-        header.setSectionResizeMode(QHeaderView.Interactive)
-        header.resizeSection(0, 36)
-        header.resizeSection(1, 68)
-        header.resizeSection(2, 68)
-        header.resizeSection(3, 58)
-        header.resizeSection(4, 88)
-        header.resizeSection(5, 88)
-        header.setStretchLastSection(True)
+        header.setStretchLastSection(False)
+        for col, width in enumerate(col_widths):
+            header.setSectionResizeMode(col, QHeaderView.Fixed)
+            header.resizeSection(col, width)
         self.distance_table.verticalHeader().setDefaultSectionSize(24)
+        # 清單寬度 = 欄寬合計 + 直向捲軸預留 + 邊框／左邊距（不再用 5:3）
+        table_w = (
+            sum(col_widths)
+            + self.style().pixelMetric(QStyle.PM_ScrollBarExtent)
+            + max(2, self.distance_table.frameWidth() * 2)
+            + table_layout.contentsMargins().left()
+            + 4
+        )
+        table_panel.setMinimumWidth(table_w)
+        table_panel.setMaximumWidth(table_w)
         table_layout.addWidget(self.distance_table, 1)
         view_splitter.addWidget(table_panel)
 
-        # Heatmap : 距離清單 = 5:3（stretch）、5:2（初始寬度）
-        view_splitter.setStretchFactor(0, 5)
-        view_splitter.setStretchFactor(1, 3)
-        view_splitter.setSizes([1000, 400])
+        # Heatmap 吃剩餘寬度；清單依欄寬固定
+        view_splitter.setStretchFactor(0, 1)
+        view_splitter.setStretchFactor(1, 0)
+        view_splitter.setSizes([1200, table_w])
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
@@ -548,7 +643,8 @@ class BaslerJsonBatchTab(QWidget):
                 self,
                 "警告",
                 "找不到可用的位置資料夾。\n"
-                "預期格式：<主資料夾>/<位置>/（一個 .npy + 多個 .json）",
+                "預期格式：<主資料夾>/<位置>/（至少一個 .json；"
+                ".npy 可選，同資料夾多檔時只取第一筆）",
             )
             return
 
@@ -563,7 +659,7 @@ class BaslerJsonBatchTab(QWidget):
         self.current_idx = -1
         self.list_points.clear()
         self.distance_table.setRowCount(0)
-        self.lbl_point_stats.setText("distance_um  平均值: --　STD: --")
+        self.lbl_point_stats.setText("平均值: --\nSTD: --")
         self.lbl_distance_title.setText("距離清單（目前點位）")
 
         n_json = sum(len(v["json_paths"]) for v in meta.values())
@@ -577,7 +673,7 @@ class BaslerJsonBatchTab(QWidget):
 
         msg = f"狀態: 已掃描 {len(meta)} 個位置，請進行位置配置後載入"
         if missing:
-            msg += f"（略過無 NPY/JSON：{', '.join(missing[:8])}）"
+            msg += f"（略過無 JSON：{', '.join(missing[:8])}）"
         self._set_status(msg)
         self._update_selected_label()
         self._refresh_action_buttons()
@@ -610,7 +706,8 @@ class BaslerJsonBatchTab(QWidget):
 
             npy_files.sort(key=lambda p: _natural_sort_key(os.path.basename(p)))
             json_files.sort(key=lambda p: _natural_sort_key(os.path.basename(p)))
-            if not npy_files or not json_files:
+            # JSON 必要；NPY 可選（僅 JSON 亦可匯入）
+            if not json_files:
                 missing.append(loc)
                 continue
 
@@ -710,41 +807,33 @@ class BaslerJsonBatchTab(QWidget):
                 if missing_xy:
                     warnings.append(f"{loc} 有 {missing_xy} 筆 JSON 缺少 x_mm/y_mm")
 
-                npy_by_xy = []
-                for npy_path in info["npy_paths"]:
-                    xy = _parse_xy_from_name(npy_path)
-                    if xy is None:
+                # 同資料夾多個 NPY：只取排序後第一筆畫圖，其餘忽略
+                first_npy = info["npy_paths"][0] if info["npy_paths"] else None
+                shared_matrix = None
+                shared_npy_path = None
+                if first_npy is not None:
+                    try:
+                        shared_matrix = np.asarray(np.load(first_npy), dtype=float)
+                        if shared_matrix.ndim != 2:
+                            raise ValueError(f"NPY 維度不是 2D：{shared_matrix.shape}")
+                        shared_npy_path = first_npy
+                    except Exception as exc:
                         warnings.append(
-                            f"{loc} 無法從 NPY 檔名解析座標：{os.path.basename(npy_path)}"
+                            f"{loc} NPY 讀取失敗（仍載入 JSON）："
+                            f"{os.path.basename(first_npy)} — {exc}"
                         )
-                        continue
-                    npy_by_xy.append((xy, npy_path))
+                        shared_matrix = None
+                        shared_npy_path = None
+                    if len(info["npy_paths"]) > 1:
+                        warnings.append(
+                            f"{loc} 有 {len(info['npy_paths'])} 個 NPY，"
+                            f"僅使用第一筆：{os.path.basename(first_npy)}"
+                        )
 
                 for key in sorted(groups.keys()):
                     group_rows = groups[key]
-                    npy_path = None
-                    for xy, path in npy_by_xy:
-                        if _xy_match(key, xy):
-                            npy_path = path
-                            break
-                    if npy_path is None and len(npy_by_xy) == 1 and len(groups) == 1:
-                        npy_path = npy_by_xy[0][1]
-                    if npy_path is None:
-                        warnings.append(
-                            f"{loc} {_format_xy_label(key[0], key[1])} 找不到對應 NPY，已略過"
-                        )
-                        continue
-
-                    try:
-                        matrix = np.load(npy_path)
-                        matrix = np.asarray(matrix, dtype=float)
-                        if matrix.ndim != 2:
-                            raise ValueError(f"NPY 維度不是 2D：{matrix.shape}")
-                    except Exception as exc:
-                        warnings.append(
-                            f"{loc} {_format_xy_label(key[0], key[1])} NPY 讀取失敗：{exc}"
-                        )
-                        continue
+                    npy_path = shared_npy_path
+                    matrix = shared_matrix
 
                     label = (
                         f"{loc} | {_format_xy_label(key[0], key[1])} "
@@ -826,7 +915,7 @@ class BaslerJsonBatchTab(QWidget):
         self._store_current_cross()
         if row < 0 or row >= len(self.points):
             self.current_idx = -1
-            self.lbl_point_stats.setText("distance_um  平均值: --　STD: --")
+            self.lbl_point_stats.setText("平均值: --\nSTD: --")
             return
         self.current_idx = row
         point = self.points[row]
@@ -849,6 +938,67 @@ class BaslerJsonBatchTab(QWidget):
         if not (0 <= self.current_idx < len(self.points)):
             return
         self.points[self.current_idx]["cross"] = (int(ix), int(iy))
+        self._sync_profile_pixel_axes()
+
+    def _hook_heatmap_view_sync(self):
+        """熱圖縮放／平移時，剖面 Pixels 軸跟著同步。"""
+        try:
+            heat_vb = self.heatmap_panel.plot.getViewBox()
+        except Exception:
+            heat_vb = None
+        if heat_vb is not None:
+            heat_vb.sigRangeChanged.connect(self._on_heatmap_view_range_changed)
+
+    def _on_heatmap_view_range_changed(self, *args):
+        if self._heatmap_range_sync_guard:
+            return
+        self._sync_profile_pixel_axes()
+
+    def _sync_profile_pixel_axes(self):
+        """讓剖面 Pixels 軸與熱圖使用相同刻度間距與資料範圍。"""
+        if not (0 <= self.current_idx < len(self.points)):
+            return
+        matrix = self.points[self.current_idx].get("matrix")
+        if matrix is None:
+            return
+
+        ny, nx = matrix.shape
+        panel = self.heatmap_panel
+        heat = panel.plot
+        x_prof = panel.plot_x_profile
+        y_prof = panel.plot_y_profile
+        if heat is None or x_prof is None or y_prof is None:
+            return
+
+        try:
+            x_range, y_range = heat.getViewBox().viewRange()
+            x_range = (float(x_range[0]), float(x_range[1]))
+            y_range = (float(y_range[0]), float(y_range[1]))
+        except Exception:
+            x_range = (0.0, float(max(nx - 1, 0)))
+            y_range = (0.0, float(max(ny - 1, 0)))
+
+        x_span = max(x_range[1] - x_range[0], 1.0)
+        y_span = max(y_range[1] - y_range[0], 1.0)
+        x_major, x_minor = _pixel_tick_spacing_for_span(x_span)
+        y_major, y_minor = _pixel_tick_spacing_for_span(y_span)
+        panel.set_tick_spacing(x_major, x_minor, y_major, y_minor, grid_alpha=0.25)
+
+        self._heatmap_range_sync_guard = True
+        try:
+            try:
+                _, y_intensity = x_prof.viewRange()[1]
+                x_prof.setRange(xRange=x_range, yRange=y_intensity, padding=0)
+            except Exception:
+                x_prof.setXRange(x_range[0], x_range[1], padding=0)
+
+            try:
+                x_intensity = y_prof.viewRange()[0]
+                y_prof.setRange(xRange=x_intensity, yRange=y_range, padding=0)
+            except Exception:
+                y_prof.setYRange(y_range[0], y_range[1], padding=0)
+        finally:
+            self._heatmap_range_sync_guard = False
 
     def _finite_values(self, rows, key):
         vals = []
@@ -875,7 +1025,7 @@ class BaslerJsonBatchTab(QWidget):
         rows = point.get("rows") or []
         dist_mean, dist_std = self._stat_text(self._finite_values(rows, "distance_um"))
         self.lbl_point_stats.setText(
-            f"distance_um  平均值: {dist_mean}\nSTD: {dist_std}"
+            f"平均值: {dist_mean}\nSTD: {dist_std}"
         )
 
     def _fill_distance_table(self, rows):
@@ -885,9 +1035,11 @@ class BaslerJsonBatchTab(QWidget):
                 str(i + 1),
                 _format_json_value(row.get("x_mm")),
                 _format_json_value(row.get("y_mm")),
-                _format_json_value(row.get("r_deg")),
+                _format_json_value(row.get("r1_deg")),
+                _format_json_value(row.get("r2_deg")),
                 _format_json_value(row.get("exposure_ms")),
                 _format_json_value(row.get("distance_um")),
+                _format_json_value(row.get("dist_ifc")),
             ]
             for col, text in enumerate(values):
                 item = QTableWidgetItem(text)
@@ -895,8 +1047,6 @@ class BaslerJsonBatchTab(QWidget):
                 self.distance_table.setItem(i, col, item)
 
     def _draw_heatmap(self, point):
-        matrix = point["matrix"]
-        ny, nx = matrix.shape
         title = (
             f"{point['location']} | "
             f"{_format_xy_label(point['x_mm'], point['y_mm'])}"
@@ -904,6 +1054,26 @@ class BaslerJsonBatchTab(QWidget):
         self.heatmap_panel.set_plot_title(title)
         self.lbl_distance_title.setText(f"距離清單 — {title}")
         self.heatmap_panel.set_axis_labels("X Pixels", "Y Pixels")
+
+        matrix = point.get("matrix")
+        if matrix is None:
+            self._suppress_cross_save = True
+            try:
+                self.heatmap_panel._profile_point = None
+                self.heatmap_panel.clear_profile_cross()
+                self.heatmap_panel.set_image(None, reset_view=True)
+                self._apply_heatmap_axis_tweaks()
+            finally:
+                self._suppress_cross_save = False
+            self.lbl_mouse.setText("滑鼠位置: （無 Heatmap）")
+            self._set_status(
+                f"狀態: 顯示 {title}\n"
+                f"JSON {len(point['rows'])} 筆｜無 NPY",
+                "#2E7D32",
+            )
+            return
+
+        ny, nx = matrix.shape
 
         # 先取出已記住的十字，避免 set_image 觸發的 signal 覆寫成中心點
         cross = point.get("cross")
@@ -924,6 +1094,7 @@ class BaslerJsonBatchTab(QWidget):
             )
             self.heatmap_panel.set_profile_point(ix, iy, reset_view=False)
             point["cross"] = (ix, iy)
+            self._sync_profile_pixel_axes()
             self._apply_heatmap_axis_tweaks()
         finally:
             self._suppress_cross_save = False
@@ -958,24 +1129,65 @@ class BaslerJsonBatchTab(QWidget):
             self._profile_hist_spacer = None
 
     def _apply_heatmap_axis_tweaks(self):
-        """熱圖底軸不顯示 X Pixels（改由下方剖面顯示），避免標題被擋。"""
+        """熱圖拿掉軸標題；軸佔位與剖面一致，讓剖面 Pixels 貼齊熱圖 ViewBox。"""
         try:
-            # 熱圖底部：清空標籤、不顯示刻度，只留極小佔位對齊剖面
-            bottom = self.heatmap_panel.plot.getAxis("bottom")
-            self.heatmap_panel.plot.setLabel("bottom", "")
-            bottom.setStyle(showValues=False)
-            bottom.setHeight(6)
-            # 下方 X 剖面保留完整「X Pixels」標籤與刻度
+            side = PROFILE_SIDE_AXIS_PX_COMPACT
+            edge = PROFILE_EDGE_AXIS_PX_COMPACT
+            value_w = max(side, 72)
+            heat = self.heatmap_panel.plot
             x_prof = self.heatmap_panel.plot_x_profile
+            y_prof = self.heatmap_panel.plot_y_profile
+
+            # 縮小格線間距，剖面更貼熱圖
+            try:
+                self.heatmap_panel.win.ci.layout.setSpacing(0)
+                self.heatmap_panel.win.ci.setContentsMargins(0, 0, 0, 0)
+            except Exception:
+                pass
+
+            # 熱圖：不顯示 Y/X 軸標題；刻度數字保留（Pixels 標籤改由剖面顯示）
+            heat.setLabel("left", "")
+            heat.setLabel("bottom", "")
+            left = heat.getAxis("left")
+            left.setStyle(showValues=True)
+            left.setWidth(side)
+            bottom = heat.getAxis("bottom")
+            bottom.setStyle(showValues=True)
+            bottom.setHeight(edge)
+            # 右／上佔位與剖面同尺寸 → ViewBox 邊緣貼齊（對應紅線）
+            heat.showAxis("right", show=True)
+            heat.getAxis("right").setWidth(value_w)
+            heat.getAxis("right").setStyle(showValues=False, tickLength=0)
+            heat.showAxis("top", show=True)
+            heat.getAxis("top").setHeight(edge)
+            heat.getAxis("top").setStyle(showValues=False, tickLength=0)
+
             if x_prof is not None:
                 x_prof.setLabel("bottom", "X Pixels")
+                x_prof.setLabel("right", "Value")
+                x_prof.getAxis("bottom").setHeight(edge)
                 right = x_prof.getAxis("right")
-                right.setWidth(72)
+                right.setWidth(value_w)
                 right.setStyle(tickTextOffset=2)
                 try:
                     right.enableAutoSIPrefix(True)
                 except Exception:
                     pass
+                x_prof.showAxis("left", show=True)
+                x_prof.getAxis("left").setWidth(side)
+                x_prof.getAxis("left").setStyle(showValues=False, tickLength=0)
+                x_prof.setLabel("left", "")
+
+            if y_prof is not None:
+                y_prof.setLabel("left", "Y Pixels")
+                y_prof.setLabel("top", "Value")
+                y_prof.getAxis("left").setWidth(side)
+                y_prof.getAxis("top").setHeight(edge)
+                y_prof.showAxis("bottom", show=True)
+                y_prof.getAxis("bottom").setHeight(edge)
+                y_prof.getAxis("bottom").setStyle(showValues=False, tickLength=0)
+                y_prof.setLabel("bottom", "")
+
             if self.heatmap_panel.hist is not None:
                 self.heatmap_panel.win.ci.layout.setColumnFixedWidth(2, 110)
         except Exception:
@@ -986,7 +1198,10 @@ class BaslerJsonBatchTab(QWidget):
             return
         if self.current_idx < 0 or self.current_idx >= len(self.points):
             return
-        matrix = self.points[self.current_idx]["matrix"]
+        matrix = self.points[self.current_idx].get("matrix")
+        if matrix is None:
+            self.lbl_mouse.setText("滑鼠位置: （無 Heatmap）")
+            return
         ny, nx = matrix.shape
         x = float(mouse_point.x())
         y = float(mouse_point.y())
@@ -1111,7 +1326,8 @@ class BaslerJsonBatchTab(QWidget):
                 csv_path = f"{base}.csv"
                 heatmap_base = f"{base}_Heatmap_With_Profiles"
                 self._write_point_csv(csv_path, point)
-                self._export_heatmap_image(heatmap_base)
+                if point.get("matrix") is not None:
+                    self._export_heatmap_image(heatmap_base)
 
                 session["next_idx"] = idx + 1
                 self._set_status(
@@ -1166,7 +1382,21 @@ class BaslerJsonBatchTab(QWidget):
         with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
             writer = csv.writer(fh)
             writer.writerow(
-                ["index", "json_file", "x_mm", "y_mm", "r_deg", "exposure_ms", "distance_um"]
+                [
+                    "index",
+                    "json_file",
+                    "x_mm",
+                    "y_mm",
+                    "r1_deg",
+                    "r2_deg",
+                    "exposure_ms",
+                    "distance_um",
+                    "dist_mm",
+                    "above_x_px",
+                    "above_y_px",
+                    "below_x_px",
+                    "below_y_px",
+                ]
             )
             for i, row in enumerate(point["rows"], start=1):
                 writer.writerow(
@@ -1175,9 +1405,15 @@ class BaslerJsonBatchTab(QWidget):
                         row.get("file", ""),
                         _format_json_value(row.get("x_mm")),
                         _format_json_value(row.get("y_mm")),
-                        _format_json_value(row.get("r_deg")),
+                        _format_json_value(row.get("r1_deg")),
+                        _format_json_value(row.get("r2_deg")),
                         _format_json_value(row.get("exposure_ms")),
                         _format_json_value(row.get("distance_um")),
+                        _format_json_value(row.get("dist_ifc")),
+                        _format_json_value(row.get("above_x_px")),
+                        _format_json_value(row.get("above_y_px")),
+                        _format_json_value(row.get("below_x_px")),
+                        _format_json_value(row.get("below_y_px")),
                     ]
                 )
 

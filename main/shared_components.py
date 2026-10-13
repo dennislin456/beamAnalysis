@@ -1072,6 +1072,204 @@ def find_dual_peak_valley_y(
     )
 
 
+def _roi_centered_on_xy(matrix, center_xy, roi_w=200, roi_h=512):
+    """以 (cx, cy) 為中心框出 W×H，並裁到影像範圍。回傳 (x, y, w, h)。"""
+    matrix = np.asarray(matrix)
+    if matrix.size == 0:
+        return None
+    h, w = matrix.shape
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+    rw = max(1, int(roi_w))
+    rh = max(1, int(roi_h))
+    x0 = int(round(cx - rw / 2.0))
+    y0 = int(round(cy - rh / 2.0))
+    x0 = int(np.clip(x0, 0, max(0, w - 1)))
+    y0 = int(np.clip(y0, 0, max(0, h - 1)))
+    rw = min(rw, w - x0)
+    rh = min(rh, h - y0)
+    if rw < 1 or rh < 1:
+        return None
+    return (x0, y0, rw, rh)
+
+
+def _peaks_by_derivative_1d(profile, *, smooth_win=7, min_prominence_frac=0.12):
+    """平滑後對 1D 剖面取微分，以 dy 正→負零交越找局部極大（亞像素）。
+
+    Returns:
+        list[(y_pos, amplitude)] 依強度由大到小。
+    """
+    raw = np.asarray(profile, dtype=np.float64)
+    if raw.size < 3:
+        if raw.size == 0:
+            return []
+        return [(float(np.argmax(raw)), float(np.max(raw)))]
+
+    y = _smooth_1d_profile(raw, int(smooth_win) if smooth_win else 7)
+    dy = np.gradient(y)
+    peak_amp = float(np.max(y)) if y.size else 0.0
+    if peak_amp <= 0:
+        return []
+    min_amp = peak_amp * float(min_prominence_frac)
+    margin = max(2, len(y) // 50)
+    peaks = []
+    for i in range(margin, len(dy) - 1 - margin):
+        if dy[i] >= 0.0 and dy[i + 1] < 0.0:
+            denom = float(dy[i] - dy[i + 1])
+            frac = float(dy[i] / denom) if abs(denom) > 1e-15 else 0.5
+            pos = float(i) + frac
+            amp = float(np.interp(pos, np.arange(len(y), dtype=np.float64), y))
+            if amp >= min_amp:
+                peaks.append((pos, amp))
+
+    if not peaks:
+        # 後備：局部極大（無乾淨零交越時）
+        for i in _local_maxima_1d(y, min_prominence_frac=min_prominence_frac):
+            peaks.append((float(i), float(y[i])))
+
+    peaks.sort(key=lambda t: t[1], reverse=True)
+    return peaks
+
+
+def _pick_two_peaks_1d(peaks, *, min_peak_distance=8, n_profile=0):
+    """從微分峰中選出最佳雙峰（強度高、間距足夠）。"""
+    if not peaks:
+        return None
+    if len(peaks) == 1:
+        return (peaks[0][0], peaks[0][0])
+
+    min_sep = max(1, int(min_peak_distance))
+    best = None
+    best_score = -1.0
+    for i, (ya, aa) in enumerate(peaks):
+        for yb, ab in peaks[i + 1:]:
+            sep = abs(float(ya) - float(yb))
+            if sep < min_sep:
+                continue
+            weaker = min(float(aa), float(ab))
+            stronger = max(float(aa), float(ab))
+            if stronger <= 0:
+                continue
+            balance = weaker / stronger
+            score = weaker * balance
+            if score > best_score:
+                best_score = score
+                best = (float(ya), float(yb)) if ya <= yb else (float(yb), float(ya))
+
+    if best is not None:
+        return best
+
+    # 間距不足時仍取最強兩峰
+    y0, y1 = peaks[0][0], peaks[1][0]
+    return (float(y0), float(y1)) if y0 <= y1 else (float(y1), float(y0))
+
+
+def _centroid_x_at_y_band(work, y_local, *, half_band=4):
+    """在 ROI 子矩陣、峰 Y 附近列帶內做強度加權 X 質心（相對 work）。"""
+    work = np.asarray(work, dtype=np.float64)
+    if work.size == 0:
+        return 0.0
+    h, w = work.shape
+    yi = int(round(float(y_local)))
+    y0 = max(0, yi - int(half_band))
+    y1 = min(h, yi + int(half_band) + 1)
+    band = work[y0:y1, :]
+    if band.size == 0 or not np.isfinite(band).any():
+        return float((w - 1) * 0.5)
+    bg = float(np.median(band))
+    weights = np.clip(band - bg, 0.0, None)
+    wsum = float(np.sum(weights))
+    if wsum <= 1e-12:
+        return float((w - 1) * 0.5)
+    xs = np.arange(w, dtype=np.float64)
+    return float(np.sum(weights * xs[None, :]) / wsum)
+
+
+def find_dual_spots_axial_1d_projection(
+    matrix,
+    center_xy,
+    roi_w=200,
+    roi_h=512,
+    smooth_win=7,
+    min_peak_distance=8,
+):
+    """軸向一維投影剖面與微分法：框選長條 ROI → 水平加總 → 微分找雙峰。
+
+    假設兩光斑大致沿同一垂直軸；以 ``center_xy`` 為寬／高中心框出
+    ``roi_w`` × ``roi_h``（預設 200×512），對條帶內每一列做水平加總得到
+    1D 強度剖面，再以一階微分零交越定位兩個峰。
+
+    Returns:
+        dict:
+            roi_xywh: 實際使用的 (x, y, w, h)
+            roi_bounds: 半開 (x0, y0, x1, y1)
+            profile: 水平加總後的 1D 剖面（全列，ROI 內）
+            peak_ys: (y_lo, y_hi) 全圖座標
+            spots: [(cx, cy), (cx, cy)] 依 Y 由小到大
+            primary_index: 較接近 center_xy 的峰索引（0 或 1）
+    """
+    matrix = np.asarray(matrix, dtype=np.float64)
+    empty = {
+        "roi_xywh": None,
+        "roi_bounds": None,
+        "profile": np.array([]),
+        "peak_ys": None,
+        "spots": None,
+        "primary_index": 0,
+    }
+    if matrix.size == 0 or center_xy is None:
+        return empty
+
+    xywh = _roi_centered_on_xy(matrix, center_xy, roi_w=roi_w, roi_h=roi_h)
+    if xywh is None:
+        return empty
+    x, y, rw, rh = xywh
+    bounds = clip_roi_to_matrix(matrix, xywh)
+    if bounds is None:
+        return empty
+    x0, y0, x1, y1 = bounds
+    work = matrix[y0:y1, x0:x1]
+    if work.size == 0:
+        return empty
+
+    # 水平加總 → 沿垂直軸的 1D 強度分佈
+    profile = np.sum(np.nan_to_num(work, nan=0.0), axis=1)
+    peaks = _peaks_by_derivative_1d(profile, smooth_win=smooth_win)
+    pair = _pick_two_peaks_1d(
+        peaks, min_peak_distance=min_peak_distance, n_profile=profile.size
+    )
+    if pair is None:
+        return {
+            **empty,
+            "roi_xywh": (x, y, rw, rh),
+            "roi_bounds": bounds,
+            "profile": profile,
+        }
+
+    y_lo_l, y_hi_l = pair
+    # 若兩峰幾乎重合，退回最強單峰＋中心 Y 附近第二猜測
+    if abs(y_hi_l - y_lo_l) < 1.0 and len(peaks) >= 1:
+        y_lo_l = peaks[0][0]
+        y_hi_l = y_lo_l
+
+    cy0 = float(y0) + float(y_lo_l)
+    cy1 = float(y0) + float(y_hi_l)
+    cx0 = float(x0) + _centroid_x_at_y_band(work, y_lo_l)
+    cx1 = float(x0) + _centroid_x_at_y_band(work, y_hi_l)
+
+    spots = [(cx0, cy0), (cx1, cy1)]
+    ref_y = float(center_xy[1])
+    primary = 0 if abs(cy0 - ref_y) <= abs(cy1 - ref_y) else 1
+
+    return {
+        "roi_xywh": (x, y, int(x1 - x0), int(y1 - y0)),
+        "roi_bounds": bounds,
+        "profile": profile,
+        "peak_ys": (cy0, cy1),
+        "spots": spots,
+        "primary_index": primary,
+    }
+
+
 # =========================================================================
 # 基礎 UI 元件
 # =========================================================================

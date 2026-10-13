@@ -7,6 +7,7 @@ from tab_dataray import DataRayTab
 from tab_batch import DataRayBatchTab
 from tab_batch_m2 import DataRayBatchM2Tab
 from tab_batch_basler import BaslerBatchTab
+from tab_batch_basler_dual import BaslerBatchDualTab
 from tab_basler import BaslerTab
 from tab_mapping import MappingTab
 from tab_mapping_filename import MappingFilenameTab
@@ -28,6 +29,7 @@ class ModularMatrixApp(QMainWindow):
         # 實例化分頁
         self.tab_batch_m2 = DataRayBatchM2Tab(self)
         self.tab_batch_basler = BaslerBatchTab(self)
+        self.tab_batch_basler_dual = BaslerBatchDualTab(self)
         self.tab_mapping_filename = MappingFilenameTab(self)
         self.tab_batch_json = BaslerJsonBatchTab(self)
         self.tab_dataray = DataRayTab(self)
@@ -39,6 +41,7 @@ class ModularMatrixApp(QMainWindow):
         # 將分頁加入 Tab 容器
         self.tabs.addTab(self.tab_batch_m2, "DataRay (M2 Batch)")
         self.tabs.addTab(self.tab_batch_basler, "Basler (M2 Batch)")
+        self.tabs.addTab(self.tab_batch_basler_dual, "Basler 短／長曝光")
         self.tabs.addTab(self.tab_mapping_filename, "Mapping (Batch)")
         self.tabs.addTab(self.tab_batch_json, "Json Batch")
         self.tabs.addTab(self.tab_dataray, "DataRay (單檔/雙檔)")

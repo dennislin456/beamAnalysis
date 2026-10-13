@@ -424,8 +424,14 @@ def _mapping_interpolator(matrix, x_coords, y_coords):
     )
 
 
-def sample_line_profile(matrix, x_coords, y_coords, x0, y0, x1, y1, n_samples=None):
-    """沿兩點連線（可斜向）取樣，回傳 (dist_mm, x_mm, y_mm, values)。"""
+def sample_line_profile(
+    matrix, x_coords, y_coords, x0, y0, x1, y1, n_samples=None, interpolate=True,
+):
+    """沿兩點連線（可斜向）取樣，回傳 (dist_mm, x_mm, y_mm, values)。
+
+    interpolate=True：雙線性插值（斜向離格點以鄰近值補值）。
+    interpolate=False：僅在落於既有網格點時取值，否則為 NaN（不補值、該點留空）。
+    """
     x0, y0, x1, y1 = map(float, (x0, y0, x1, y1))
     line_len = float(np.hypot(x1 - x0, y1 - y0))
     if line_len <= 0 or not np.isfinite(line_len):
@@ -447,10 +453,19 @@ def sample_line_profile(matrix, x_coords, y_coords, x0, y0, x1, y1, n_samples=No
     ys = y0 + t * (y1 - y0)
     dists = t * line_len
 
-    interp = _mapping_interpolator(matrix, x_coords, y_coords)
-    if interp is not None:
-        pts = np.column_stack([ys, xs])
-        values = np.asarray(interp(pts), dtype=float)
+    if interpolate:
+        interp = _mapping_interpolator(matrix, x_coords, y_coords)
+        if interp is not None:
+            pts = np.column_stack([ys, xs])
+            values = np.asarray(interp(pts), dtype=float)
+        else:
+            values = np.array(
+                [
+                    lookup_mapping_value(matrix, x_coords, y_coords, x, y)
+                    for x, y in zip(xs, ys)
+                ],
+                dtype=float,
+            )
     else:
         values = np.array(
             [
@@ -506,6 +521,7 @@ class LineProfilePlotPanel(QWidget):
         self._clamped = None
         self._show_raw = True
         self._clamp_enabled = False
+        self._show_gap_markers = False
         self._selected_idx = None
         self._fixed = False
         self._default_x = None
@@ -536,6 +552,7 @@ class LineProfilePlotPanel(QWidget):
     def set_data(
         self, dists, xs, ys, raw, clamped,
         show_raw=True, clamp_enabled=False, profile_axis="x",
+        show_gap_markers=False,
     ):
         self._dists = np.asarray(dists, dtype=float)
         self._xs = np.asarray(xs, dtype=float)
@@ -551,6 +568,7 @@ class LineProfilePlotPanel(QWidget):
         self._clamped = np.asarray(clamped, dtype=float)
         self._show_raw = bool(show_raw)
         self._clamp_enabled = bool(clamp_enabled)
+        self._show_gap_markers = bool(show_gap_markers)
         self._fixed = False
         self._selected_idx = None
         self._redraw_curves()
@@ -561,31 +579,41 @@ class LineProfilePlotPanel(QWidget):
         self.plot.clear()
         if self._dists is None or self._dists.size == 0:
             return
-        if self._show_raw:
-            mask = np.isfinite(self._raw)
-            if np.any(mask):
-                self.plot.plot(
-                    self._plot_x[mask], self._raw[mask],
-                    pen=pg.mkPen("#90A4AE", width=1.5, style=Qt.DashLine),
-                )
-        mask_c = np.isfinite(self._clamped)
-        if np.any(mask_c):
+        # connect='finite'：NaN 處斷開，不補值時離格點會顯示為空缺
+        if self._show_raw and np.any(np.isfinite(self._raw)):
             self.plot.plot(
-                self._plot_x[mask_c], self._clamped[mask_c],
-                pen=pg.mkPen("#0288D1", width=2.0),
+                self._plot_x, self._raw,
+                pen=pg.mkPen("#90A4AE", width=1.5, style=Qt.DashLine),
+                connect="finite",
             )
+        if np.any(np.isfinite(self._clamped)):
+            kwargs = dict(
+                pen=pg.mkPen("#0288D1", width=2.0),
+                connect="finite",
+            )
+            if getattr(self, "_show_gap_markers", False):
+                kwargs.update(
+                    symbol="o",
+                    symbolSize=6,
+                    symbolBrush=pg.mkBrush("#0288D1"),
+                    symbolPen=pg.mkPen("#01579B", width=1),
+                )
+            self.plot.plot(self._plot_x, self._clamped, **kwargs)
         vals = []
         if self._show_raw:
             vals.append(self._raw[np.isfinite(self._raw)])
         vals.append(self._clamped[np.isfinite(self._clamped)])
         if vals:
-            merged = np.concatenate(vals)
-            lo, hi = float(np.min(merged)), float(np.max(merged))
-            if lo == hi:
-                lo -= 1.0
-                hi += 1.0
-            pad = 0.08 * (hi - lo)
-            self._default_y = (lo - pad, hi + pad)
+            merged = np.concatenate([v for v in vals if v.size])
+            if merged.size:
+                lo, hi = float(np.min(merged)), float(np.max(merged))
+                if lo == hi:
+                    lo -= 1.0
+                    hi += 1.0
+                pad = 0.08 * (hi - lo)
+                self._default_y = (lo - pad, hi + pad)
+            else:
+                self._default_y = (0.0, 1.0)
         else:
             self._default_y = (0.0, 1.0)
         self._default_x = (float(self._plot_x[0]), float(self._plot_x[-1]))
@@ -733,6 +761,13 @@ class MappingLineProfileWindow(QMainWindow):
         self.chk_show_raw = QCheckBox("顯示原始趨勢")
         self.chk_show_raw.setChecked(True)
         row_clamp.addWidget(self.chk_show_raw)
+        self.chk_no_interp = QCheckBox("不補值（離格點留空）")
+        self.chk_no_interp.setChecked(False)
+        self.chk_no_interp.setToolTip(
+            "預設斜向剖面會以鄰近網格雙線性補值；勾選後僅在落於既有測量格點時取值，"
+            "其餘取樣點為空（NaN），曲線於該處斷開。"
+        )
+        row_clamp.addWidget(self.chk_no_interp)
         self.btn_update = QPushButton("更新剖面")
         self.btn_update.setStyleSheet(
             "QPushButton { font-weight: bold; color: white; background-color: #2E7D32; "
@@ -798,6 +833,7 @@ class MappingLineProfileWindow(QMainWindow):
         self.combo_clamp.currentIndexChanged.connect(self._rebuild_profile)
         self.chk_clamp.toggled.connect(self._rebuild_profile)
         self.chk_show_raw.toggled.connect(self._rebuild_profile)
+        self.chk_no_interp.toggled.connect(self._rebuild_profile)
 
     @staticmethod
     def _make_coord_spin(coords):
@@ -857,8 +893,10 @@ class MappingLineProfileWindow(QMainWindow):
     def _rebuild_profile(self):
         x0, y0 = self.spin_x0.value(), self.spin_y0.value()
         x1, y1 = self.spin_x1.value(), self.spin_y1.value()
+        interpolate = not self.chk_no_interp.isChecked()
         dists, xs, ys, raw = sample_line_profile(
-            self.matrix, self.x_coords, self.y_coords, x0, y0, x1, y1
+            self.matrix, self.x_coords, self.y_coords, x0, y0, x1, y1,
+            interpolate=interpolate,
         )
         if dists.size == 0:
             self.lbl_info.setText("起點與終點相同或無法取樣。")
@@ -884,6 +922,7 @@ class MappingLineProfileWindow(QMainWindow):
             show_raw=self.chk_show_raw.isChecked(),
             clamp_enabled=self.chk_clamp.isChecked(),
             profile_axis=self._profile_axis,
+            show_gap_markers=self.chk_no_interp.isChecked(),
         )
 
         axis_name = "X" if self._profile_axis == "x" else "Y"
@@ -891,9 +930,10 @@ class MappingLineProfileWindow(QMainWindow):
         n_finite = int(np.sum(np.isfinite(clamped)))
         n_replaced = int(np.sum(np.isfinite(raw) & (raw != clamped)))
         mode_label = self.combo_clamp.currentText()
+        fill_label = "不補值（離格點留空）" if self.chk_no_interp.isChecked() else "補值（雙線性）"
         self.lbl_info.setText(
             f"剖面橫軸={axis_name}（與熱圖對齊）｜線段長 {line_len:.4f} mm｜取樣 {dists.size} 點｜"
-            f"有效 {n_finite} 點｜"
+            f"有效 {n_finite} 點｜{fill_label}｜"
             + (
                 f"條件替換 {n_replaced} 點（{mode_label} {self.spin_threshold.value():g} → "
                 f"{self.spin_replace.value():g}）"
@@ -1024,7 +1064,8 @@ class MappingLineProfileWindow(QMainWindow):
         x0, y0 = self.spin_x0.value(), self.spin_y0.value()
         x1, y1 = self.spin_x1.value(), self.spin_y1.value()
         dists, xs, ys, raw = sample_line_profile(
-            self.matrix, self.x_coords, self.y_coords, x0, y0, x1, y1
+            self.matrix, self.x_coords, self.y_coords, x0, y0, x1, y1,
+            interpolate=not self.chk_no_interp.isChecked(),
         )
         if dists.size == 0:
             QMessageBox.warning(self, "提醒", "無法取樣，請確認起點與終點。")
