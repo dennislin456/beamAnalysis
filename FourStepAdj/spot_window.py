@@ -23,7 +23,20 @@ from PyQt5.QtWidgets import (
 )
 
 from dual_spot import locate_dual_spots
-from sci_format import ask_scientific
+from image_canvas import (
+    COLOR_CEIL,
+    COLOR_FLOOR,
+    OptionalNumberBox,
+    add_gaussian_controls,
+    apply_abs_then_color_scale,
+    build_bw_clip_colormap,
+    display_threshold,
+    fix_readout_height,
+    function_frame,
+    linear_bound,
+    log10_bound,
+)
+from sci_format import ask_scientific, format_sci
 
 CANVAS = "#E8ECF0"
 
@@ -95,6 +108,7 @@ class SpotWindow(QMainWindow):
         self._roi_user_set = False
         self._roi_x = 0
         self._color_updating = False
+        self._color_bounds_in_log = False
         self._manual_profile = False
         self._manual_smooth = False
         self._smooth_restoring = False
@@ -121,7 +135,7 @@ class SpotWindow(QMainWindow):
             "條帶的寬度以上光斑 X 為中心，位置不能手動調，Y 固定為整張高度。\n"
             "上光斑是最強訊號的門檻質心。條帶找出波谷後，以波谷中心為界分開上下光斑。\n"
             "左側平滑圖是整張合成影像的圓形平均。下光斑可切換形狀中心或強度質心。\n"
-            "log 只改顯示。雙擊條帶圖可復原強度軸。"
+            "log、abs 和平滑只改顯示。雙擊條帶圖可復原強度軸。"
         )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
@@ -206,8 +220,6 @@ class SpotWindow(QMainWindow):
         self.smooth_plot.setLabel("bottom", "X")
         self.smooth_plot.setLabel("left", "Y")
         self.smooth_image_item = pg.ImageItem()
-        colors = [(0, 0, 255), (0, 255, 255), (0, 255, 0), (255, 255, 0), (255, 0, 0)]
-        self.smooth_image_item.setColorMap(pg.ColorMap(np.linspace(0.0, 1.0, len(colors)), colors))
         self.smooth_plot.addItem(self.smooth_image_item)
         self.smooth_upper = self.smooth_plot.plot(
             pen=None, symbol="+", symbolSize=12, symbolPen=pg.mkPen("#f7f7f7", width=2)
@@ -248,6 +260,16 @@ class SpotWindow(QMainWindow):
         self.plot_y.invertY(True)
         self.plot_y.enableAutoRange(x=False, y=False)
         self.curve_y = self.plot_y.plot(pen=pg.mkPen("#444444", width=1.5))
+        self.profile_values: np.ndarray | None = None
+        self.tip_y = pg.TextItem(
+            color="#333333",
+            anchor=(0, 1),
+            fill=pg.mkBrush(255, 255, 255, 230),
+            border=pg.mkPen("#c5c5c5"),
+        )
+        self.tip_y.setZValue(5)
+        self.tip_y.hide()
+        self.plot_y.addItem(self.tip_y)
         self.marker_upper = self.plot_y.plot(
             pen=None, symbol="+", symbolSize=12, symbolPen=pg.mkPen("#222222", width=2)
         )
@@ -269,13 +291,14 @@ class SpotWindow(QMainWindow):
         self.roi = pg.RectROI(
             [0, 0],
             [160, 512],
-            pen=pg.mkPen("#555555", width=1.2, style=Qt.DashLine),
-            hoverPen=pg.mkPen("#333333", width=1.6),
-            handlePen=pg.mkPen("#333333"),
-            handleHoverPen=pg.mkPen("#111111"),
+            pen=pg.mkPen("#FF4FD8", width=2.4, style=Qt.DashLine),
+            hoverPen=pg.mkPen("#FFD6F4", width=2.8),
+            handlePen=pg.mkPen("#FF4FD8"),
+            handleHoverPen=pg.mkPen("#FFD6F4"),
         )
         for handle in [item["item"] for item in list(self.roi.handles)]:
             self.roi.removeHandle(handle)
+        self.roi.setZValue(2)
         self.roi.translatable = False
         self.roi.setAcceptedMouseButtons(Qt.NoButton)
         self.roi.sigRegionChanged.connect(self._on_roi_dragged)
@@ -286,10 +309,11 @@ class SpotWindow(QMainWindow):
         self.spot_lower = self.plot.plot(pen=None, symbol="x", symbolSize=14, symbolPen=spot_pen)
 
         colors = [(0, 0, 255), (0, 255, 255), (0, 255, 0), (255, 255, 0), (255, 0, 0)]
-        cmap = pg.ColorMap(np.linspace(0.0, 1.0, len(colors)), colors)
+        self._base_cmap = pg.ColorMap(np.linspace(0.0, 1.0, len(colors)), colors)
+        self.smooth_image_item.setColorMap(self._base_cmap)
         self.hist = pg.HistogramLUTItem()
         self.hist.setImageItem(self.image_item)
-        self.hist.gradient.setColorMap(cmap)
+        self.hist.gradient.setColorMap(self._base_cmap)
         self.hist.plot.setPen(pg.mkPen("#666666", width=1))
         for line in self.hist.region.lines:
             line.setPen(pg.mkPen("#444444", width=1))
@@ -337,19 +361,79 @@ class SpotWindow(QMainWindow):
         host_layout.setContentsMargins(0, 0, 8, 0)
         host_layout.setSpacing(6)
         self.log_check = QCheckBox("log")
-        self.log_check.setToolTip("只改熱圖和條帶圖的顯示。找上下光斑仍用線性強度。")
+        self.log_check.setToolTip("只改熱圖、平滑圖和條帶圖的顯示。找上下光斑仍用線性強度。")
         self.log_check.toggled.connect(self._on_log_toggled)
+        self.abs_check = QCheckBox("abs")
+        self.abs_check.setToolTip(
+            "熱圖和平滑圖先取絕對值，再套 color scale。條帶圖只取絕對值。"
+            "找上下光斑仍用原本的線性強度。"
+        )
+        self.abs_check.toggled.connect(self._on_abs_toggled)
+        self.smooth_check = QCheckBox("平滑")
+        self.smooth_check.setToolTip(
+            "熱圖和圓形平均預覽改為 Gaussian blur。水平、垂直是核寬，sigma 兩邊共用。某一邊為 1 時該方向不平滑。"
+            "有勾 abs 時先取絕對值。有勾 color scale 時，先做這個平滑，再套門檻，最後才是 log。"
+            "找上下光斑和條帶圖仍用原本的線性強度，也不套這個平滑。"
+        )
+        self.smooth_check.toggled.connect(self._on_smooth_toggled)
+        self.color_scale_check = QCheckBox("color scale")
+        self.color_scale_check.setToolTip(
+            "勾選後，小於等於左邊數值的像素顯示為 0，色條底部是黑色；"
+            "大於等於右邊數值的像素顯示成該數值，色條頂部是白色。"
+            "同時勾選 abs 時先取絕對值。有勾平滑時先做 Gaussian blur，再套這兩個門檻，最後才是 log。"
+            "預設 256 和 4096。留空的那一側不採用。勾選 log 時，有填的門檻改顯示 log10，取消後換回 10 的次方；熱圖仍用線性門檻再取 log。"
+            "找上下光斑仍用沒裁過的線性強度。"
+        )
+        self.color_scale_check.toggled.connect(self._on_color_scale_toggled)
+        self._color_floor_tip = "小於等於這個值的像素為 0，色條底部黑色。留空代表不採用這個下限。"
+        self._color_ceil_tip = "大於等於這個值的像素等於這個值，色條頂部白色。留空代表不採用這個上限。"
+        self._color_floor_log_tip = (
+            "log10 下限。畫面用 10 的這個次方裁線性值，再取 log。取消 log 會換回線性下限。"
+            "留空代表不採用。小於等於 0 的線性下限會改成 0。"
+        )
+        self._color_ceil_log_tip = (
+            "log10 上限。畫面用 10 的這個次方裁線性值，再取 log。取消 log 會換回線性上限。"
+            "留空代表不採用。小於等於 0 的線性上限會改成 0。"
+        )
+        self.color_floor = OptionalNumberBox(COLOR_FLOOR, self._color_floor_tip)
+        self.color_ceil = OptionalNumberBox(COLOR_CEIL, self._color_ceil_tip)
+        self.color_floor.setEnabled(False)
+        self.color_ceil.setEnabled(False)
+        self.color_floor.numberChanged.connect(self._on_color_scale_value)
+        self.color_ceil.numberChanged.connect(self._on_color_scale_value)
         color_row = QHBoxLayout()
-        color_row.setContentsMargins(8, 0, 0, 0)
+        color_row.setContentsMargins(8, 4, 0, 0)
         color_row.setSpacing(8)
-        color_row.addWidget(self.log_check)
+        log_frame, log_row = function_frame()
+        log_row.addWidget(self.log_check)
+        abs_frame, abs_row = function_frame()
+        abs_row.addWidget(self.abs_check)
+        smooth_frame, smooth_row = function_frame()
+        smooth_row.addWidget(self.smooth_check)
+        color_row.addWidget(log_frame)
+        color_row.addWidget(abs_frame)
+        color_row.addWidget(smooth_frame)
+        self.smooth_kx, self.smooth_ky, self.smooth_sigma = add_gaussian_controls(smooth_row)
+        for box in (self.smooth_kx, self.smooth_ky, self.smooth_sigma):
+            box.valueChanged.connect(self._on_smooth_n_changed)
+            box.setToolTip(box.toolTip() + "和左側的平滑窗不同。")
+        scale_frame, scale_row = function_frame()
+        scale_row.addWidget(self.color_scale_check)
+        scale_row.addWidget(self.color_floor)
+        scale_row.addWidget(self.color_ceil)
+        color_row.addWidget(scale_frame)
         color_row.addStretch(1)
         color_row.addWidget(self.color_max)
         color_row.addWidget(self.color_min)
         host_layout.addLayout(color_row)
         host_layout.addWidget(self.win, 1)
+        self.hover = QLabel("游標：—")
+        self.hover.setStyleSheet("color: #333333; padding: 0 8px 4px 8px;")
+        fix_readout_height(self.hover, 2)
+        host_layout.addWidget(self.hover, 0, Qt.AlignLeft)
         layout.addWidget(host, 1)
         self.plot.scene().sigMouseClicked.connect(self._on_scene_clicked)
+        self.plot.scene().sigMouseMoved.connect(self._on_profile_moved)
 
     def set_image(self, image: np.ndarray) -> None:
         self.image = np.asarray(image, dtype=np.float64)
@@ -371,22 +455,123 @@ class SpotWindow(QMainWindow):
         self.plot.setXRange(0, width, padding=0)
         self.plot.setYRange(0, height, padding=0)
 
+    def _color_scale_enabled(self) -> bool:
+        return bool(self.color_scale_check.isChecked())
+
+    def _abs_enabled(self) -> bool:
+        return bool(self.abs_check.isChecked())
+
+    def _color_bounds(self) -> tuple[float | None, float | None]:
+        if not self._color_scale_enabled():
+            return None, None
+        lo = self.color_floor.number()
+        hi = self.color_ceil.number()
+        if self._color_bounds_in_log:
+            lo = linear_bound(lo)
+            hi = linear_bound(hi)
+        return lo, hi
+
+    def _smooth_params(self) -> tuple[int, int, float]:
+        if not self.smooth_check.isChecked():
+            return 1, 1, 0.0
+        return (
+            int(self.smooth_kx.value()),
+            int(self.smooth_ky.value()),
+            float(self.smooth_sigma.value()),
+        )
+
+    def _view_image(self) -> np.ndarray:
+        clip_on = self._color_scale_enabled()
+        lo, hi = self._color_bounds()
+        return apply_abs_then_color_scale(
+            self.image,
+            self._abs_enabled(),
+            lo,
+            hi,
+            clip_on,
+            self._smooth_params(),
+        )
+
     def _display_values(self, values: np.ndarray) -> np.ndarray:
         data = np.asarray(values, dtype=float)
         if not self.log_check.isChecked():
             return data
         return np.log10(np.maximum(data, 1.0))
 
-    def _show_heatmap(self) -> None:
-        if self.image is None:
-            return
-        shown = self._display_values(self.image)
+    def _display_bounds(self) -> tuple[float | None, float | None]:
+        if not self._color_scale_enabled():
+            return None, None
+        lo, hi = self._color_bounds()
+        log_on = self.log_check.isChecked()
+        lo_d = display_threshold(lo, log_on) if lo is not None else None
+        hi_d = display_threshold(hi, log_on) if hi is not None else None
+        if lo_d is not None and hi_d is not None and hi_d < lo_d:
+            lo_d, hi_d = hi_d, lo_d
+        return lo_d, hi_d
+
+    def _scale_limits(self, shown: np.ndarray | None = None) -> tuple[float, float]:
+        lo_b, hi_b = self._display_bounds()
+        if shown is not None and np.size(shown):
+            data_lo = float(np.min(shown))
+            data_hi = float(np.max(shown))
+        else:
+            data_lo, data_hi = 0.0, 1.0
+        lo = data_lo if lo_b is None else lo_b
+        hi = data_hi if hi_b is None else hi_b
+        if hi < lo:
+            lo, hi = hi, lo
+        if hi <= lo:
+            hi = lo + 1.0
+        return lo, hi
+
+    def _level_span(self, shown: np.ndarray) -> tuple[float, float]:
+        if self._color_scale_enabled():
+            return self._scale_limits(shown)
         lo = float(np.min(shown))
         hi = float(np.max(shown))
         if lo >= hi:
             hi = lo + 1.0
+        return lo, hi
+
+    def _apply_colormap(self) -> None:
+        try:
+            vmin, vmax = self.hist.getLevels()
+        except Exception:
+            return
+        vmin, vmax = float(vmin), float(vmax)
+        if self._color_scale_enabled():
+            lo_b, hi_b = self._display_bounds()
+            span = max(vmax - vmin, 1e-12)
+            cmap = build_bw_clip_colormap(
+                self._base_cmap,
+                vmin,
+                vmax,
+                vmin + span * 1e-9 if lo_b is not None else None,
+                vmax - span * 1e-9 if hi_b is not None else None,
+            )
+        else:
+            cmap = self._base_cmap
+        self.hist.gradient.setColorMap(cmap)
+        self.smooth_image_item.setColorMap(cmap)
+
+    def _on_color_scale_toggled(self, checked: bool) -> None:
+        self.color_floor.setEnabled(checked)
+        self.color_ceil.setEnabled(checked)
+        self._show_heatmap()
+        self._draw_smooth()
+
+    def _on_color_scale_value(self) -> None:
+        if not self._color_scale_enabled():
+            return
+        self._show_heatmap()
+        self._draw_smooth()
+
+    def _show_heatmap(self) -> None:
+        if self.image is None:
+            return
+        shown = self._display_values(self._view_image())
         self.image_item.setImage(shown.T, autoLevels=False)
-        self._set_color_levels(lo, hi)
+        self._set_color_levels(*self._level_span(shown))
 
     def _make_roi_box(self) -> QSpinBox:
         box = QSpinBox()
@@ -431,10 +616,42 @@ class SpotWindow(QMainWindow):
             return
         self._sync_roi_rect()
 
-    def _on_log_toggled(self, _checked: bool) -> None:
+    def _on_log_toggled(self, checked: bool) -> None:
+        self._sync_color_bound_space(checked)
         self._manual_profile = False
         self._show_heatmap()
         self._refresh_spots()
+
+    def _sync_color_bound_space(self, log_on: bool) -> None:
+        if bool(log_on) == self._color_bounds_in_log:
+            return
+        convert = log10_bound if log_on else linear_bound
+        self.color_floor.set_number(convert(self.color_floor.number()), emit=False)
+        self.color_ceil.set_number(convert(self.color_ceil.number()), emit=False)
+        self.color_floor.setToolTip(self._color_floor_log_tip if log_on else self._color_floor_tip)
+        self.color_ceil.setToolTip(self._color_ceil_log_tip if log_on else self._color_ceil_tip)
+        self._color_bounds_in_log = bool(log_on)
+
+    def _on_abs_toggled(self, _checked: bool) -> None:
+        self._manual_profile = False
+        self._manual_smooth = False
+        self._show_heatmap()
+        self._draw_profile()
+        self._draw_smooth()
+
+    def _on_smooth_toggled(self, checked: bool) -> None:
+        for box in (self.smooth_kx, self.smooth_ky, self.smooth_sigma):
+            box.setEnabled(checked)
+        self._manual_smooth = False
+        self._show_heatmap()
+        self._draw_smooth()
+
+    def _on_smooth_n_changed(self, _value: int) -> None:
+        if not self.smooth_check.isChecked():
+            return
+        self._manual_smooth = False
+        self._show_heatmap()
+        self._draw_smooth()
 
     def _refresh_spots(self) -> None:
         if self.image is None:
@@ -512,7 +729,12 @@ class SpotWindow(QMainWindow):
             self.smooth_upper.setData([], [])
             self.smooth_marker.setData([], [])
             return
-        shown = self._display_values(np.asarray(image, dtype=np.float64))
+        clip_on = self._color_scale_enabled()
+        lo, hi = self._color_bounds()
+        preview = apply_abs_then_color_scale(
+            image, self._abs_enabled(), lo, hi, clip_on, self._smooth_params()
+        )
+        shown = self._display_values(preview)
         self.smooth_image_item.setImage(shown.T, autoLevels=False)
         levels = self.hist.getLevels()
         self.smooth_image_item.setLevels([float(levels[0]), float(levels[1])])
@@ -560,10 +782,10 @@ class SpotWindow(QMainWindow):
             y0 = int(bounds[1])
             count = min(len(smooth), height - y0)
             values[y0 : y0 + count] = np.asarray(smooth[:count], dtype=float)
-        shown = values
+        shown = np.abs(values) if self._abs_enabled() else values
+        self.profile_values = shown
         self.curve_y.setData(shown, positions)
-        label = "log10 條帶加總" if self.log_check.isChecked() else "條帶加總"
-        self.plot_y.setLabel("bottom", label)
+        self.plot_y.setLabel("bottom", self._strip_caption())
         upper = spots.get("upper")
         lower = spots.get("lower")
         if upper is None:
@@ -601,6 +823,7 @@ class SpotWindow(QMainWindow):
             self.color_min.blockSignals(False)
             self.color_max.blockSignals(False)
             self._color_updating = False
+        self._apply_colormap()
 
     def _on_color_limit_changed(self, _value: float | None = None) -> None:
         if self._color_updating or self.image is None:
@@ -632,6 +855,7 @@ class SpotWindow(QMainWindow):
             self.color_min.blockSignals(False)
             self.color_max.blockSignals(False)
             self._color_updating = False
+        self._apply_colormap()
 
     def _restore_smooth_view(self) -> None:
         if self.image is None:
@@ -656,6 +880,71 @@ class SpotWindow(QMainWindow):
         self._manual_smooth = False
         self._restore_smooth_view()
 
+    def _on_profile_moved(self, pos) -> None:
+        if self.image is not None and self.plot.sceneBoundingRect().contains(pos):
+            self.tip_y.hide()
+            point = self.plot.vb.mapSceneToView(pos)
+            x = int(np.floor(point.x()))
+            y = int(np.floor(point.y()))
+            height, width = self.image.shape
+            if not (0 <= x < width and 0 <= y < height):
+                self.hover.setText("游標：影像外")
+                return
+            shown = self._cursor_image()
+            self.hover.setText(f"游標：x={x}, y={y}\n{self._cursor_caption()}：{format_sci(float(shown[y, x]))}")
+            return
+        if self.profile_values is None or not self.plot_y.sceneBoundingRect().contains(pos):
+            self.tip_y.hide()
+            self.hover.setText("游標：—")
+            return
+        point = self.plot_y.vb.mapSceneToView(pos)
+        index = int(np.floor(point.y()))
+        if not (0 <= index < len(self.profile_values)):
+            self.tip_y.hide()
+            self.hover.setText("游標：—")
+            return
+        value = float(self.profile_values[index])
+        span = self.plot_y.viewRange()[0]
+        anchor_x = 0 if point.x() <= (span[0] + span[1]) / 2.0 else 1
+        self.tip_y.setAnchor((anchor_x, 1))
+        self.tip_y.setText(f"y = {index} px\n{format_sci(value)}")
+        self.tip_y.setPos(value, index + 0.5)
+        self.tip_y.show()
+        self.hover.setText(f"游標：y={index} px\n{self._strip_caption()}：{format_sci(value)}")
+
+    def _cursor_image(self) -> np.ndarray:
+        key = (
+            id(self.image),
+            self._abs_enabled(),
+            self._smooth_params(),
+            self._color_bounds() if self._color_scale_enabled() else (None, None),
+            self.log_check.isChecked(),
+        )
+        cached = getattr(self, "_cursor_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        shown = self._display_values(self._view_image())
+        self._cursor_cache = (key, shown)
+        return shown
+
+    def _strip_caption(self) -> str:
+        if self.log_check.isChecked() and self._abs_enabled():
+            return "log10 絕對值條帶加總"
+        if self.log_check.isChecked():
+            return "log10 條帶加總"
+        if self._abs_enabled():
+            return "絕對值條帶加總"
+        return "條帶加總"
+
+    def _cursor_caption(self) -> str:
+        if self.log_check.isChecked() and self._abs_enabled():
+            return "log10 絕對值"
+        if self.log_check.isChecked():
+            return "log10 強度"
+        if self._abs_enabled():
+            return "絕對值"
+        return "強度"
+
     def _on_scene_clicked(self, event) -> None:
         if self.image is None:
             return
@@ -672,12 +961,8 @@ class SpotWindow(QMainWindow):
             self._draw_profile()
             return
         if self.hist.sceneBoundingRect().contains(pos):
-            shown = self._display_values(self.image)
-            lo = float(np.min(shown))
-            hi = float(np.max(shown))
-            if lo >= hi:
-                hi = lo + 1.0
-            self._set_color_levels(lo, hi)
+            shown = self._display_values(self._view_image())
+            self._set_color_levels(*self._level_span(shown))
             return
         if self.plot.sceneBoundingRect().contains(pos):
             height, width = self.image.shape

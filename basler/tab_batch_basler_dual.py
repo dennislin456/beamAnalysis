@@ -50,6 +50,7 @@ from shared_components import (
     InteractiveHeatmapPanel,
     NoWheelDoubleSpinBox,
     NoWheelSpinBox,
+    attach_curve_hover_readout,
     attach_waveform_axis_scale,
     build_robust_threshold_mask,
     clip_roi_to_matrix,
@@ -74,7 +75,7 @@ from tab_batch_basler import (
 
 # dual 分頁 color scale 預設（原始強度）
 _DEFAULT_BLACK_BELOW = 256.0
-_DEFAULT_WHITE_ABOVE = 3038.0
+_DEFAULT_WHITE_ABOVE = 4096.0
 
 _FILE_FILTER = (
     "資料檔 (*.npy *.csv *.xlsx *.xls);;"
@@ -1745,6 +1746,7 @@ class BatchHSumResultsDialog(QDialog):
             x_label="Y (pixels)",
             y_label="Horizontal sum",
         )
+        attach_curve_hover_readout(plot, pixel_name="Y")
         return plot, line1, line2
 
     def _data_range_from_block(self, block):
@@ -3949,7 +3951,7 @@ class BaslerBatchDualTab(BaslerBatchTab):
             | Qt.WindowMinimizeButtonHint
             | Qt.WindowMaximizeButtonHint
         )
-        dlg.resize(860, 520)
+        dlg.resize(860, 760)
         dlg.setAttribute(Qt.WA_DeleteOnClose, True)
 
         root = QVBoxLayout(dlg)
@@ -3971,6 +3973,7 @@ class BaslerBatchDualTab(BaslerBatchTab):
         plot.setLabel("bottom", "Y (pixels)")
         plot.setLabel("left", "Horizontal sum")
         plot.addLegend(offset=(10, 10))
+        attach_curve_hover_readout(plot, pixel_name="Y")
 
         plot.plot(
             y,
@@ -4036,7 +4039,53 @@ class BaslerBatchDualTab(BaslerBatchTab):
             )
             root.addWidget(peak_lbl)
 
-        root.addWidget(plot, 1)
+        root.addWidget(plot, 3)
+
+        # 找峰用的就是這條平滑曲線的微分（win=1 時等於 sum−median）
+        dy = (
+            np.gradient(sum_sm)
+            if sum_sm.size == y.size and y.size
+            else np.asarray([], dtype=float)
+        )
+        plot_d = pg.PlotWidget()
+        plot_d.setBackground("#FAFBFC")
+        plot_d.showGrid(x=True, y=True, alpha=0.25)
+        plot_d.setLabel("bottom", "Y (pixels)")
+        plot_d.setLabel("left", "d(smooth) / dY")
+        plot_d.addLegend(offset=(10, 10))
+        plot_d.setXLink(plot)
+        attach_curve_hover_readout(plot_d, pixel_name="Y")
+        if dy.size == y.size:
+            plot_d.plot(
+                y,
+                dy,
+                pen=pg.mkPen("#6A1B9A", width=1.6),
+                name=f"d(smooth win={smooth_win})/dY",
+            )
+            plot_d.addItem(
+                pg.InfiniteLine(
+                    pos=0.0,
+                    angle=0,
+                    pen=pg.mkPen("#90A4AE", width=1, style=Qt.DashLine),
+                )
+            )
+        if primary_y is not None:
+            plot_d.addItem(
+                pg.InfiniteLine(
+                    pos=float(primary_y),
+                    angle=90,
+                    pen=pg.mkPen("#2E7D32", width=2, style=Qt.DashLine),
+                )
+            )
+        if secondary_y is not None:
+            plot_d.addItem(
+                pg.InfiniteLine(
+                    pos=float(secondary_y),
+                    angle=90,
+                    pen=pg.mkPen("#C62828", width=2, style=Qt.DashLine),
+                )
+            )
+        root.addWidget(plot_d, 2)
 
         # 波型圖：雙擊復原；軸外側輸入上下限
         scale_ctrl = attach_waveform_axis_scale(
@@ -4044,6 +4093,12 @@ class BaslerBatchDualTab(BaslerBatchTab):
             dlg,
             x_label="Y (pixels)",
             y_label="Horizontal sum",
+        )
+        scale_d = attach_waveform_axis_scale(
+            plot_d,
+            dlg,
+            x_label="Y (pixels)",
+            y_label="d(smooth) / dY",
         )
         if y.size:
             x0, x1 = float(np.nanmin(y)), float(np.nanmax(y))
@@ -4063,6 +4118,16 @@ class BaslerBatchDualTab(BaslerBatchTab):
                     pad = 0.05 * (y1 - y0)
                     scale_ctrl.set_default_range(x0, x1, y0, y1 + pad)
                     scale_ctrl.reset_view()
+            if dy.size:
+                d_finite = dy[np.isfinite(dy)]
+                if d_finite.size:
+                    d0 = float(np.nanmin(d_finite))
+                    d1 = float(np.nanmax(d_finite))
+                    if d1 <= d0:
+                        d1 = d0 + 1.0
+                    dpad = 0.08 * (d1 - d0)
+                    scale_d.set_default_range(x0, x1, d0 - dpad, d1 + dpad)
+                    scale_d.reset_view()
 
         btn_close = QPushButton("關閉")
         btn_close.setCursor(Qt.PointingHandCursor)
@@ -4823,6 +4888,7 @@ class BaslerBatchDualTab(BaslerBatchTab):
         plot.addItem(line2)
         if not dual_peaks:
             line2.hide()
+        attach_curve_hover_readout(plot, pixel_name="Y")
         return plot, line1, line2
 
     def _wire_hsum_focus_param_signals(self):

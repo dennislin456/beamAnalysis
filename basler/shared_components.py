@@ -3588,6 +3588,189 @@ def attach_waveform_axis_scale(
     )
 
 
+def _curve_display_name(item):
+    name = None
+    if hasattr(item, "name"):
+        try:
+            name = item.name()
+        except Exception:
+            name = None
+    if not name:
+        opts = getattr(item, "opts", None) or {}
+        name = opts.get("name")
+    return str(name) if name else "曲線"
+
+
+class CurveHoverReadout:
+    """滑鼠靠近曲線時，標出該點像素與畫面上的數值。"""
+
+    def __init__(self, plot, *, pixel_name="像素", pixel_axis="x", max_px=14.0):
+        self.plot = plot
+        self.pixel_name = str(pixel_name)
+        self.pixel_axis = "y" if str(pixel_axis).lower() == "y" else "x"
+        self.max_px = float(max_px)
+        self.label = pg.TextItem(
+            color="#212121",
+            fill=pg.mkBrush(255, 255, 255, 235),
+            border=pg.mkPen("#212121", width=1),
+            anchor=(0, 0),
+        )
+        self.label.setZValue(40)
+        self.dot = pg.ScatterPlotItem(
+            size=9,
+            pen=pg.mkPen("#212121", width=1.2),
+            brush=pg.mkBrush(255, 235, 59, 230),
+        )
+        self.dot.setZValue(39)
+        try:
+            self.label.setAcceptedMouseButtons(Qt.NoButton)
+            self.dot.setAcceptedMouseButtons(Qt.NoButton)
+        except Exception:
+            pass
+        self._add_overlay()
+        scene = plot.scene()
+        if scene is not None:
+            scene.sigMouseMoved.connect(self._on_moved)
+
+    def _plot_item(self):
+        return self.plot.plotItem if hasattr(self.plot, "plotItem") else self.plot
+
+    def _add_overlay(self):
+        plot = self._plot_item()
+        for item in (self.dot, self.label):
+            try:
+                if item.scene() is None:
+                    plot.addItem(item, ignoreBounds=True)
+                    item.hide()
+            except Exception:
+                pass
+
+    def _curve_items(self):
+        plot = self._plot_item()
+        found = []
+        seen = set()
+        for item in list(getattr(plot, "items", []) or []):
+            if item is self.dot or item is self.label or id(item) in seen:
+                continue
+            getter = getattr(item, "getData", None)
+            if getter is None:
+                continue
+            try:
+                data = getter()
+            except Exception:
+                continue
+            if not data or len(data) < 2 or data[0] is None or data[1] is None:
+                continue
+            xd = np.asarray(data[0], dtype=float)
+            yd = np.asarray(data[1], dtype=float)
+            if xd.size == 0 or yd.size != xd.size:
+                continue
+            seen.add(id(item))
+            found.append((item, xd, yd))
+        return found
+
+    def _hide(self):
+        self.label.hide()
+        self.dot.hide()
+
+    def _on_moved(self, pos):
+        plot = self._plot_item()
+        self._add_overlay()
+        try:
+            if not plot.sceneBoundingRect().contains(pos):
+                self._hide()
+                return
+        except Exception:
+            self._hide()
+            return
+        vb = plot.getViewBox()
+        if vb is None:
+            self._hide()
+            return
+        mouse = vb.mapSceneToView(pos)
+        mx, my = float(mouse.x()), float(mouse.y())
+        try:
+            (x0, x1), (y0, y1) = vb.viewRange()
+        except Exception:
+            self._hide()
+            return
+        rect = plot.sceneBoundingRect()
+        sx = rect.width() / (float(x1) - float(x0)) if float(x1) != float(x0) else 0.0
+        sy = rect.height() / (float(y1) - float(y0)) if float(y1) != float(y0) else 0.0
+        if sx <= 0.0 or sy <= 0.0:
+            self._hide()
+            return
+
+        hits = []
+        for item, xd, yd in self._curve_items():
+            finite = np.isfinite(xd) & np.isfinite(yd)
+            if not np.any(finite):
+                continue
+            dx = (xd - mx) * sx
+            dy = (yd - my) * sy
+            dist = np.hypot(dx, dy)
+            dist = np.where(finite, dist, np.inf)
+            i = int(np.argmin(dist))
+            d = float(dist[i])
+            if d > self.max_px:
+                continue
+            if self.pixel_axis == "y":
+                pixel, value = float(yd[i]), float(xd[i])
+            else:
+                pixel, value = float(xd[i]), float(yd[i])
+            hits.append(
+                {
+                    "dist": d,
+                    "pixel": pixel,
+                    "value": value,
+                    "name": _curve_display_name(item),
+                    "vx": float(xd[i]),
+                    "vy": float(yd[i]),
+                }
+            )
+        if not hits:
+            self._hide()
+            return
+        hits.sort(key=lambda h: h["dist"])
+        best = hits[0]
+        axis = self.pixel_name.lower()
+        px_txt = (
+            str(int(round(best["pixel"])))
+            if abs(best["pixel"] - round(best["pixel"])) < 0.05
+            else f"{best['pixel']:.1f}"
+        )
+        lines = [f"{axis} = {px_txt} px"]
+        if len(hits) == 1:
+            lines.append(f"{float(best['value']):.3e}")
+        else:
+            for hit in hits:
+                lines.append(f"{hit['name']}  {float(hit['value']):.3e}")
+        self.label.setText("\n".join(lines))
+        self.dot.setData([best["vx"]], [best["vy"]])
+        rect = vb.sceneBoundingRect()
+        origin = rect.topLeft()
+        scene_pt = origin.__class__(origin.x() + 8, origin.y() + 6)
+        view_pt = vb.mapSceneToView(scene_pt)
+        self.label.setPos(float(view_pt.x()), float(view_pt.y()))
+        self.label.show()
+        self.dot.show()
+
+
+def attach_curve_hover_readout(plot, *, pixel_name="像素", pixel_axis="x"):
+    """在剖面圖上顯示游標所在曲線點的像素與畫面數值。"""
+    existing = getattr(plot, "_curve_hover_readout", None)
+    if existing is not None:
+        return existing
+    readout = CurveHoverReadout(
+        plot, pixel_name=pixel_name, pixel_axis=pixel_axis
+    )
+    try:
+        plot._curve_hover_readout = readout
+    except Exception:
+        pass
+    return readout
+
+
 class InteractiveHeatmapPanel(QWidget):
     """自訂座標熱力圖：滾輪縮放、拖曳平移、雙擊復原視野；
     色條可直接拖曳藍色拉條調整上下限（亦可點擊數值精調）；上方可匯出當前圖檔。
@@ -3831,6 +4014,10 @@ class InteractiveHeatmapPanel(QWidget):
                 y_label=self._y_label,
                 reset_callback=lambda: self._reset_profile_view("y"),
                 connect_scene=False,
+            )
+            attach_curve_hover_readout(self.plot_x_profile, pixel_name="X")
+            attach_curve_hover_readout(
+                self.plot_y_profile, pixel_name="Y", pixel_axis="y"
             )
             # ViewBox 訊號較可靠（精簡剖面軸區窄，scene 點擊易漏）
             self._install_profile_vb_click_handlers()
