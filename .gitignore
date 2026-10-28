@@ -101,3 +101,7 @@ DataRay_Batch_Results.zip
 !.env.example
 secrets.json
 credentials.json
+/HDR/script/output
+/HDR/data
+/FourStepAdj
+/basler
