@@ -1,0 +1,10 @@
+# HDR 測試視窗。在 beamAnalysis/HDR 執行：
+#   pip install -r requirements.txt
+#   python hdr_test.py
+
+PyQt5>=5.15
+numpy>=1.24
+pyqtgraph>=0.13
+scipy>=1.10
+Pillow>=10.0
+opencv-python>=4.8
