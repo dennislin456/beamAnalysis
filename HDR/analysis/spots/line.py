@@ -60,8 +60,9 @@ def resolve(ctx: StripContext) -> dict:
     x0, y0, _x1, _y1 = ctx.bounds
     upper = (float(x0) + float(ctx.upper_local[0]), float(y0) + float(ctx.upper_local[1]))
     lower = None
+    lower_mask = None
     if ctx.lower_local is not None and ctx.lower_local[0] > ctx.upper_local[1] + float(ctx.min_dist):
-        center, _ = lower_centroid(
+        center, lower_mask = lower_centroid(
             ctx.work,
             ctx.lower_local[1],
             ctx.work.shape[0] - 1,
@@ -70,6 +71,8 @@ def resolve(ctx: StripContext) -> dict:
         )
         if center is not None and center[1] > ctx.lower_local[1]:
             lower = (float(x0) + center[0], float(y0) + center[1])
+        else:
+            lower_mask = None
     upper_local = (float(upper[0]) - float(x0), float(upper[1]) - float(y0))
     lower_local_pt = (
         None
@@ -77,4 +80,4 @@ def resolve(ctx: StripContext) -> dict:
         else (float(lower[0]) - float(x0), float(lower[1]) - float(y0))
     )
     profile = slanted_line_profile(ctx.work, upper_local, lower_local_pt)
-    return pack_result(ctx, upper, lower, profile=profile)
+    return pack_result(ctx, upper, lower, profile=profile, lower_mask=lower_mask)

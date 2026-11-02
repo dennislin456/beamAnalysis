@@ -41,9 +41,39 @@ def locate_dual_spots(
     thresh_percent: float = 50.0,
     lower_thresh_percent: float | None = None,
     center_mode: str = "shape",
+    *,
+    refine_enabled: bool = False,
+    refine_method: str = "none",
+    refine_window: int = 7,
+    refine_order: int = 2,
+    refine_sigma: float = 1.0,
+    savgol_enabled: bool | None = None,
+    savgol_window: int | None = None,
+    savgol_order: int | None = None,
 ) -> dict:
     """Dispatch to the module that implements ``center_mode``."""
     module = MODES.get(str(center_mode), shape)
+    if str(center_mode) == peak.MODE_ID:
+        return peak.locate(
+            image,
+            x,
+            y,
+            width,
+            height,
+            min_peak_distance=min_peak_distance,
+            min_peak_ratio=min_peak_ratio,
+            use_log=use_log,
+            thresh_percent=thresh_percent,
+            lower_thresh_percent=lower_thresh_percent,
+            refine_enabled=bool(refine_enabled),
+            refine_method=str(refine_method),
+            refine_window=int(refine_window),
+            refine_order=int(refine_order),
+            refine_sigma=float(refine_sigma),
+            savgol_enabled=savgol_enabled,
+            savgol_window=savgol_window,
+            savgol_order=savgol_order,
+        )
     return module.locate(
         image,
         x,

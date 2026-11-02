@@ -7,16 +7,21 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pyqtgraph as pg
 from PyQt5.QtCore import QEvent, QRectF, QSize, Qt, QTimer
 from PyQt5.QtGui import QColor, QFontMetrics
 from PyQt5.QtWidgets import (
+    QAbstractScrollArea,
     QAbstractSpinBox,
     QApplication,
     QButtonGroup,
@@ -49,10 +54,13 @@ from common import (
     ask_scientific,
     clip_color_scale,
     exposure_us_from_name,
+    format_xy_label,
     function_frame,
     gaussian_blur,
     install_input_undo,
     list_images,
+    parse_xy_from_name,
+    xy_key,
 )
 from common.images import is_merged_name
 from common.sci_format import format_sci
@@ -82,12 +90,15 @@ CANVAS = "#E8ECF0"
 FUSION_PANEL_W = 440
 
 
-def load_hdr_image(path: str | Path) -> np.ndarray:
-    """Load a 2D image or an RGB image. Alpha is dropped."""
+def load_hdr_image(path: str | Path, *, mmap: bool = False) -> np.ndarray:
+    """Load a 2D image or an RGB image. Alpha is dropped.
+
+    ``mmap=True`` uses memory-map for ``.npy`` so crops can avoid a full RAM copy.
+    """
     path = Path(path)
     ext = path.suffix.lower()
     if ext == ".npy":
-        arr = np.load(path, allow_pickle=False)
+        arr = np.load(path, allow_pickle=False, mmap_mode="r" if mmap else None)
     elif ext == ".csv":
         arr = np.loadtxt(path, delimiter=",", dtype=np.float64)
     elif ext in {".png", ".bmp", ".tif", ".tiff"}:
@@ -104,12 +115,88 @@ def load_hdr_image(path: str | Path) -> np.ndarray:
     raise ValueError(f"{path.name} 不是二維或 RGB 影像，形狀為 {arr.shape}")
 
 
+def crop_array(
+    image: np.ndarray,
+    origin: tuple[int, int],
+    size: tuple[int, int],
+) -> np.ndarray:
+    """Slice ``image`` to ``size`` at ``origin`` without copying metadata checks."""
+    x, y = int(origin[0]), int(origin[1])
+    crop_w, crop_h = int(size[0]), int(size[1])
+    data = np.asarray(image)
+    height, width = int(data.shape[0]), int(data.shape[1])
+    if x < 0 or y < 0 or x + crop_w > width or y + crop_h > height:
+        raise RuntimeError("計算範圍超出影像。")
+    return data[y : y + crop_h, x : x + crop_w]
+
+
+def average_image_paths(
+    paths: list[Path],
+    origin: tuple[int, int],
+    size: tuple[int, int],
+    *,
+    workers: int | None = None,
+    progress: Callable[[int, int], None] | None = None,
+) -> np.ndarray:
+    """Mean of cropped frames via running sum (no N-frame stack) and threaded I/O."""
+    files = [Path(path) for path in paths]
+    count = len(files)
+    if count < 1:
+        raise ValueError("沒有可平均的影像。")
+    worker_n = int(workers) if workers is not None else min(8, max(2, (os.cpu_count() or 4)))
+    worker_n = max(1, min(worker_n, count))
+    wave = max(worker_n * 2, 8)
+
+    def _load_cropped(path: Path) -> np.ndarray:
+        return np.asarray(
+            crop_array(load_hdr_image(path, mmap=True), origin, size),
+            dtype=np.float64,
+        )
+
+    acc: np.ndarray | None = None
+    done = 0
+    with ThreadPoolExecutor(max_workers=worker_n) as pool:
+        for start in range(0, count, wave):
+            batch = files[start : start + wave]
+            for part in pool.map(_load_cropped, batch):
+                if acc is None:
+                    acc = part
+                else:
+                    acc += part
+                done += 1
+                if progress is not None:
+                    progress(done, count)
+    if acc is None:
+        raise RuntimeError("加總平均沒有結果。")
+    return acc / float(count)
+
+
 def guess_exposure_us(path: Path) -> float | None:
     for name in (path.parent.name, path.stem, path.name):
         value = exposure_us_from_name(name)
         if value is not None:
             return value
     return None
+
+
+@dataclass(frozen=True)
+class SpotRef:
+    """One stage position: a real subfolder, or a flat-folder XY filter."""
+
+    label: str
+    root: Path
+    xy: tuple[float, float] | None = None
+
+    def matches(self, other: SpotRef | None) -> bool:
+        if other is None:
+            return False
+        if self.root.resolve() != other.root.resolve():
+            return False
+        if self.xy is None and other.xy is None:
+            return True
+        if self.xy is None or other.xy is None:
+            return False
+        return xy_key(self.xy) == xy_key(other.xy)
 
 
 def blur_hdr_image(image: np.ndarray, width_x: int, width_y: int, sigma: float) -> np.ndarray:
@@ -293,22 +380,20 @@ def _group_card() -> tuple[QFrame, QVBoxLayout]:
 
 
 class _NameScroll(QScrollArea):
-    """One filename, scrolled sideways with the wheel.
+    """Filename viewport: only a short window is shown; wheel pans sideways."""
 
-    The label can be wider than the viewport; this widget reports a small
-    sizeHint so long Basler names never widen the fusion panel. Hover and
-    use the mouse wheel to pan; full path stays in the tooltip.
-    """
+    VIEW_W = 220
 
     def __init__(self, text: str, tooltip: str) -> None:
         super().__init__()
         self.setObjectName("nameScroll")
         label = QLabel(text)
-        label.setObjectName("fileName")
+        label.setObjectName("fileMeta")
         label.setWordWrap(False)
         label.setToolTip(tooltip)
         label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        label.setStyleSheet("color: #8a939c; background: transparent; font-weight: 400;")
         self._label = label
         self.setWidget(label)
         self.setWidgetResizable(False)
@@ -316,17 +401,18 @@ class _NameScroll(QScrollArea):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setFixedHeight(label.fontMetrics().height() + 4)
-        self.setMinimumWidth(0)
-        # Ignored: take only the width the row layout gives; never push the panel wider.
-        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.setFixedWidth(self.VIEW_W)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        if hasattr(self, "setSizeAdjustPolicy"):
+            self.setSizeAdjustPolicy(QAbstractScrollArea.AdjustIgnored)
         self.setToolTip("檔名過長時在此處滾輪左右滑動；完整路徑見提示。")
         self._sync_label_width()
 
     def minimumSizeHint(self):
-        return QSize(40, self.height())
+        return QSize(self.VIEW_W, self.height())
 
     def sizeHint(self):
-        return QSize(80, self.height())
+        return QSize(self.VIEW_W, self.height())
 
     def _sync_label_width(self) -> None:
         text = self._label.text() or ""
@@ -336,8 +422,11 @@ class _NameScroll(QScrollArea):
     def set_text(self, text: str, tooltip: str) -> None:
         self._label.setText(text)
         self._label.setToolTip(tooltip)
-        self.setToolTip(f"{tooltip}\n（在檔名上滾輪可左右滑動）" if tooltip else "在檔名上滾輪可左右滑動")
+        self.setToolTip(
+            f"{tooltip}\n（在檔名上滾輪可左右滑動）" if tooltip else "在檔名上滾輪可左右滑動"
+        )
         self._sync_label_width()
+        self.horizontalScrollBar().setValue(0)
 
     def wheelEvent(self, event) -> None:
         delta = event.angleDelta().y() or event.angleDelta().x()
@@ -355,11 +444,11 @@ def _muted_label(text: str = "") -> QLabel:
 class ExposureRow(QFrame):
     """One imported exposure. Rows are created only after a file is loaded."""
 
-    # Same four-line card as before; fixed columns keep every input lined up.
-    ROW_HEIGHT = 142
+    ROW_HEIGHT = 138
     _LABEL_W = 64
     _FIELD_W = 92
-    _LABEL2_W = 32
+    _LABEL2_W = 36
+    _PAIR_GAP = 24
 
     def __init__(self, time_us: float, on_remove, on_change) -> None:
         super().__init__()
@@ -368,7 +457,6 @@ class ExposureRow(QFrame):
         self.image: np.ndarray | None = None
         self.file_count = 0
         self._meta_core = ""
-        self._file_full_name = ""
         self._on_remove = on_remove
         self.setObjectName("fileRow")
         self.setFixedHeight(self.ROW_HEIGHT)
@@ -378,27 +466,32 @@ class ExposureRow(QFrame):
         outer.setContentsMargins(8, 6, 8, 6)
         outer.setSpacing(4)
 
-        grid = QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(4)
-        # col0 check | col1 label | col2 field | col3 label2 | col4 field2 | col5 count | col6 remove
-        grid.setColumnMinimumWidth(1, self._LABEL_W)
-        grid.setColumnMinimumWidth(2, self._FIELD_W)
-        grid.setColumnMinimumWidth(3, self._LABEL2_W)
-        grid.setColumnMinimumWidth(4, self._FIELD_W)
-        grid.setColumnStretch(5, 1)
-
         def field_label(text: str, width: int) -> QLabel:
             label = _muted_label(text)
             label.setFixedWidth(width)
             label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             return label
 
+        def pair_row(
+            left_text: str,
+            left_widget,
+            right_text: str,
+            right_widget,
+        ) -> QHBoxLayout:
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+            row.addWidget(field_label(left_text, self._LABEL_W), 0, Qt.AlignVCenter)
+            row.addWidget(left_widget, 0, Qt.AlignVCenter)
+            row.addSpacing(self._PAIR_GAP)
+            row.addWidget(field_label(right_text, self._LABEL2_W), 0, Qt.AlignVCenter)
+            row.addWidget(right_widget, 0, Qt.AlignVCenter)
+            row.addStretch(1)
+            return row
+
         self.use = QCheckBox()
         self.use.setToolTip("取消後這張不參與這次計算。")
         self.use.toggled.connect(on_change)
-        us_label = field_label("曝光", self._LABEL_W)
         self.time = _spin(
             1e-3,
             1e12,
@@ -422,9 +515,10 @@ class ExposureRow(QFrame):
         self.average_n = OptionalNumberBox(
             None,
             "排序後每 N 張加總平均成一張；餘數丟掉。"
-            "按計算時取「目前張數」對應的那一段，只做一次融合。"
-            "空白＝不採用（維持原樣）。N 大於總張數會擋下計算。"
-            "有勾批次融合時此欄暫不套用，改依原始張數逐筆融合。",
+            "未勾批次時按計算：每一段都融合並進距離表可切筆；"
+            "筆數取各曝光段數／張數最大值，較短的重複最後一段／最後一張。"
+            "空白＝不採用。N 大於總張數會擋下。"
+            "有勾批次時此欄不套用：單曝光逐張原圖；多曝光逐筆融合。",
             width=self._FIELD_W,
         )
         self.average_n.setPlaceholderText("不採用")
@@ -453,36 +547,26 @@ class ExposureRow(QFrame):
         self.color_floor.numberChanged.connect(on_change)
         self.color_ceil.numberChanged.connect(on_change)
 
-        # Row 0: checkbox | 曝光 | time | … | 共 N 張 | 移除
-        grid.addWidget(self.use, 0, 0, Qt.AlignVCenter)
-        grid.addWidget(us_label, 0, 1, Qt.AlignVCenter)
-        grid.addWidget(self.time, 0, 2, Qt.AlignVCenter)
-        grid.addWidget(self.count_value, 0, 5, Qt.AlignVCenter)
-        grid.addWidget(self.remove, 0, 6, Qt.AlignVCenter)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(8)
+        top.addWidget(self.use, 0, Qt.AlignVCenter)
+        top.addWidget(field_label("曝光", self._LABEL_W), 0, Qt.AlignVCenter)
+        top.addWidget(self.time, 0, Qt.AlignVCenter)
+        top.addWidget(self.count_value, 0, Qt.AlignVCenter)
+        top.addStretch(1)
+        top.addWidget(self.remove, 0, Qt.AlignVCenter)
 
-        # Row 1: filename
-        self.file_label = QLabel("")
-        self.file_label.setObjectName("fileMeta")
-        self.file_label.setWordWrap(False)
-        self.file_label.setMinimumWidth(0)
-        self.file_label.setMinimumHeight(self.file_label.fontMetrics().height() + 2)
-        self.file_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        self.file_label.setStyleSheet("color: #8a939c; background: transparent;")
-        grid.addWidget(self.file_label, 1, 1, 1, 6)
+        self.name_scroll = _NameScroll("", "")
 
-        # Row 2: 加總平均 | N | 倍率 | gain  (fields share columns with row 0 / 3)
-        grid.addWidget(field_label("加總平均", self._LABEL_W), 2, 1, Qt.AlignVCenter)
-        grid.addWidget(self.average_n, 2, 2, Qt.AlignVCenter)
-        grid.addWidget(field_label("倍率", self._LABEL2_W), 2, 3, Qt.AlignVCenter)
-        grid.addWidget(self.gain, 2, 4, Qt.AlignVCenter)
-
-        # Row 3: 下限 | floor | 上限 | ceil
-        grid.addWidget(field_label("下限", self._LABEL_W), 3, 1, Qt.AlignVCenter)
-        grid.addWidget(self.color_floor, 3, 2, Qt.AlignVCenter)
-        grid.addWidget(field_label("上限", self._LABEL2_W), 3, 3, Qt.AlignVCenter)
-        grid.addWidget(self.color_ceil, 3, 4, Qt.AlignVCenter)
-
-        outer.addLayout(grid)
+        outer.addLayout(top)
+        outer.addWidget(self.name_scroll, 0, Qt.AlignLeft)
+        outer.addLayout(
+            pair_row("加總平均", self.average_n, "倍率", self.gain)
+        )
+        outer.addLayout(
+            pair_row("下限", self.color_floor, "上限", self.color_ceil)
+        )
         self.use.setChecked(True)
 
     def minimumSizeHint(self):
@@ -490,19 +574,6 @@ class ExposureRow(QFrame):
 
     def sizeHint(self):
         return QSize(280, self.ROW_HEIGHT)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._refresh_file_label()
-
-    def _refresh_file_label(self) -> None:
-        name = self._file_full_name
-        if not name:
-            self.file_label.setText("")
-            return
-        metrics = self.file_label.fontMetrics()
-        width = max(self.file_label.width(), 40)
-        self.file_label.setText(metrics.elidedText(name, Qt.ElideMiddle, width))
 
     def average_count(self) -> int | None:
         """N for chunk averaging, or None when unused."""
@@ -543,11 +614,9 @@ class ExposureRow(QFrame):
         self.image = image
         name, meta = self._describe()
         self._meta_core = meta
-        self._file_full_name = name
         tip = f"{path}\n{meta}"
-        self.file_label.setToolTip(tip)
+        self.name_scroll.set_text(name, tip)
         self.count_value.setToolTip(tip)
-        self._refresh_file_label()
         self.time.setValue(self.slot_us)
         self.time.setEnabled(True)
         if keep_preprocess and preprocess is not None:
@@ -587,12 +656,12 @@ class ExposureRow(QFrame):
 
 
 class SpotPickDialog(QDialog):
-    """Pick exactly one spot folder; checkboxes are exclusive."""
+    """Pick exactly one spot; checkboxes are exclusive."""
 
     def __init__(
         self,
-        spots: list[Path],
-        current: Path | None = None,
+        spots: list[SpotRef],
+        current: SpotRef | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -600,7 +669,7 @@ class SpotPickDialog(QDialog):
         self.resize(420, 520)
         self._spots = list(spots)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("勾選一個點位（不可多選）。依資料夾名稱排序。"))
+        layout.addWidget(QLabel("勾選一個點位（不可多選）。依名稱排序。"))
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -610,14 +679,16 @@ class SpotPickDialog(QDialog):
         host_layout.setSpacing(6)
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
-        current_key = current.resolve() if current is not None else None
         checked = False
         for index, spot in enumerate(self._spots):
-            box = QCheckBox(spot.name)
-            box.setToolTip(str(spot))
+            box = QCheckBox(spot.label)
+            tip = str(spot.root)
+            if spot.xy is not None:
+                tip += f"\nX={spot.xy[0]:.2f}, Y={spot.xy[1]:.2f}"
+            box.setToolTip(tip)
             self._group.addButton(box, index)
             host_layout.addWidget(box)
-            if current_key is not None and spot.resolve() == current_key:
+            if current is not None and spot.matches(current):
                 box.setChecked(True)
                 checked = True
         if not checked and self._spots:
@@ -637,7 +708,7 @@ class SpotPickDialog(QDialog):
         buttons.addWidget(cancel)
         layout.addLayout(buttons)
 
-    def selected_spot(self) -> Path | None:
+    def selected_spot(self) -> SpotRef | None:
         button_id = self._group.checkedId()
         if button_id < 0 or button_id >= len(self._spots):
             return None
@@ -947,13 +1018,16 @@ class HdrTestWindow(QMainWindow):
         self.analysis: SpotPanel | None = None
         self._export_full_scale = True
         self.parent_root: Path | None = None
-        self.spot_dirs: list[Path] = []
+        self.spot_dirs: list[SpotRef] = []
+        self.current_spot: SpotRef | None = None
         self.source_root: Path | None = None
         self.source_groups: dict[float, list[Path]] | None = None
+        self.active_xy: tuple[float, float] | None = None
         self.crop_origin: tuple[int, int] | None = None
         self.crop_size: tuple[int, int] | None = None
         self.batch_planes: list[np.ndarray] = []
         self.batch_labels: list[str] = []
+        self._result_file_label: str = ""
         self._batch_running = False
         self._batch_stop = False
         # Persist across spot switches under the same parent folder.
@@ -1027,8 +1101,8 @@ class HdrTestWindow(QMainWindow):
         add_files.clicked.connect(self._add_files)
         self.btn_crop = QPushButton("調整範圍")
         self.btn_crop.setToolTip(
-            "選擇計算範圍：全屏、512×512，或自行輸入寬高後拖移方框。"
-            "計算和批次融合都用這一塊。清空、換點位或重新載入後要再選一次。"
+            "手動選擇計算範圍：全屏、512×512，或自行輸入寬高後拖移方框。"
+            "載入後不自動跳出；需要時再按此鈕。計算和批次融合都用這一塊。"
         )
         self.btn_crop.clicked.connect(self._adjust_crop)
         clear = QPushButton("清空")
@@ -1243,32 +1317,26 @@ class HdrTestWindow(QMainWindow):
         self.btn_run = QPushButton("計算")
         self.btn_run.setObjectName("primary")
         self.btn_run.clicked.connect(self._compute)
-        self.btn_analyze = QPushButton("分析")
-        self.btn_analyze.setEnabled(False)
-        self.btn_analyze.setToolTip(
-            "把目前融合結果送進分析區並重抓光斑。"
-            "數值是 × 255 之後的 8-bit 尺度。兩種 Mertens 已經 × 255；"
-            "Debevec、Robertson 和單張會再 × 255。不含 log。彩色影像用三個通道的平均。"
-        )
-        self.btn_analyze.clicked.connect(self._open_analysis)
         self.btn_export = QPushButton("匯出")
         self.btn_export.setEnabled(False)
         self.btn_export.setToolTip(
             "選一個資料夾，一次寫出剖面 CSV、熱圖、npy 和參數 JSON。"
             "檔名都帶時間戳。熱圖沿用畫布的色階和剖面，不含色條與十字。"
-            "npy 不含 log。Debevec、Robertson 和單張再 × 滿量；兩種 Mertens 已經 × 255。"
+            "npy 不含 log。多曝光 Debevec／Robertson 再 × 滿量；"
+            "單張保持前處理後尺度；兩種 Mertens 已經 × 255。"
         )
         self.btn_export.clicked.connect(self._export_bundle)
         actions.addWidget(self.btn_run, 1)
-        actions.addWidget(self.btn_analyze, 1)
         actions.addWidget(self.btn_export, 1)
         left_layout.addLayout(actions)
         self.batch_check = QCheckBox("批次融合")
         self.batch_check.setToolTip(
-            "勾選後用目前的演算法、倍率、color scale 和高斯模糊，"
-            "依原始張數逐筆融合目前點位（或主資料夾）。不會跨點位；加總平均 N 暫不套用。"
-            "未勾選時按計算：有填加總平均則平均後只融一次。"
-            "分析區可逐筆查看；過程中取消勾選會停下來。"
+            "勾選後依原始張數處理目前點位（或主資料夾）；不會跨點位；加總平均 N 不套用。"
+            "只勾一個曝光：不做融合，逐張套倍率／color scale／高斯模糊後進分析區可切筆。"
+            "勾兩個以上曝光：用目前演算法逐筆融合。"
+            "未勾選時按計算：有填加總平均則每一段平均後都融合，"
+            "筆數取各曝光「段數或張數」的最大值，較短的重複最後一段／最後一張。"
+            "過程中取消勾選會停下來。"
         )
         self.batch_check.toggled.connect(self._on_batch_toggled)
         left_layout.addWidget(self.batch_check)
@@ -1484,7 +1552,34 @@ class HdrTestWindow(QMainWindow):
         root = Path(folder)
         self._clear_spot_list()
         self._clear_exposure_session()
-        added, reused = self._load_exposure_folder(root, keep_preprocess=False, offer_crop=True)
+        xy_spots = self._scan_xy_spots(root)
+        if xy_spots:
+            if len(xy_spots) > 1:
+                dialog = SpotPickDialog(xy_spots, None, self)
+                if dialog.exec_() != QDialog.Accepted:
+                    return
+                spot = dialog.selected_spot()
+                if spot is None:
+                    QMessageBox.warning(self, "尚未勾選", "請勾選一個點位。")
+                    return
+                self.parent_root = root
+                self.spot_dirs = xy_spots
+                self.btn_spot.setEnabled(True)
+            else:
+                spot = xy_spots[0]
+            added, reused = self._load_spot(spot, keep_preprocess=False, offer_crop=False)
+            self._refresh_spot_label()
+            note = f"已載入主資料夾 {root.name}，點位 {spot.label}（由檔名讀取 X／Y／曝光）。"
+            if reused:
+                note += " 張數不夠的曝光固定用最後一張：" + "、".join(reused)
+            if added or reused:
+                self.stats.setText(note)
+            return
+        added, reused = self._load_spot(
+            SpotRef(label=root.name, root=root, xy=None),
+            keep_preprocess=False,
+            offer_crop=False,
+        )
         if reused:
             self.stats.setText("已載入。張數不夠的曝光固定用最後一張：" + "、".join(reused))
         elif added:
@@ -1500,7 +1595,7 @@ class HdrTestWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "沒有點位",
-                "這個父資料夾底下沒有含曝光影像的子資料夾。",
+                "這個父資料夾底下沒有含曝光影像的子資料夾，也沒有可從檔名讀取 X／Y 的影像。",
             )
             return
         dialog = SpotPickDialog(spots, None, self)
@@ -1515,11 +1610,9 @@ class HdrTestWindow(QMainWindow):
         self.btn_spot.setEnabled(True)
         self._clear_exposure_session()
         self._refresh_source_label()
-        added, reused = self._load_exposure_folder(
-            spot, keep_preprocess=False, offer_crop=True
-        )
+        added, reused = self._load_spot(spot, keep_preprocess=False, offer_crop=False)
         self._refresh_spot_label()
-        note = f"已載入父資料夾，共 {len(spots)} 個點位，目前 {spot.name}。"
+        note = f"已載入父資料夾，共 {len(spots)} 個點位，目前 {spot.label}。"
         if reused:
             note += " 張數不夠的曝光固定用最後一張：" + "、".join(reused)
         if added or reused:
@@ -1527,23 +1620,20 @@ class HdrTestWindow(QMainWindow):
 
     def _pick_spot(self) -> None:
         if not self.spot_dirs:
-            QMessageBox.warning(self, "沒有點位", "請先載入父資料夾。")
+            QMessageBox.warning(self, "沒有點位", "請先載入父資料夾或含多點位的主資料夾。")
             return
-        current = self.source_root if self.parent_root is not None else None
-        dialog = SpotPickDialog(self.spot_dirs, current, self)
+        dialog = SpotPickDialog(self.spot_dirs, self.current_spot, self)
         if dialog.exec_() != QDialog.Accepted:
             return
         spot = dialog.selected_spot()
         if spot is None:
             QMessageBox.warning(self, "尚未勾選", "請勾選一個點位。")
             return
-        if self.source_root is not None and spot.resolve() == self.source_root.resolve():
+        if self.current_spot is not None and spot.matches(self.current_spot):
             return
-        added, reused = self._load_exposure_folder(
-            spot, keep_preprocess=True, offer_crop=True
-        )
+        added, reused = self._load_spot(spot, keep_preprocess=True, offer_crop=False)
         self._refresh_spot_label()
-        note = f"已切換點位 {spot.name}。"
+        note = f"已切換點位 {spot.label}。"
         if reused:
             note += " 張數不夠的曝光固定用最後一張：" + "、".join(reused)
         if added or reused:
@@ -1552,20 +1642,26 @@ class HdrTestWindow(QMainWindow):
     def _clear_spot_list(self) -> None:
         self.parent_root = None
         self.spot_dirs = []
+        self.current_spot = None
+        self.active_xy = None
         self.btn_spot.setEnabled(False)
         self.spot_name.setText("尚未選擇")
         self.spot_name.setToolTip("")
 
     def _refresh_spot_label(self) -> None:
-        if self.parent_root is None or self.source_root is None:
+        spot = self.current_spot
+        if spot is None:
             self.spot_name.setText("尚未選擇")
             self.spot_name.setToolTip("")
             return
-        self.spot_name.setText(self.source_root.name)
-        self.spot_name.setToolTip(str(self.source_root))
+        self.spot_name.setText(spot.label)
+        tip = str(spot.root)
+        if spot.xy is not None:
+            tip += f"\nX={spot.xy[0]:.2f}, Y={spot.xy[1]:.2f}"
+        self.spot_name.setToolTip(tip)
 
-    def _scan_spots(self, parent: Path) -> list[Path]:
-        spots: list[Path] = []
+    def _scan_spots(self, parent: Path) -> list[SpotRef]:
+        spots: list[SpotRef] = []
         try:
             children = list(parent.iterdir())
         except OSError:
@@ -1574,7 +1670,30 @@ class HdrTestWindow(QMainWindow):
             if not path.is_dir():
                 continue
             if self._scan_source(path):
-                spots.append(path)
+                spots.append(SpotRef(label=path.name, root=path, xy=None))
+                continue
+            xy_spots = self._scan_xy_spots(path)
+            spots.extend(xy_spots)
+        if spots:
+            return spots
+        return self._scan_xy_spots(parent)
+
+    def _scan_xy_spots(self, root: Path) -> list[SpotRef]:
+        """Flat folder: group images by X／Y parsed from Basler-style filenames."""
+        by_xy: dict[tuple[float, float], dict[float, list[Path]]] = {}
+        for path in list_images(root):
+            xy = parse_xy_from_name(path.name)
+            time_us = exposure_us_from_name(path.name)
+            if xy is None or time_us is None:
+                continue
+            key = xy_key(xy)
+            exp = self._exposure_key(time_us)
+            by_xy.setdefault(key, {}).setdefault(exp, []).append(path)
+        spots: list[SpotRef] = []
+        for key in sorted(by_xy.keys(), key=lambda item: (item[1], item[0])):
+            if not by_xy[key]:
+                continue
+            spots.append(SpotRef(label=format_xy_label(key), root=root, xy=key))
         return spots
 
     @staticmethod
@@ -1589,16 +1708,38 @@ class HdrTestWindow(QMainWindow):
         for row in self.rows:
             self._exposure_prefs[self._exposure_key(row.slot_us)] = row.preprocess_state()
 
+    def _load_spot(
+        self,
+        spot: SpotRef,
+        *,
+        keep_preprocess: bool,
+        offer_crop: bool,
+    ) -> tuple[int, list[str]]:
+        return self._load_exposure_folder(
+            spot.root,
+            keep_preprocess=keep_preprocess,
+            offer_crop=offer_crop,
+            xy=spot.xy,
+            spot=spot,
+        )
+
     def _load_exposure_folder(
         self,
         root: Path,
         *,
         keep_preprocess: bool,
         offer_crop: bool,
+        xy: tuple[float, float] | None = None,
+        spot: SpotRef | None = None,
     ) -> tuple[int, list[str]]:
-        groups = self._scan_source(root)
+        groups = self._scan_source(root, xy=xy)
         if not groups:
-            QMessageBox.warning(self, "沒有影像", "這個資料夾裡沒有可辨認曝光時間的影像檔。")
+            QMessageBox.warning(
+                self,
+                "沒有影像",
+                "這個資料夾裡沒有可辨認曝光時間的影像檔"
+                + ("（或沒有符合此 X／Y 的檔案）。" if xy is not None else "。"),
+            )
             return 0, []
         if not keep_preprocess:
             self._clear_exposure_session()
@@ -1637,7 +1778,7 @@ class HdrTestWindow(QMainWindow):
         self.response = None
         self.batch_planes = []
         self.batch_labels = []
-        self.btn_analyze.setEnabled(False)
+        self._result_file_label = ""
         if self.batch_check.isChecked():
             self.batch_check.blockSignals(True)
             self.batch_check.setChecked(False)
@@ -1646,10 +1787,17 @@ class HdrTestWindow(QMainWindow):
         self.batch_bar.setValue(0)
         self.batch_bar.setFormat("尚未批次融合")
         self.source_root = root
+        self.active_xy = xy_key(xy) if xy is not None else None
+        self.current_spot = spot or SpotRef(
+            label=format_xy_label(xy) if xy is not None else root.name,
+            root=root,
+            xy=self.active_xy,
+        )
         self.source_groups = groups
         self._refresh_source_label()
         if self.analysis is not None:
-            self.analysis.set_source_folder(root)
+            spot_key = self.current_spot.label if self.current_spot else None
+            self.analysis.set_source_folder(root, spot_key=spot_key)
         added = self._add_paths(
             chosen,
             compute=False,
@@ -1667,8 +1815,13 @@ class HdrTestWindow(QMainWindow):
             reused.append("沿用已移除曝光（未載入）：" + "、".join(skipped_removed))
         return added, reused
 
-    def _scan_source(self, root: Path) -> dict[float, list[Path]]:
+    def _scan_source(
+        self,
+        root: Path,
+        xy: tuple[float, float] | None = None,
+    ) -> dict[float, list[Path]]:
         groups: dict[float, list[Path]] = {}
+        want = xy_key(xy) if xy is not None else None
         for path in sorted(root.iterdir(), key=lambda item: _natural_name_key(item.name)):
             if not path.is_dir():
                 continue
@@ -1677,6 +1830,13 @@ class HdrTestWindow(QMainWindow):
                 continue
             key = self._exposure_key(time_us)
             files = list_images(path)
+            if want is not None:
+                files = [
+                    file
+                    for file in files
+                    if (parsed := parse_xy_from_name(file.name)) is not None
+                    and xy_key(parsed) == want
+                ]
             if files:
                 # Same exposure key from two folder names: keep separate lists concatenated
                 # only when keys truly match (normalized), never mix 50us with 10000us.
@@ -1687,6 +1847,10 @@ class HdrTestWindow(QMainWindow):
             time_us = exposure_us_from_name(path.name)
             if time_us is None:
                 continue
+            if want is not None:
+                parsed = parse_xy_from_name(path.name)
+                if parsed is None or xy_key(parsed) != want:
+                    continue
             key = self._exposure_key(time_us)
             groups.setdefault(key, []).append(path)
         return groups
@@ -1788,23 +1952,19 @@ class HdrTestWindow(QMainWindow):
             self.stats.setText("已移除全部曝光列。")
 
     def _invalidate_fusion_after_exposure_change(self) -> None:
-        """Drop stale batch / preview so removed exposures cannot keep driving frame count."""
+        """Mark fusion stale after an exposure row is removed; do not auto-recompute."""
         self.batch_planes = []
         self.batch_labels = []
-        self.raw = None
-        self.preview = None
-        self.shown = None
-        self.response = None
-        self.btn_analyze.setEnabled(False)
+        self._result_file_label = ""
         if self.batch_check.isChecked():
             self.batch_check.blockSignals(True)
             self.batch_check.setChecked(False)
             self.batch_check.blockSignals(False)
         self.batch_bar.setRange(0, 1)
         self.batch_bar.setValue(0)
-        self.batch_bar.setFormat("曝光已變更，請重新計算")
-        if self.analysis is not None:
-            self.analysis.set_batch([], [])
+        self.batch_bar.setFormat("曝光已變更")
+        # Keep current heatmap; fusion only updates when the user presses 計算.
+        self.stats.setText("已移除曝光；熱圖保留，請再按計算更新。")
 
     def _sync_file_scroll_height(self) -> None:
         n = len(self.rows)
@@ -1838,9 +1998,24 @@ class HdrTestWindow(QMainWindow):
         self.source_groups = None
         self.batch_planes = []
         self.batch_labels = []
+        self._result_file_label = ""
+        self.raw = None
+        self.preview = None
+        self.shown = None
+        self.response = None
+        self.cross_xy = None
+        self.btn_export.setEnabled(False)
+        self.image_item.clear()
+        self.curve_x.setData([], [])
+        self.curve_y.setData([], [])
+        self.vline.hide()
+        self.hline.hide()
+        self.response_plot.clear()
+        self.stats.setText("尚未計算。")
         self._clear_spot_list()
         self._refresh_source_label()
         if self.analysis is not None:
+            self.analysis.clear_view()
             self.analysis.set_source_folder(None)
 
     def _crop_source_image(self) -> np.ndarray | None:
@@ -1849,7 +2024,22 @@ class HdrTestWindow(QMainWindow):
                 return row.image
         return None
 
+    def _ensure_default_crop(self) -> bool:
+        """Use the full first image when no range was set. Never opens a dialog."""
+        if self.crop_origin is not None and self.crop_size is not None:
+            return True
+        image = self._crop_source_image()
+        if image is None:
+            return False
+        height, width = int(image.shape[0]), int(image.shape[1])
+        if width < 1 or height < 1:
+            return False
+        self.crop_origin = (0, 0)
+        self.crop_size = (width, height)
+        return True
+
     def _offer_crop(self) -> bool:
+        """Manual range dialog; only used from「調整範圍」."""
         image = self._crop_source_image()
         if image is None:
             QMessageBox.warning(self, "沒有影像", "請先載入影像。")
@@ -1879,15 +2069,9 @@ class HdrTestWindow(QMainWindow):
         self._offer_crop()
 
     def _crop_image(self, image: np.ndarray) -> np.ndarray:
-        if self.crop_origin is None or self.crop_size is None:
-            raise RuntimeError("請先選擇計算範圍。")
-        x, y = self.crop_origin
-        crop_w, crop_h = self.crop_size
-        data = np.asarray(image)
-        height, width = int(data.shape[0]), int(data.shape[1])
-        if x < 0 or y < 0 or x + crop_w > width or y + crop_h > height:
-            raise RuntimeError("計算範圍超出影像。")
-        return data[y : y + crop_h, x : x + crop_w]
+        if not self._ensure_default_crop():
+            raise RuntimeError("沒有可計算的影像。")
+        return crop_array(image, self.crop_origin, self.crop_size)
 
     def _selected(self) -> list[ExposureRow]:
         return [row for row in self.rows if row.image is not None and row.use.isChecked()]
@@ -1911,7 +2095,9 @@ class HdrTestWindow(QMainWindow):
         return settings
 
     def _compute(self) -> None:
-        # Batch checkbox → raw-frame batch. Otherwise one fuse (average-N applied if set).
+        # Batch checkbox → raw-frame batch (ignores average-N).
+        # Otherwise: average-N expands to one plane per chunk; fuse all indices
+        # (pad shorter exposures with their last plane) into the distance table.
         if self.batch_check.isChecked():
             self._compute_batch()
             return
@@ -1919,24 +2105,108 @@ class HdrTestWindow(QMainWindow):
         if not selected:
             QMessageBox.warning(self, "沒有影像", "請至少勾選一張影像。")
             return
-        if (self.crop_origin is None or self.crop_size is None) and not self._offer_crop():
-            QMessageBox.warning(self, "尚未框選", "請先選擇計算範圍。")
+        if not self._ensure_default_crop():
+            QMessageBox.warning(self, "沒有影像", "請至少勾選一張影像。")
             return
         try:
             series, notes = self._prepare_exposure_series(selected)
-            images = [planes[0] for planes in series]
-            raw, response, single = self._fuse_images(selected, images)
+            count = max((len(planes) for planes in series), default=0)
+            if count < 1:
+                raise RuntimeError("沒有可融合的影像。")
+            labels = self._series_file_labels(selected, count)
+            if count == 1:
+                images = [planes[0] for planes in series]
+                raw, response, single = self._fuse_images(selected, images)
+                used_average = any(row.average_count() is not None for row in selected)
+                if used_average:
+                    plane = self._analysis_from_raw(raw, single)
+                    self.batch_planes = [np.asarray(plane, dtype=np.float32)]
+                    self.batch_labels = labels
+                else:
+                    self.batch_planes = []
+                    self.batch_labels = []
+                self._result_file_label = labels[0] if used_average else ""
+                self._show_fused(raw, response, single, selected)
+            else:
+                self._compute_average_series(selected, series, labels)
         except RuntimeError as exc:
             QMessageBox.warning(self, "無法計算", str(exc))
             return
         except Exception as exc:
             QMessageBox.warning(self, "計算失敗", str(exc))
             return
-        self.batch_planes = []
-        self.batch_labels = []
-        self._show_fused(raw, response, single, selected)
         if notes:
             self.stats.setText("\n".join(notes) + "\n" + self.stats.text())
+
+    def _series_file_labels(self, selected: list[ExposureRow], count: int) -> list[str]:
+        """Labels for distance table / export ``file`` column.
+
+        Averaged chunks use 1-based inclusive ranges (``1 - 10``, ``11 - 20``, …)
+        from the first selected exposure that has 加總平均 N.
+        """
+        n = next(
+            (
+                row.average_count()
+                for row in selected
+                if row.average_count() is not None
+            ),
+            None,
+        )
+        labels: list[str] = []
+        for index in range(max(0, int(count))):
+            if n is not None:
+                start = index * int(n) + 1
+                end = (index + 1) * int(n)
+                labels.append(f"{start} - {end}")
+            else:
+                labels.append(f"段{index}")
+        return labels
+
+    def _compute_average_series(
+        self,
+        selected: list[ExposureRow],
+        series: list[list[np.ndarray]],
+        labels: list[str] | None = None,
+    ) -> None:
+        """Fuse every index of preprocessed planes; pad short lists with the last plane."""
+        count = max(len(planes) for planes in series)
+        if labels is None or len(labels) != count:
+            labels = self._series_file_labels(selected, count)
+        target = int(self.frame_index.value())
+        planes_out: list[np.ndarray] = []
+        shown_raw = None
+        shown_response = None
+        shown_single = False
+        self.batch_bar.setRange(0, count)
+        self.batch_bar.setValue(0)
+        self.btn_run.setEnabled(False)
+        try:
+            for index in range(count):
+                self.batch_bar.setFormat(f"加總平均融合 {index + 1} / {count}")
+                QApplication.processEvents()
+                images = [
+                    planes[min(index, len(planes) - 1)]
+                    for planes in series
+                ]
+                raw, response, single = self._fuse_images(selected, images)
+                plane = self._analysis_from_raw(raw, single)
+                planes_out.append(np.asarray(plane, dtype=np.float32))
+                if shown_raw is None or index == min(target, count - 1):
+                    shown_raw = raw
+                    shown_response = response
+                    shown_single = single
+                self.batch_bar.setValue(index + 1)
+        finally:
+            self.btn_run.setEnabled(True)
+        if not planes_out or shown_raw is None:
+            self.batch_bar.setFormat("加總平均融合失敗")
+            self.batch_bar.setValue(0)
+            raise RuntimeError("加總平均融合沒有結果。")
+        self.batch_planes = planes_out
+        self.batch_labels = list(labels)
+        self._result_file_label = ""
+        self.batch_bar.setFormat(f"加總平均已完成 {len(planes_out)} / {count}")
+        self._show_fused(shown_raw, shown_response, shown_single, selected)
 
     def _on_batch_toggled(self, checked: bool) -> None:
         if self._batch_running:
@@ -1952,7 +2222,7 @@ class HdrTestWindow(QMainWindow):
         if self.source_groups:
             raw_folders = self.source_groups
         elif self.source_root is not None and self.source_root.is_dir():
-            raw_folders = self._scan_source(self.source_root)
+            raw_folders = self._scan_source(self.source_root, xy=self.active_xy)
         else:
             raise RuntimeError("請先用「載入主資料夾」或「載入父資料夾」載入資料。")
         selected = self._selected()
@@ -1978,17 +2248,19 @@ class HdrTestWindow(QMainWindow):
     def _compute_batch(self) -> bool:
         if self._batch_running:
             return False
-        if (self.crop_origin is None or self.crop_size is None) and not self._offer_crop():
+        if not self._ensure_default_crop():
+            QMessageBox.warning(self, "沒有影像", "請至少勾選一張影像。")
             return False
         try:
             folders, selected, count = self._batch_sources()
         except RuntimeError as exc:
             QMessageBox.warning(self, "無法批次融合", str(exc))
             return False
+        # One exposure: show each raw frame after preprocess; no HDR fuse.
+        single_exposure = len(selected) == 1
         self._batch_running = True
         self._batch_stop = False
         self.btn_run.setEnabled(False)
-        self.btn_analyze.setEnabled(False)
         self.batch_bar.setRange(0, count)
         self.batch_bar.setValue(0)
         width_x, width_y, sigma = self._smooth_widths()
@@ -2005,47 +2277,77 @@ class HdrTestWindow(QMainWindow):
         failed_at: int | None = None
         try:
             for index in range(count):
-                self.batch_bar.setFormat(f"正在融合第 {index + 1} / {count} 筆")
+                if single_exposure:
+                    self.batch_bar.setFormat(f"正在載入第 {index + 1} / {count} 張")
+                else:
+                    self.batch_bar.setFormat(f"正在融合第 {index + 1} / {count} 筆")
                 QApplication.processEvents()
                 if self._batch_stop:
                     canceled = True
                     break
                 try:
-                    images = []
-                    times = []
-                    for row in selected:
+                    if single_exposure:
+                        row = selected[0]
                         files = self._files_for_exposure(folders, row.slot_us) or []
-                        path = files[min(index, len(files) - 1)]
+                        path = files[index]
                         image = self._crop_image(load_hdr_image(path))
-                        images.append(preprocess_exposure(
-                            image,
-                            float(row.gain.value()),
-                            row.color_floor.number(),
-                            row.color_ceil.number(),
-                            width_x,
-                            width_y,
-                            sigma,
-                        ))
-                        times.append(float(row.time.value()))
-                    if len(images) == 1:
-                        raw = np.asarray(images[0], dtype=np.float32)
+                        raw = np.asarray(
+                            preprocess_exposure(
+                                image,
+                                float(row.gain.value()),
+                                row.color_floor.number(),
+                                row.color_ceil.number(),
+                                width_x,
+                                width_y,
+                                sigma,
+                            ),
+                            dtype=np.float32,
+                        )
                         response = None
                         single = True
+                        labels.append(path.name)
                     else:
-                        raw, response = run_hdr(images, times, algorithm, full_scale, settings)
+                        images = []
+                        times = []
+                        for row in selected:
+                            files = self._files_for_exposure(folders, row.slot_us) or []
+                            path = files[min(index, len(files) - 1)]
+                            image = self._crop_image(load_hdr_image(path))
+                            images.append(
+                                preprocess_exposure(
+                                    image,
+                                    float(row.gain.value()),
+                                    row.color_floor.number(),
+                                    row.color_ceil.number(),
+                                    width_x,
+                                    width_y,
+                                    sigma,
+                                )
+                            )
+                            times.append(float(row.time.value()))
+                        raw, response = run_hdr(
+                            images, times, algorithm, full_scale, settings
+                        )
                         single = False
+                        label_row = max(
+                            selected,
+                            key=lambda row: len(
+                                self._files_for_exposure(folders, row.slot_us) or []
+                            ),
+                        )
+                        label_files = (
+                            self._files_for_exposure(folders, label_row.slot_us) or []
+                        )
+                        labels.append(
+                            label_files[min(index, len(label_files) - 1)].name
+                        )
                 except Exception as exc:
-                    QMessageBox.warning(self, "批次融合失敗", f"第 {index} 筆：{exc}")
+                    kind = "批次載入" if single_exposure else "批次融合"
+                    QMessageBox.warning(self, f"{kind}失敗", f"第 {index} 筆：{exc}")
                     failed_at = index
                     break
                 plane = self._analysis_from_raw(raw, single)
                 planes.append(np.asarray(plane, dtype=np.float32))
-                label_row = max(
-                    selected,
-                    key=lambda row: len(self._files_for_exposure(folders, row.slot_us) or []),
-                )
-                label_files = self._files_for_exposure(folders, label_row.slot_us) or []
-                labels.append(label_files[min(index, len(label_files) - 1)].name)
                 if shown_raw is None or index == target:
                     shown_raw = raw
                     shown_response = response
@@ -2054,14 +2356,15 @@ class HdrTestWindow(QMainWindow):
         finally:
             self._batch_running = False
             self.btn_run.setEnabled(True)
-            if self.raw is not None or self.batch_planes:
-                self.btn_analyze.setEnabled(True)
         if not planes or shown_raw is None:
-            self.batch_bar.setFormat("批次融合失敗" if failed_at is not None else "尚未批次融合")
+            fail_label = "批次載入失敗" if single_exposure else "批次融合失敗"
+            idle_label = "尚未批次載入" if single_exposure else "尚未批次融合"
+            self.batch_bar.setFormat(fail_label if failed_at is not None else idle_label)
             self.batch_bar.setValue(0)
             return False
         self.batch_planes = planes
         self.batch_labels = labels
+        self._result_file_label = ""
         if not self.batch_check.isChecked():
             self.batch_check.blockSignals(True)
             self.batch_check.setChecked(True)
@@ -2075,13 +2378,18 @@ class HdrTestWindow(QMainWindow):
             )
         elif canceled:
             self.batch_bar.setFormat(f"已停止 {done} / {count}")
+            action = "批次載入" if single_exposure else "批次融合"
             self.stats.setText(
-                f"批次融合已停止，完成 {done} / {count} 筆。\n" + self.stats.text()
+                f"{action}已停止，完成 {done} / {count} 筆。\n" + self.stats.text()
+            )
+        elif single_exposure:
+            self.batch_bar.setFormat(f"已載入 {done} / {count} 張原圖")
+            self.stats.setText(
+                f"單曝光批次：已載入 {done} 張原圖（未融合）。\n" + self.stats.text()
             )
         else:
             self.batch_bar.setFormat(f"已完成 {done} / {count}")
             self.stats.setText(f"批次融合完成 {done} 筆。\n" + self.stats.text())
-        self.btn_analyze.setEnabled(True)
         return True
 
     def _fuse_rows(self, selected: list[ExposureRow]) -> tuple[np.ndarray, np.ndarray | None, bool]:
@@ -2106,19 +2414,45 @@ class HdrTestWindow(QMainWindow):
         )
         return raw, response, False
 
+    def _preprocess_plane(
+        self,
+        image: np.ndarray,
+        row: ExposureRow,
+        width_x: int,
+        width_y: int,
+        sigma: float,
+    ) -> np.ndarray:
+        return preprocess_exposure(
+            image,
+            float(row.gain.value()),
+            row.color_floor.number(),
+            row.color_ceil.number(),
+            width_x,
+            width_y,
+            sigma,
+        )
+
     def _prepare_exposure_series(
         self,
         selected: list[ExposureRow],
     ) -> tuple[list[list[np.ndarray]], list[str]]:
-        """One preprocessed plane per exposure (chunk-averaged when N is set)."""
+        """Preprocessed planes per exposure.
+
+        With average-N: every complete chunk becomes one plane.
+        If any selected row uses N, rows without N expand to one plane per raw
+        frame so fusion length = max(chunks, frames) and shorter sides pad.
+        With no N anywhere: one plane at the current frame index (single fuse).
+        """
         folders = self.source_groups
         if not folders and self.source_root is not None and self.source_root.is_dir():
-            folders = self._scan_source(self.source_root)
+            folders = self._scan_source(self.source_root, xy=self.active_xy)
         folders = folders or {}
         width_x, width_y, sigma = self._smooth_widths()
         frame_index = int(self.frame_index.value())
+        expand_raw = any(row.average_count() is not None for row in selected)
         series: list[list[np.ndarray]] = []
         notes: list[str] = []
+        lengths: list[str] = []
         for row in selected:
             files = self._files_for_exposure(folders, row.slot_us)
             if not files:
@@ -2129,21 +2463,25 @@ class HdrTestWindow(QMainWindow):
                     raise RuntimeError(f"{row.slot_us:g} us 沒有影像路徑。")
             n = row.average_count()
             if n is None:
-                pick = min(frame_index, len(files) - 1)
-                image = self._crop_image(load_hdr_image(files[pick]))
-                series.append(
-                    [
-                        preprocess_exposure(
-                            image,
-                            float(row.gain.value()),
-                            row.color_floor.number(),
-                            row.color_ceil.number(),
+                if expand_raw:
+                    planes = [
+                        self._preprocess_plane(
+                            self._crop_image(load_hdr_image(path)),
+                            row,
                             width_x,
                             width_y,
                             sigma,
                         )
+                        for path in files
                     ]
-                )
+                    series.append(planes)
+                    lengths.append(f"{row.slot_us:g} us：{len(planes)} 張（未加總平均）")
+                else:
+                    pick = min(frame_index, len(files) - 1)
+                    image = self._crop_image(load_hdr_image(files[pick]))
+                    series.append(
+                        [self._preprocess_plane(image, row, width_x, width_y, sigma)]
+                    )
                 continue
             if n > len(files):
                 raise RuntimeError(
@@ -2153,41 +2491,66 @@ class HdrTestWindow(QMainWindow):
             if chunks < 1:
                 raise RuntimeError(f"{row.slot_us:g} us 加總平均後沒有完整段。")
             leftover = len(files) - chunks * n
-            chunk_i = min(frame_index, chunks - 1)
-            chunk_paths = files[chunk_i * n : (chunk_i + 1) * n]
-            stack = [
-                np.asarray(self._crop_image(load_hdr_image(path)), dtype=np.float64)
-                for path in chunk_paths
-            ]
-            mean = np.mean(np.stack(stack, axis=0), axis=0)
-            series.append(
-                [
-                    preprocess_exposure(
-                        mean,
-                        float(row.gain.value()),
-                        row.color_floor.number(),
-                        row.color_ceil.number(),
-                        width_x,
-                        width_y,
-                        sigma,
+            if not self._ensure_default_crop():
+                raise RuntimeError("沒有可計算的影像。")
+            origin = (int(self.crop_origin[0]), int(self.crop_origin[1]))
+            size = (int(self.crop_size[0]), int(self.crop_size[1]))
+            total_reads = chunks * n
+            planes = []
+            self.batch_bar.setRange(0, max(total_reads, 1))
+            self.batch_bar.setValue(0)
+            self.btn_run.setEnabled(False)
+            try:
+                for chunk_i in range(chunks):
+                    chunk_paths = files[chunk_i * n : (chunk_i + 1) * n]
+                    base = chunk_i * n
+
+                    def _progress(done: int, _total: int, *, _base=base) -> None:
+                        self.batch_bar.setFormat(
+                            f"加總平均 {row.slot_us:g} us  "
+                            f"{_base + done} / {total_reads}"
+                        )
+                        self.batch_bar.setValue(_base + done)
+                        QApplication.processEvents()
+
+                    mean = average_image_paths(
+                        chunk_paths,
+                        origin,
+                        size,
+                        progress=_progress,
                     )
-                ]
-            )
-            note = (
-                f"{row.slot_us:g} us：N={n}，共 {chunks} 段，"
-                f"用第 {chunk_i + 1} 段（{chunk_i * n}–{chunk_i * n + n - 1}）加總平均後單次融合。"
-            )
+                    planes.append(
+                        self._preprocess_plane(mean, row, width_x, width_y, sigma)
+                    )
+            finally:
+                self.btn_run.setEnabled(True)
+            series.append(planes)
+            note = f"{row.slot_us:g} us：N={n}，共 {chunks} 段加總平均後逐段融合。"
             if leftover:
                 note += f" 餘 {leftover} 張丟掉。"
             notes.append(note)
+            lengths.append(f"{row.slot_us:g} us：{chunks} 段")
+        if expand_raw and lengths:
+            total = max(len(planes) for planes in series)
+            notes.append(
+                "融合筆數 "
+                + str(total)
+                + "（"
+                + "、".join(lengths)
+                + "；較短的重複最後一段／最後一張）。"
+            )
         return series, notes
 
     def _analysis_from_raw(self, raw: np.ndarray, single: bool) -> np.ndarray:
         plane = self._as_plane(raw)
         if plane is None:
             raise RuntimeError("沒有可分析的結果。")
+        # Single exposure: keep preprocessed DN (no ×255).
+        # Mertens already ×255; Debevec/Robertson analysis uses ×255 scale.
+        if single:
+            return plane
         algorithm = str(self.algorithm.currentData())
-        if single or algorithm not in {"mertens", "mertens_local"}:
+        if algorithm not in {"mertens", "mertens_local"}:
             return plane * 255.0
         return plane
 
@@ -2203,11 +2566,14 @@ class HdrTestWindow(QMainWindow):
         self.raw = raw
         self.response = response
         self.preview = raw
-        self._export_full_scale = single or algorithm not in {"mertens", "mertens_local"}
+        # npy ×滿量 only for multi-exposure Debevec/Robertson (not single, not Mertens).
+        self._export_full_scale = (not single) and algorithm not in {
+            "mertens",
+            "mertens_local",
+        }
         self._draw_preview(raw)
         self._draw_response(response)
         self.btn_export.setEnabled(True)
-        self.btn_analyze.setEnabled(True)
         self._push_analysis(switch_view=False)
         finite = raw[np.isfinite(raw)]
         missing = int(np.size(raw) - finite.size)
@@ -2229,7 +2595,9 @@ class HdrTestWindow(QMainWindow):
             title = self.algorithm.currentText()
             kind = "融合結果" if algorithm in {"mertens", "mertens_local"} else "輻射圖"
         scale = float(self.full_scale.value())
-        if self._export_full_scale:
+        if single:
+            saved = "單張不 × 255；分析與匯出 npy 都保持前處理後的原始尺度。"
+        elif self._export_full_scale:
             saved = f"匯出 npy 會再 × 滿量 {scale:g}。"
         else:
             saved = "Mertens 結果已 × 255，回到 8-bit 尺度。匯出 npy 就是這個值，不再乘滿量。"
@@ -2276,11 +2644,8 @@ class HdrTestWindow(QMainWindow):
         self._on_preprocess_changed()
 
     def _on_preprocess_changed(self, *_args) -> None:
+        """Remember preprocess edits only; fusion recomputes when 計算 is pressed."""
         self._sync_exposure_prefs_from_rows()
-        if self.raw is None or self.batch_check.isChecked() or self._batch_running:
-            return
-        if len(self._selected()) >= 1:
-            self._compute()
 
     def _on_log_toggled(self, _checked: bool) -> None:
         self._manual_x = False
@@ -2926,7 +3291,7 @@ class HdrTestWindow(QMainWindow):
         self._update_crosshair(reset_intensity=True)
 
     def _analysis_plane(self) -> np.ndarray | None:
-        """Linear image on the scale after × 255. Mertens is already there."""
+        """Analysis image: single keeps DN; Mertens already ×255; else ×255."""
         plane = self._linear_plane()
         if plane is None:
             return None
@@ -2938,7 +3303,11 @@ class HdrTestWindow(QMainWindow):
         if self.parent_root is not None:
             self.source_name.setText(self.parent_root.name)
             tip = str(self.parent_root)
-            if self.source_root is not None:
+            if self.current_spot is not None:
+                tip = f"{self.parent_root}\n目前點位：{self.current_spot.label}"
+                if self.current_spot.xy is not None:
+                    tip += f" (X={self.current_spot.xy[0]:.2f}, Y={self.current_spot.xy[1]:.2f})"
+            elif self.source_root is not None:
                 tip = f"{self.parent_root}\n目前點位：{self.source_root}"
             self.source_name.setToolTip(tip)
             return
@@ -2947,7 +3316,10 @@ class HdrTestWindow(QMainWindow):
             self.source_name.setToolTip("")
             return
         self.source_name.setText(self.source_root.name)
-        self.source_name.setToolTip(str(self.source_root))
+        tip = str(self.source_root)
+        if self.current_spot is not None and self.current_spot.xy is not None:
+            tip += f"\n點位 {self.current_spot.label}"
+        self.source_name.setToolTip(tip)
 
     def _on_shared_log_toggled(self, checked: bool) -> None:
         if self.log_check.isChecked() != bool(checked):
@@ -2979,6 +3351,12 @@ class HdrTestWindow(QMainWindow):
         del switch_view
         if self.analysis is None:
             return False
+        # Prefer 點位 label for analysis source / export folder name.
+        spot_key = self.current_spot.label if self.current_spot else None
+        self.analysis.set_source_folder(self.source_root, spot_key=spot_key)
+        self.analysis.set_exposure_times(
+            [float(row.time.value()) for row in self._selected()]
+        )
         # Batch fusion leaves planes in batch_planes.
         if self.batch_planes:
             self.analysis.set_batch(self.batch_planes, self.batch_labels)
@@ -2986,14 +3364,11 @@ class HdrTestWindow(QMainWindow):
             plane = self._analysis_plane()
             if plane is None:
                 return False
-            self.analysis.set_image(np.array(plane, copy=True))
-        self.analysis.set_source_folder(self.source_root)
+            self.analysis.set_image(
+                np.array(plane, copy=True),
+                file_label=str(getattr(self, "_result_file_label", "") or ""),
+            )
         return True
-
-    def _open_analysis(self) -> None:
-        if not self._push_analysis():
-            QMessageBox.warning(self, "尚未計算", "請先計算影像。")
-            return
 
     def _export_bundle(self) -> None:
         if self.raw is None or self.shown is None:
@@ -3230,11 +3605,11 @@ class HdrTestWindow(QMainWindow):
         else:
             lo = float(finite.min())
             hi = float(finite.max())
-            if hi <= lo:
-                hi = lo + 1.0
-            pad = (hi - lo) * 0.05
-            lo -= pad
-            hi += pad
+        if hi <= lo:
+            hi = lo + 1.0
+        pad = (hi - lo) * 0.05
+        lo -= pad
+        hi += pad
         if axis == "x":
             plot.setXRange(lo, hi, padding=0)
         else:

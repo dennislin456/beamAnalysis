@@ -1,7 +1,15 @@
 """Local helpers for the HDR window. These no longer import FourStepAdj."""
 
 from common.blur import gaussian_blur
-from common.images import IMAGE_EXTS, classify_exposure, exposure_us_from_name, list_images
+from common.images import (
+    IMAGE_EXTS,
+    classify_exposure,
+    exposure_us_from_name,
+    format_xy_label,
+    list_images,
+    parse_xy_from_name,
+    xy_key,
+)
 from common.sci_format import ask_scientific
 from common.widgets import (
     COLOR_CEIL,
@@ -24,9 +32,12 @@ __all__ = [
     "classify_exposure",
     "exposure_us_from_name",
     "clip_color_scale",
+    "format_xy_label",
     "function_frame",
     "gaussian_blur",
     "install_input_undo",
     "install_no_wheel_on_inputs",
     "list_images",
+    "parse_xy_from_name",
+    "xy_key",
 ]

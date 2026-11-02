@@ -21,6 +21,39 @@ BARE_TOKENS = {
 IMAGE_EXTS = {".npy", ".png", ".bmp", ".tif", ".tiff", ".csv"}
 FRAME_RE = re.compile(r"_(\d+)_\d{8}_\d{6}\.[^.]+$", re.IGNORECASE)
 US_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)us(?!\d)", re.IGNORECASE)
+# Basler-style: X16p00_Y123p80 → (16.00, 123.80); also X16.00_Y123.80.
+_BASLER_XY_RE = re.compile(
+    r"(?:^|_)X(-?\d+)p(\d+)_Y(-?\d+)p(\d+)(?:_|$)",
+    re.IGNORECASE,
+)
+_DOT_XY_RE = re.compile(
+    r"(?:^|_)X(-?\d+(?:\.\d+)?)_Y(-?\d+(?:\.\d+)?)(?:_|$)",
+    re.IGNORECASE,
+)
+
+
+def parse_xy_from_name(name: str) -> tuple[float, float] | None:
+    """Stage XY from a file or folder name. ``p`` means the decimal point."""
+    match = _BASLER_XY_RE.search(name)
+    if match is not None:
+        x = float(f"{match.group(1)}.{match.group(2)}")
+        y = float(f"{match.group(3)}.{match.group(4)}")
+        return x, y
+    match = _DOT_XY_RE.search(name)
+    if match is not None:
+        return float(match.group(1)), float(match.group(2))
+    return None
+
+
+def xy_key(xy: tuple[float, float]) -> tuple[float, float]:
+    """Stable key for grouping stage positions."""
+    return (round(float(xy[0]), 4), round(float(xy[1]), 4))
+
+
+def format_xy_label(xy: tuple[float, float]) -> str:
+    """UI / folder-style label, e.g. ``X16.00_Y123.80``."""
+    x, y = float(xy[0]), float(xy[1])
+    return f"X{x:.2f}_Y{y:.2f}"
 
 
 def exposure_us_from_name(name: str) -> float | None:
