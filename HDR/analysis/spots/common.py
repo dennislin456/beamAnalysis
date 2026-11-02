@@ -161,9 +161,12 @@ def empty_result() -> dict:
         "profile": np.array([]),
         "smooth": np.array([]),
         "mask": None,
+        "lower_mask": None,
         "upper": None,
         "lower": None,
         "raw_sum": np.array([]),
+        "valley_y": None,
+        "savgol": None,
     }
 
 
@@ -329,7 +332,11 @@ def lower_centroid(
     center_mode: str = "shape",
     thresh_percent: float = 50.0,
 ):
-    """Center of the lower blob below the valley (shape or intensity)."""
+    """Center of the lower blob below the valley (shape or intensity).
+
+    Returns ``(center_xy, support_mask)``. ``support_mask`` is the boolean
+    connected core used for the centroid (same shape as ``work``), or None.
+    """
     from scipy.ndimage import label as ndi_label
 
     height, width = work.shape
@@ -344,22 +351,22 @@ def lower_centroid(
     signal[y_end + 1 :, :] = 0.0
     peak = float(np.max(signal))
     if not np.isfinite(peak) or peak <= 0.0:
-        return None, signal
+        return None, None
     frac = float(np.clip(thresh_percent, 1.0, 99.0)) / 100.0
     raw_mask = signal >= peak * frac
     if not np.any(raw_mask):
-        return None, signal
+        return None, None
     peak_index = np.unravel_index(int(np.argmax(signal)), signal.shape)
     labeled, count = ndi_label(raw_mask)
     if count < 1:
-        return None, signal
+        return None, None
     peak_label = int(labeled[peak_index])
     if peak_label == 0:
-        return None, signal
+        return None, None
     support = labeled == peak_label
     ys, xs = np.where(support)
     if ys.size == 0:
-        return None, signal
+        return None, None
     if center_mode == "intensity":
         weights = signal[support]
         total = float(np.sum(weights))
@@ -367,8 +374,8 @@ def lower_centroid(
             return (
                 float(np.sum(xs * weights) / total),
                 float(np.sum(ys * weights) / total),
-            ), signal
-    return (float(np.mean(xs)), float(np.mean(ys))), signal
+            ), support
+    return (float(np.mean(xs)), float(np.mean(ys))), support
 
 
 def highest_peak_above(profile: np.ndarray, valley: float) -> float | None:
@@ -519,15 +526,32 @@ def pack_result(
     upper: tuple[float, float] | None,
     lower: tuple[float, float] | None,
     profile: np.ndarray | None = None,
+    *,
+    valley_y: float | None = None,
+    lower_mask: np.ndarray | None = None,
+    savgol: dict | None = None,
 ) -> dict:
-    x0, y0, _x1, _y1 = ctx.bounds
+    x0, y0, x1, y1 = ctx.bounds
+    if valley_y is None and ctx.lower_local is not None:
+        valley_y = float(y0) + float(ctx.lower_local[1])
+    full_lower = None
+    if lower_mask is not None:
+        local = np.asarray(lower_mask, dtype=bool)
+        if local.shape == ctx.work.shape:
+            full_lower = np.zeros(ctx.matrix.shape, dtype=bool)
+            full_lower[y0:y1, x0:x1] = local
+        elif local.shape == ctx.matrix.shape:
+            full_lower = local
     return {
         "bounds": ctx.bounds,
         "profile": ctx.profile if profile is None else profile,
         "smooth": ctx.profile if profile is None else profile,
         "mask": ctx.full_mask,
+        "lower_mask": full_lower,
         "upper": upper,
         "lower": lower,
         "raw_sum": ctx.raw_sum,
         "origin": (float(x0), float(y0)),
+        "valley_y": None if valley_y is None else float(valley_y),
+        "savgol": None if savgol is None else dict(savgol),
     }

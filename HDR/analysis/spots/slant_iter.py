@@ -91,7 +91,7 @@ def _wide_seed_lower(
 ) -> tuple[float, float] | None:
     """If the user strip missed the lower blob, try a wider vertical window once."""
     matrix = np.nan_to_num(np.asarray(ctx.matrix, dtype=np.float64), nan=0.0)
-    height, img_w = matrix.shape
+    _height, img_w = matrix.shape
     wide = max(int(strip_width) * 3, int(strip_width) + 40)
     half = wide / 2.0
     cx = float(upper[0])
@@ -145,11 +145,12 @@ def _second_pass(
     )
 
     masked = np.where(mask, np.clip(matrix, 0.0, None), 0.0)
+    lower_support = None
     if lobe is not None:
         upper_c, upper_mask = threshold_upper(
             masked, ctx.thresh_percent, y_limit=float(lobe[1])
         )
-        lower_c, _ = lower_centroid(
+        lower_c, lower_support = lower_centroid(
             masked,
             float(lobe[1]),
             masked.shape[0] - 1,
@@ -164,6 +165,8 @@ def _second_pass(
     lower = None
     if lower_c is not None and float(lower_c[1]) > float(upper[1]) + float(ctx.min_dist):
         lower = (float(lower_c[0]), float(lower_c[1]))
+    else:
+        lower_support = None
     if lower is None:
         lower = lower0
 
@@ -178,7 +181,15 @@ def _second_pass(
         if ctx.use_log
         else np.asarray(slant_sum, dtype=np.float64)
     )
-    result = pack_result(ctx, upper, lower, profile=profile)
+    valley_y = None if lobe is None else float(lobe[1])
+    result = pack_result(
+        ctx,
+        upper,
+        lower,
+        profile=profile,
+        valley_y=valley_y,
+        lower_mask=lower_support,
+    )
     result["raw_sum"] = np.asarray(slant_sum, dtype=np.float64)
     result["slant_seed"] = (upper0, lower0)
     return result

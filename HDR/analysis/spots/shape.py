@@ -55,8 +55,9 @@ def resolve(ctx: StripContext) -> dict:
     x0, y0, _x1, _y1 = ctx.bounds
     upper = (float(x0) + float(ctx.upper_local[0]), float(y0) + float(ctx.upper_local[1]))
     lower = None
+    lower_mask = None
     if ctx.lower_local is not None and ctx.lower_local[0] > ctx.upper_local[1] + float(ctx.min_dist):
-        center, _ = lower_centroid(
+        center, lower_mask = lower_centroid(
             ctx.work,
             ctx.lower_local[1],
             ctx.work.shape[0] - 1,
@@ -65,4 +66,6 @@ def resolve(ctx: StripContext) -> dict:
         )
         if center is not None and center[1] > ctx.lower_local[1]:
             lower = (float(x0) + center[0], float(y0) + center[1])
-    return pack_result(ctx, upper, lower)
+        else:
+            lower_mask = None
+    return pack_result(ctx, upper, lower, lower_mask=lower_mask)

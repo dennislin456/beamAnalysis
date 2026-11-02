@@ -22,6 +22,7 @@ from PyQt5.QtWidgets import (
     QFormLayout,
     QFrame,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -88,6 +89,21 @@ def _panel_style() -> str:
         border: 1px solid #e4e9ee;
         border-radius: 10px;
     }
+    QGroupBox {
+        background: #ffffff;
+        border: 1px solid #e4e9ee;
+        border-radius: 10px;
+        margin-top: 10px;
+        padding-top: 8px;
+        font-weight: 600;
+        color: #1f2933;
+    }
+    QGroupBox::title {
+        subcontrol-origin: margin;
+        left: 10px;
+        padding: 0 4px;
+    }
+    QGroupBox:disabled { color: #a0a8b0; }
     QLabel#resultKey { color: #6b7580; padding: 0; font-size: 12px; }
     QLabel#resultValue { color: #1f2933; padding: 0; font-size: 13px; }
     QLabel#resultNote { color: #8a939c; padding: 4px 0 0 0; font-size: 11px; }
@@ -183,20 +199,20 @@ def _meta_label(text: str) -> QLabel:
 
 
 class DistanceTable(QWidget):
-    """每一筆的筆數、像素距離和微米距離。"""
+    """每一筆的筆數、上／下光斑 Y、像素距離。"""
 
     rowClicked = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.table = QTableWidget(0, 3)
+        self.table = QTableWidget(0, 4)
         self.table.setObjectName("distanceTable")
-        self.table.setHorizontalHeaderLabels(["筆數", "px", "μm"])
+        self.table.setHorizontalHeaderLabels(["筆數", "y1", "y2", "px"])
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setWordWrap(False)
-        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.setFocusPolicy(Qt.StrongFocus)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         self.table.verticalHeader().setVisible(False)
@@ -207,11 +223,16 @@ class DistanceTable(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.table.cellClicked.connect(self._on_cell_clicked)
+        self.table.currentCellChanged.connect(self._on_current_cell_changed)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.table)
         self.setMinimumHeight(160)
-        self.setToolTip("每一筆的上下光斑距離。點一列會切到那一張。")
+        self.setFocusProxy(self.table)
+        self.setToolTip(
+            "每一筆的上光斑 Y（y1）、下光斑 Y（y2）與距離 px。"
+            "點選或按 ↑↓ 可切到那一張。"
+        )
 
     def blockSignals(self, block: bool) -> bool:
         previous = super().blockSignals(block)
@@ -230,17 +251,29 @@ class DistanceTable(QWidget):
             return
         self.table.selectRow(row)
 
-    def fill(self, rows: list[tuple[str, str, str]]) -> None:
+    def fill(self, rows: list[tuple[str, str, str, str]]) -> None:
         self.table.setRowCount(len(rows))
-        for index, (frame, px, um) in enumerate(rows):
+        for index, (frame, y1, y2, px) in enumerate(rows):
             self._set_cell(index, 0, frame, Qt.AlignCenter)
-            self._set_cell(index, 1, px, Qt.AlignCenter)
-            self._set_cell(index, 2, um, Qt.AlignCenter)
+            self._set_cell(index, 1, y1, Qt.AlignCenter)
+            self._set_cell(index, 2, y2, Qt.AlignCenter)
+            self._set_cell(index, 3, px, Qt.AlignCenter)
 
     def _on_cell_clicked(self, row: int, _column: int) -> None:
         if row < 0 or self.signalsBlocked():
             return
         self.setCurrentRow(row)
+        self.table.setFocus(Qt.MouseFocusReason)
+
+    def _on_current_cell_changed(
+        self,
+        row: int,
+        _column: int,
+        previous_row: int,
+        _previous_column: int,
+    ) -> None:
+        if row < 0 or row == previous_row or self.signalsBlocked():
+            return
         self.rowClicked.emit(row)
 
     def _set_cell(self, row: int, column: int, text: str, align: int) -> None:
@@ -266,15 +299,25 @@ class SpotPanel(QWidget):
         self._color_updating = False
         self._stops_updating = False
         self._hold_color_levels = False
+        self._hold_profile_limits = False
+        # Keep profile pixel axes after wheel zoom / pan across batch frames.
+        self._hold_profile_px_x = False
+        self._hold_profile_px_y = False
         self._listing = False
         self._exporting = False
         self._source_folder: Path | None = None
+        self._spot_label: str | None = None
+        self._single_file_label: str = ""
+        self._exposure_us: list[float] = []
+        self._source_key: tuple[str | None, str | None] | None = None
         self.color_stop_boxes: list[QDoubleSpinBox] = []
         self._manual_profile = False
         self._manual_x = False
         self.cross_xy: tuple[int, int] | None = None
         self._x_values: np.ndarray | None = None
         self._distance_stats: tuple[float, float, int] | None = None
+        self._y1_stats: tuple[float, float, int] | None = None
+        self._y2_stats: tuple[float, float, int] | None = None
         install_input_undo()
         self._build_ui()
 
@@ -286,7 +329,7 @@ class SpotPanel(QWidget):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(14, 14, 14, 14)
         left_layout.setSpacing(12)
-        hint = QLabel("門檻質心擺條帶，加總找下峰與波谷。數值是 × 255 尺度。")
+        hint = QLabel("門檻質心擺條帶，加總找下峰與波谷。融合為 ×255 尺度；單張為原始 DN。")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         hint.setToolTip(
@@ -341,6 +384,24 @@ class SpotPanel(QWidget):
         self.strip_form.setHorizontalSpacing(12)
         self.strip_form.setVerticalSpacing(8)
         self.strip_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.strip_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        # Trailing gutter matches 「顯示」 checkbox so every value column shares one width.
+        self.show_thresh = QCheckBox("顯示")
+        self.show_thresh.setChecked(True)
+        self.show_thresh.setToolTip("在熱圖上以半透明白色顯示上光斑的門檻範圍。")
+        self.show_thresh.toggled.connect(self._draw_threshold)
+        self.show_lower_thresh = QCheckBox("顯示")
+        self.show_lower_thresh.setChecked(True)
+        self.show_lower_thresh.setToolTip(
+            "在熱圖上以半透明青色顯示下光斑的門檻範圍（形狀中心／強度質心／斜剖面）。"
+        )
+        self.show_lower_thresh.toggled.connect(self._draw_threshold)
+        self._param_tail_w = max(
+            int(self.show_thresh.sizeHint().width()),
+            int(self.show_lower_thresh.sizeHint().width()),
+            48,
+        )
+
         self.roi_w = self._make_roi_box()
         self.roi_w.setRange(1, 100000)
         self.roi_w.setValue(160)
@@ -349,17 +410,18 @@ class SpotPanel(QWidget):
             "顯示用斜剖面選 Y 加總時，這是斜向範圍的水平寬度。"
         )
         self.roi_w.valueChanged.connect(self._on_roi_boxes_changed)
-        self.strip_form.addRow("寬", self.roi_w)
+        self.strip_form.addRow("寬", self._param_field(self.roi_w))
         self.peak_dist = self._make_roi_box()
         self.peak_dist.setRange(1, 100000)
         self.peak_dist.setValue(50)
         self.peak_dist.setSuffix(" px")
         self.peak_dist.setToolTip(
-            "上光斑到下峰的最小距離。條帶加總找波谷時，候選下峰至少要再往下這麼多列；"
-            "通過距離、下峰比、谷深條件後取最高的下峰，兩峰之間的最低點當波谷。預設 50。"
+            "峰距：條帶加總找下峰／波谷時用。"
+            "候選下峰至少要再往下這麼多列；通過峰距、下峰比、谷深後取最高下峰，"
+            "兩峰之間最低點當波谷。預設 50。"
         )
         self.peak_dist.valueChanged.connect(self._on_roi_boxes_changed)
-        self.strip_form.addRow("距離", self.peak_dist)
+        self.strip_form.addRow("峰距", self._param_field(self.peak_dist))
         self.peak_ratio = QSpinBox()
         self.peak_ratio.setRange(0, 100)
         self.peak_ratio.setValue(10)
@@ -370,7 +432,7 @@ class SpotPanel(QWidget):
             "用來擋主峰後面貼底的雜訊凸起。預設 10%。設 0% 表示不檢查比例。"
         )
         self.peak_ratio.valueChanged.connect(self._on_roi_boxes_changed)
-        self.strip_form.addRow("下峰比", self.peak_ratio)
+        self.strip_form.addRow("下峰比", self._param_field(self.peak_ratio))
         self.thresh = QSpinBox()
         self.thresh.setRange(5, 95)
         self.thresh.setValue(50)
@@ -381,17 +443,7 @@ class SpotPanel(QWidget):
             "40% 就是留下不低於峰值 40% 的那一塊核心。"
         )
         self.thresh.valueChanged.connect(self._on_roi_boxes_changed)
-        self.show_thresh = QCheckBox("顯示")
-        self.show_thresh.setChecked(True)
-        self.show_thresh.setToolTip("在熱圖上以半透明白色顯示上光斑的門檻範圍。")
-        self.show_thresh.toggled.connect(self._draw_threshold)
-        thresh_row = QHBoxLayout()
-        thresh_row.setSpacing(8)
-        thresh_row.addWidget(self.thresh, 1)
-        thresh_row.addWidget(self.show_thresh)
-        thresh_wrap = QWidget()
-        thresh_wrap.setLayout(thresh_row)
-        self.strip_form.addRow("上門檻", thresh_wrap)
+        self.strip_form.addRow("上門檻", self._param_field(self.thresh, tail=self.show_thresh))
         self.lower_thresh = QSpinBox()
         self.lower_thresh.setRange(5, 95)
         self.lower_thresh.setValue(50)
@@ -403,7 +455,21 @@ class SpotPanel(QWidget):
             "下光斑較暗時可調低，例如 30%。"
         )
         self.lower_thresh.valueChanged.connect(self._on_roi_boxes_changed)
-        self.strip_form.addRow("下門檻", self.lower_thresh)
+        # Same-width field row; placeholder keeps height when peak mode hides the spinbox.
+        self.lower_thresh_host = self._param_field(
+            self.lower_thresh, tail=self.show_lower_thresh
+        )
+        self.lower_thresh_placeholder = QWidget()
+        self.lower_thresh_placeholder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.lower_thresh_placeholder.setFixedHeight(
+            max(int(self.lower_thresh.sizeHint().height()), 28)
+        )
+        self.lower_thresh_placeholder.hide()
+        lower_row = self.lower_thresh_host.layout()
+        if isinstance(lower_row, QHBoxLayout):
+            lower_row.insertWidget(0, self.lower_thresh_placeholder, 1)
+        self.strip_form.addRow("下門檻", self.lower_thresh_host)
+        self._lower_thresh_label = self.strip_form.labelForField(self.lower_thresh_host)
         self.center_mode = QComboBox()
         self.center_mode.addItem("形狀中心", "shape")
         self.center_mode.addItem("強度質心", "intensity")
@@ -419,8 +485,67 @@ class SpotPanel(QWidget):
             "直條帶已包住兩團時幾乎不變，下光斑被切邊時才會差。"
         )
         self.center_mode.currentIndexChanged.connect(self._on_center_mode_changed)
-        self.strip_form.addRow("演算法", self.center_mode)
+        self.strip_form.addRow("演算法", self._param_field(self.center_mode))
+
+        # Fixed-height refine box: rows always present so switching method does not jump.
+        self.sg_box = QGroupBox("Refine")
+        self.sg_box.setToolTip(
+            "僅條帶波峰：先在原始加總上抓下峰，再對下峰附近 window 做 S-G、Gaussian，"
+            "或多項式擬合（左右各 k 點→2k 次）得到 float Y。"
+            "Y 加總圖會標 window 範圍；方框列數固定不跳動。"
+        )
+        self.sg_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        sg_form = QFormLayout(self.sg_box)
+        sg_form.setContentsMargins(8, 8, 8, 8)
+        sg_form.setHorizontalSpacing(8)
+        sg_form.setVerticalSpacing(6)
+        self.sg_enable = QCheckBox("啟用")
+        self.sg_enable.setToolTip("關閉時下峰維持 raw 整數峰；開啟後依下方 refine 方法處理。")
+        self.sg_enable.toggled.connect(self._on_savgol_changed)
+        sg_form.addRow(self.sg_enable)
+        self.sg_method = QComboBox()
+        self.sg_method.addItem("無", "none")
+        self.sg_method.addItem("S-G", "savgol")
+        self.sg_method.addItem("Gaussian", "gaussian")
+        self.sg_method.addItem("多項式擬合", "quadratic")
+        self.sg_method.setToolTip(
+            "無：不平滑。S-G：Savitzky–Golay（window／order）。"
+            "Gaussian：1D 高斯，只調 window；sigma = (window-1)/6 自動決定。"
+            "多項式擬合：window 內對 raw 加總擬合；左右各 k 點 → 2k 次"
+            "（3→二次、5→四次…），在區間內取曲線最高點當 float Y。"
+        )
+        self.sg_method.currentIndexChanged.connect(self._on_savgol_changed)
+        sg_form.addRow("refine", self._param_field(self.sg_method))
+        self.sg_window = QSpinBox()
+        self.sg_window.setRange(3, 99)
+        self.sg_window.setSingleStep(2)
+        self.sg_window.setValue(7)
+        self.sg_window.setToolTip("下峰附近窗寬（奇數）。S-G／Gaussian 共用；Y 加總圖標出此範圍。")
+        self.sg_window.setKeyboardTracking(False)
+        self.sg_window.valueChanged.connect(self._on_savgol_window_changed)
+        sg_form.addRow("window", self._param_field(self.sg_window))
+        self.sg_order = QSpinBox()
+        self.sg_order.setRange(1, 12)
+        self.sg_order.setValue(2)
+        self.sg_order.setToolTip("S-G 多項式階數，須小於 window。Gaussian 時停用。")
+        self.sg_order.setKeyboardTracking(False)
+        self.sg_order.valueChanged.connect(self._on_savgol_changed)
+        sg_form.addRow("order", self._param_field(self.sg_order))
+        self.sg_sigma = QDoubleSpinBox()
+        self.sg_sigma.setRange(0.01, 100.0)
+        self.sg_sigma.setDecimals(2)
+        self.sg_sigma.setSingleStep(0.1)
+        self.sg_sigma.setValue(1.0)
+        self.sg_sigma.setToolTip(
+            "Gaussian 時顯示自動 sigma = (window-1)/6，不可手調；其他方法不使用。"
+        )
+        self.sg_sigma.setKeyboardTracking(False)
+        self.sg_sigma.setReadOnly(True)
+        self.sg_sigma.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        sg_form.addRow("sigma", self._param_field(self.sg_sigma))
         params_layout.addLayout(self.strip_form)
+        params_layout.addWidget(self.sg_box)
+        self._params_card = params_card
         left_layout.addWidget(params_card)
 
         left_layout.addWidget(_section_label("結果"))
@@ -450,9 +575,27 @@ class SpotPanel(QWidget):
         self.result_distance = _result_value()
         self.result_average = _result_value()
         self.result_std = _result_value()
+        self.result_y1_avg_key = _result_key("平均 y1")
+        self.result_y1_average = _result_value()
+        self.result_y1_std_key = _result_key("標準差 y1")
+        self.result_y1_std = _result_value()
+        self.result_y2_avg_key = _result_key("平均 y2")
+        self.result_y2_average = _result_value()
+        self.result_y2_std_key = _result_key("標準差 y2")
+        self.result_y2_std = _result_value()
         self.result_note = QLabel("")
         self.result_note.setObjectName("resultNote")
         self.result_note.setWordWrap(True)
+        self._peak_y_stat_widgets = (
+            self.result_y1_avg_key,
+            self.result_y1_average,
+            self.result_y1_std_key,
+            self.result_y1_std,
+            self.result_y2_avg_key,
+            self.result_y2_average,
+            self.result_y2_std_key,
+            self.result_y2_std,
+        )
 
         result_grid.addWidget(self.result_frame_label, 0, 0, 1, 2)
         result_grid.addWidget(_result_key("上光斑"), 1, 0)
@@ -465,7 +608,15 @@ class SpotPanel(QWidget):
         result_grid.addWidget(self.result_average, 4, 1)
         result_grid.addWidget(_result_key("標準差"), 5, 0)
         result_grid.addWidget(self.result_std, 5, 1)
-        result_grid.addWidget(self.result_note, 6, 0, 1, 2)
+        result_grid.addWidget(self.result_y1_avg_key, 6, 0)
+        result_grid.addWidget(self.result_y1_average, 6, 1)
+        result_grid.addWidget(self.result_y1_std_key, 7, 0)
+        result_grid.addWidget(self.result_y1_std, 7, 1)
+        result_grid.addWidget(self.result_y2_avg_key, 8, 0)
+        result_grid.addWidget(self.result_y2_average, 8, 1)
+        result_grid.addWidget(self.result_y2_std_key, 9, 0)
+        result_grid.addWidget(self.result_y2_std, 9, 1)
+        result_grid.addWidget(self.result_note, 10, 0, 1, 2)
         left_layout.addWidget(result_card)
 
         left_layout.addWidget(_section_label("距離表"))
@@ -494,7 +645,9 @@ class SpotPanel(QWidget):
         self.controls_scroll.setWidgetResizable(True)
         self.controls_scroll.setFrameShape(QScrollArea.NoFrame)
         self.controls_scroll.setWidget(left)
+        # Always reserve the vertical scrollbar gutter so field columns are not clipped.
         self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.controls_scroll.setFixedWidth(ANALYSIS_PANEL_W)
         self.controls_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.controls_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
@@ -514,6 +667,27 @@ class SpotPanel(QWidget):
         self.plot_y.invertY(True)
         self.plot_y.enableAutoRange(x=False, y=False)
         self.curve_y = self.plot_y.plot(pen=curve_pen)
+        self.curve_sg = self.plot_y.plot(pen=pg.mkPen("#1565c0", width=2.0))
+        self.curve_sg.setZValue(15)
+        self.marker_sg = self.plot_y.plot(
+            pen=None,
+            symbol="o",
+            symbolSize=9,
+            symbolBrush=pg.mkBrush("#1565c0"),
+            symbolPen=pg.mkPen("#0d47a1", width=1),
+        )
+        self.marker_sg.setZValue(16)
+        self.sg_region = pg.LinearRegionItem(
+            values=(0, 1),
+            orientation="horizontal",
+            brush=pg.mkBrush(21, 101, 192, 40),
+            pen=pg.mkPen("#1565c0", width=1, style=Qt.DotLine),
+            movable=False,
+        )
+        self.sg_region.setZValue(5)
+        self.sg_region.setToolTip("Refine window（下峰附近）")
+        self.plot_y.addItem(self.sg_region)
+        self.sg_region.hide()
         self.profile_values: np.ndarray | None = None
         self.raw_strip_sum: np.ndarray | None = None
         self.tip_y = pg.TextItem(
@@ -526,6 +700,9 @@ class SpotPanel(QWidget):
         self.tip_y.hide()
         self.win.scene().addItem(self.tip_y)
         self.plot_y.vb.sigRangeChanged.connect(lambda *_: self._pin_profile_tip("y"))
+        self.plot_y.vb.sigRangeChangedManually.connect(
+            lambda *_: self._on_profile_px_zoomed("y")
+        )
         self.marker_upper = self.plot_y.plot(
             pen=None, symbol="+", symbolSize=12, symbolPen=pg.mkPen("#222222", width=2)
         )
@@ -535,6 +712,16 @@ class SpotPanel(QWidget):
         self.marker_y = self.plot_y.plot(
             pen=None, symbol="o", symbolSize=7, symbolBrush=curve_brush
         )
+        valley_pen = pg.mkPen("#d32f2f", width=1.5, style=Qt.DashLine)
+        self.valley_line = pg.InfiniteLine(
+            angle=0,
+            movable=False,
+            pen=valley_pen,
+        )
+        self.valley_line.setZValue(20)
+        self.valley_line.setToolTip("波谷（條帶加總上下峰之間的最低點）")
+        self.plot_y.addItem(self.valley_line)
+        self.valley_line.hide()
 
         self.plot = self.win.addPlot(row=0, col=1, title="合成影像")
         self.plot.setLabel("bottom", "X (px)")
@@ -618,6 +805,9 @@ class SpotPanel(QWidget):
         self.tip_x.hide()
         self.win.scene().addItem(self.tip_x)
         self.plot_x.vb.sigRangeChanged.connect(lambda *_: self._pin_profile_tip("x"))
+        self.plot_x.vb.sigRangeChangedManually.connect(
+            lambda *_: self._on_profile_px_zoomed("x")
+        )
 
         grid = self.win.ci.layout
         grid.setRowStretchFactor(0, 4)
@@ -694,7 +884,7 @@ class SpotPanel(QWidget):
         self.smooth_check.setToolTip(
             "勾選後，每一張曝光在倍率和自己的 color scale 之後做 Gaussian blur，然後才跑演算法。"
             "水平、垂直是核寬，sigma 兩邊共用。某一邊為 1 時該方向不模糊。"
-            "會進演算法輸入、浮點結果和匯出 npy。改參數後會重新計算。"
+            "會進演算法輸入、浮點結果和匯出 npy。改參數後請按計算才會套用。"
         )
         self.smooth_check.toggled.connect(self._on_gauss_enabled)
         gauss_row.addWidget(self.smooth_check)
@@ -728,6 +918,9 @@ class SpotPanel(QWidget):
         self.view_host = host
         self.plot.scene().sigMouseClicked.connect(self._on_scene_clicked)
         self.plot.scene().sigMouseMoved.connect(self._on_profile_moved)
+        self._sync_lower_thresh_row()
+        self._sync_savgol_controls()
+        self._set_peak_y_stats_visible(str(self.center_mode.currentData()) == "peak")
 
         if not self._embed:
             layout = QHBoxLayout(self)
@@ -736,26 +929,129 @@ class SpotPanel(QWidget):
             layout.addWidget(self.controls_scroll)
             layout.addWidget(self.view_host, 1)
 
-    def set_source_folder(self, root: Path | None) -> None:
+    def set_source_folder(self, root: Path | None, *, spot_key: str | None = None) -> None:
+        label = str(spot_key).strip() if spot_key else ""
         if root is None:
+            key = (None, label or None)
+            if key != self._source_key:
+                self._reset_display_limits()
+                self._source_key = key
             self._source_folder = None
+            self._spot_label = label or None
             self.source_name.setText("尚未載入")
             self.source_name.setToolTip("")
             return
-        self._source_folder = Path(root)
-        self.source_name.setText(self._source_folder.name)
-        self.source_name.setToolTip(str(self._source_folder))
+        path = Path(root)
+        key = (str(path.resolve()), label or None)
+        if key != self._source_key:
+            self._reset_display_limits()
+            self._source_key = key
+        self._source_folder = path
+        self._spot_label = label or None
+        # Prefer 點位 label over parent/main folder name when present.
+        if self._spot_label:
+            self.source_name.setText(self._spot_label)
+            self.source_name.setToolTip(f"{self._spot_label}\n{path}")
+        else:
+            self.source_name.setText(path.name)
+            self.source_name.setToolTip(str(path))
 
-    def set_image(self, image: np.ndarray) -> None:
+    def _reset_display_limits(self) -> None:
+        """Allow colorbar / profile limits to auto-fit again (new spot or clear)."""
+        self._hold_color_levels = False
+        self._hold_profile_limits = False
+        self._hold_profile_px_x = False
+        self._hold_profile_px_y = False
+        self._manual_x = False
+        self._manual_profile = False
+
+    def _on_profile_px_zoomed(self, which: str) -> None:
+        """Remember pixel-axis zoom so batch frame changes do not jump."""
+        if which == "x":
+            self._hold_profile_px_x = True
+        else:
+            self._hold_profile_px_y = True
+
+    def set_image(self, image: np.ndarray, *, file_label: str = "") -> None:
+        self._batch_images = []
+        self._batch_labels = []
+        self._single_file_label = str(file_label or "")
+        self.batch_host.setVisible(False)
+        self._apply_image(
+            image,
+            keep_roi=False,
+            keep_display_limits=self._hold_color_levels
+            or self._hold_profile_limits
+            or self._hold_profile_px_x
+            or self._hold_profile_px_y,
+        )
+        self._refresh_distance_list()
+
+    def clear_view(self) -> None:
+        """Clear heatmap / markers / batch; keep analysis parameters."""
+        self._reset_display_limits()
+        self._source_key = None
+        self._spot_label = None
+        self._single_file_label = ""
+        self._exposure_us = []
         self._batch_images = []
         self._batch_labels = []
         self.batch_host.setVisible(False)
-        self._apply_image(image, keep_roi=False)
+        self.image = None
+        self.spots = None
+        self.cross_xy = None
+        self.profile_values = None
+        self.raw_strip_sum = None
+        self.image_item.clear()
+        self.mask_item.clear()
+        self.spot_upper.setData([], [])
+        self.spot_lower.setData([], [])
+        self.curve_x.setData([], [])
+        self.curve_y.setData([], [])
+        self.curve_sg.setData([], [])
+        if hasattr(self, "marker_sg"):
+            self.marker_sg.setData([], [])
+        self.marker_x.setData([], [])
+        self.marker_y.setData([], [])
+        self.marker_upper.setData([], [])
+        self.marker_lower.setData([], [])
+        self.vline.hide()
+        self.hline.hide()
+        if hasattr(self, "valley_line"):
+            self.valley_line.hide()
+        if hasattr(self, "sg_region"):
+            self.sg_region.hide()
+        self.roi.hide()
+        self.slant_roi.setData([], [])
+        self.slant_roi.hide()
+        self.profile_line.hide()
+        self._distance_stats = None
+        self._y1_stats = None
+        self._y2_stats = None
         self._refresh_distance_list()
+        self._update_spot_label()
+
+    def set_exposure_times(self, times_us: list[float] | None) -> None:
+        """Store exposure times (us) used for the current analysis result."""
+        values: list[float] = []
+        for value in times_us or []:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(number):
+                values.append(number)
+        self._exposure_us = values
+
+    def _exposure_times_text(self) -> str:
+        if not self._exposure_us:
+            return ""
+        return ",".join(f"{value:g}" for value in self._exposure_us)
 
     def set_batch(self, images: list[np.ndarray], labels: list[str]) -> None:
         self._batch_images = [np.asarray(image) for image in images]
         self._batch_labels = list(labels)
+        self._single_file_label = ""
         count = len(self._batch_images)
         if count < 1:
             self.batch_host.setVisible(False)
@@ -765,14 +1061,26 @@ class SpotPanel(QWidget):
         self.batch_index.setRange(0, count - 1)
         self.batch_index.setValue(0)
         self.batch_index.blockSignals(False)
-        self._apply_image(self._batch_images[0], keep_roi=True)
+        # Keep colorbar/profile limits across recompute; only spot change resets them.
+        self._apply_image(
+            self._batch_images[0],
+            keep_roi=True,
+            keep_display_limits=self._hold_color_levels
+            or self._hold_profile_limits
+            or self._hold_profile_px_x
+            or self._hold_profile_px_y,
+        )
         self._update_batch_caption()
         self._refresh_distance_list()
 
     def _on_batch_index_changed(self, index: int) -> None:
         if not self._batch_images or not (0 <= index < len(self._batch_images)):
             return
-        self._apply_image(self._batch_images[index], keep_roi=True)
+        self._apply_image(
+            self._batch_images[index],
+            keep_roi=True,
+            keep_display_limits=True,
+        )
         self._update_batch_caption()
         if not self._listing:
             self.distance_table.blockSignals(True)
@@ -786,13 +1094,25 @@ class SpotPanel(QWidget):
         self.batch_name.setText(f"{index + 1} / {total}  {name}")
         self.batch_name.setToolTip(name)
 
-    def _apply_image(self, image: np.ndarray, keep_roi: bool) -> None:
+    def _apply_image(
+        self,
+        image: np.ndarray,
+        keep_roi: bool,
+        *,
+        keep_display_limits: bool = False,
+    ) -> None:
         self.image = np.asarray(image, dtype=np.float64)
         height, width = self.image.shape
         if not keep_roi:
             self.cross_xy = None
-            self._manual_x = False
-            self._manual_profile = False
+            if not keep_display_limits:
+                self._manual_x = False
+                self._manual_profile = False
+                self._hold_profile_px_x = False
+                self._hold_profile_px_y = False
+        if keep_display_limits:
+            self._hold_color_levels = True
+            self._hold_profile_limits = True
         self.roi_w.setMaximum(width)
         if self.roi_w.value() > width or (not keep_roi and not self._roi_user_set):
             self._roi_sync = True
@@ -804,7 +1124,7 @@ class SpotPanel(QWidget):
                 self._roi_user_set = False
         self.roi.maxBounds = QRectF(0, 0, width, height)
         self._sync_roi_rect()
-        self._show_heatmap()
+        self._show_heatmap(refit=not keep_display_limits and not self._hold_color_levels)
         self._refresh_spots()
         self.plot.setXRange(0, width, padding=0)
         self.plot.setYRange(0, height, padding=0)
@@ -852,9 +1172,27 @@ class SpotPanel(QWidget):
         self.image_item.setImage(shown.T, autoLevels=False)
         if refit or not self._hold_color_levels:
             self._set_color_levels(*self._level_span(shown))
+            self._hold_color_levels = True
         else:
             lo, hi = self.hist.getLevels()
             self._set_color_levels(float(lo), float(hi))
+
+    def _param_field(self, widget: QWidget, *, tail: QWidget | None = None) -> QWidget:
+        """Wrap a form value so every row shares the same value-column width."""
+        host = QWidget()
+        row = QHBoxLayout(host)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        row.addWidget(widget, 1)
+        if tail is None:
+            spacer = QWidget()
+            spacer.setFixedWidth(self._param_tail_w)
+            row.addWidget(spacer)
+        else:
+            tail.setFixedWidth(self._param_tail_w)
+            row.addWidget(tail)
+        return host
 
     def _make_roi_box(self) -> QSpinBox:
         box = QSpinBox()
@@ -1002,12 +1340,22 @@ class SpotPanel(QWidget):
         self._sync_roi_rect()
 
     def _on_log_toggled(self, _checked: bool) -> None:
+        self._hold_color_levels = False
+        self._hold_profile_limits = False
+        self._hold_profile_px_x = False
+        self._hold_profile_px_y = False
         self._manual_profile = False
+        self._manual_x = False
         self._show_heatmap(refit=True)
         self._refresh_spots()
 
     def _on_abs_toggled(self, _checked: bool) -> None:
+        self._hold_color_levels = False
+        self._hold_profile_limits = False
+        self._hold_profile_px_x = False
+        self._hold_profile_px_y = False
         self._manual_profile = False
+        self._manual_x = False
         self._show_heatmap(refit=True)
         self._draw_profile()
 
@@ -1037,8 +1385,6 @@ class SpotPanel(QWidget):
             int(np.clip(round(float(upper[0])), 0, width - 1)),
             int(np.clip(round(float(upper[1])), 0, height - 1)),
         )
-        self._manual_x = False
-        self._manual_profile = False
 
     def _line_mode(self) -> bool:
         return str(self.center_mode.currentData()) == "line"
@@ -1105,7 +1451,12 @@ class SpotPanel(QWidget):
             layout.addWidget(frame)
 
     def _on_y_mode_changed(self, _button=None) -> None:
+        # Y 剖面 ↔ 累加強度尺度不同，重設剖面上下限並自動對齊。
+        self._hold_profile_limits = False
+        self._hold_profile_px_x = False
+        self._hold_profile_px_y = False
         self._manual_profile = False
+        self._manual_x = False
         self._sync_profile_mark()
         self._draw_profile()
 
@@ -1114,20 +1465,10 @@ class SpotPanel(QWidget):
         sum_mode = self._line_sum_mode()
         self.y_mode_frame.setVisible(True)
         self.roi_w.setVisible(True)
-        width_label = self.strip_form.labelForField(self.roi_w)
-        if width_label is not None:
-            width_label.setVisible(True)
         self.peak_dist.setVisible(True)
-        dist_label = self.strip_form.labelForField(self.peak_dist)
-        if dist_label is not None:
-            dist_label.setVisible(True)
         self.peak_ratio.setVisible(True)
-        ratio_label = self.strip_form.labelForField(self.peak_ratio)
-        if ratio_label is not None:
-            ratio_label.setVisible(True)
-        # Lower blob threshold is unused in peak mode (Y from strip-sum only).
-        peak_mode = str(self.center_mode.currentData()) == "peak"
-        self.lower_thresh.setEnabled(not peak_mode)
+        # Lower threshold unused in peak mode; hide it but keep row height (no jump).
+        self._sync_lower_thresh_row()
         self.strip_section.setVisible(True)
         # Keep vertical ROI in slant_iter so first-pass strip can be compared to slant outline.
         self.roi.setVisible(self.image is not None and not line_mode)
@@ -1201,6 +1542,11 @@ class SpotPanel(QWidget):
             thresh_percent=thresh,
             lower_thresh_percent=lower_thresh,
             center_mode=str(self.center_mode.currentData()),
+            refine_enabled=bool(self.sg_enable.isChecked()),
+            refine_method=str(self.sg_method.currentData()),
+            refine_window=int(self.sg_window.value()),
+            refine_order=int(self.sg_order.value()),
+            refine_sigma=0.0,
         )
         return spots, origin
 
@@ -1229,9 +1575,14 @@ class SpotPanel(QWidget):
                 self.result_distance,
                 self.result_average,
                 self.result_std,
+                self.result_y1_average,
+                self.result_y1_std,
+                self.result_y2_average,
+                self.result_y2_std,
             ):
                 label.setText("—")
             self.result_note.setText("")
+            self._set_peak_y_stats_visible(False)
             return
         spots = self.spots or {}
         upper = spots.get("upper")
@@ -1244,6 +1595,7 @@ class SpotPanel(QWidget):
             self.result_frame_label.hide()
             self.result_frame_label.setText("")
         peak_mode = str(self.center_mode.currentData()) == "peak"
+        self._set_peak_y_stats_visible(peak_mode)
         if peak_mode:
             self.result_upper.setText(
                 "未找到" if upper is None else f"+ Y = {upper[1]:.1f}"
@@ -1262,7 +1614,23 @@ class SpotPanel(QWidget):
         average_text, std_text, note = self._distance_stats_values()
         self.result_average.setText(average_text)
         self.result_std.setText(std_text)
+        if peak_mode:
+            y1_avg, y1_std = self._stats_pair_text(self._y1_stats)
+            y2_avg, y2_std = self._stats_pair_text(self._y2_stats)
+            self.result_y1_average.setText(y1_avg)
+            self.result_y1_std.setText(y1_std)
+            self.result_y2_average.setText(y2_avg)
+            self.result_y2_std.setText(y2_std)
+        else:
+            self.result_y1_average.setText("—")
+            self.result_y1_std.setText("—")
+            self.result_y2_average.setText("—")
+            self.result_y2_std.setText("—")
         self.result_note.setText(note)
+
+    def _set_peak_y_stats_visible(self, visible: bool) -> None:
+        for widget in self._peak_y_stat_widgets:
+            widget.setVisible(bool(visible))
 
     @staticmethod
     def _safe_folder_name(name: str) -> str:
@@ -1272,6 +1640,8 @@ class SpotPanel(QWidget):
         return cleaned or "未命名點位"
 
     def _export_spot_folder_name(self) -> str:
+        if self._spot_label:
+            return self._safe_folder_name(self._spot_label)
         if self._source_folder is not None:
             name = self._source_folder.name.strip()
             if name:
@@ -1333,7 +1703,7 @@ class SpotPanel(QWidget):
                 (index, labels[index] if index < len(labels) else "", np.asarray(image))
                 for index, image in enumerate(self._batch_images)
             ]
-        return [(0, "", np.asarray(self.image))]
+        return [(0, self._single_file_label, np.asarray(self.image))]
 
     def _write_analysis_csvs(
         self,
@@ -1348,6 +1718,8 @@ class SpotPanel(QWidget):
         count = len(items)
         if total is None:
             total = max(count, 1)
+        export_folder = self._export_spot_folder_name()
+        exposure_text = self._exposure_times_text()
         spot_rows: list[list[str]] = []
         raw_columns: list[tuple[str, np.ndarray]] = []
         summed_columns: list[tuple[str, np.ndarray]] = []
@@ -1359,13 +1731,17 @@ class SpotPanel(QWidget):
             raw_header = "strip_sum_raw" if single else str(index)
             raw_columns.append((raw_header, self._raw_strip(spots, int(image.shape[0]), image)))
             summed_columns.append((header, self._shown_strip(spots, int(image.shape[0]), image)))
-            spot_rows.append(self._spot_row(index, name, spots))
+            spot_rows.append(
+                self._spot_row(index, name, spots, export_folder, exposure_text)
+            )
         spots_path.parent.mkdir(parents=True, exist_ok=True)
         self._write_table(
             spots_path,
             [
                 "frame",
                 "file",
+                "export_folder",
+                "exposure_us",
                 "strip_width",
                 "min_peak_distance",
                 "min_peak_ratio_percent",
@@ -1392,12 +1768,25 @@ class SpotPanel(QWidget):
             "batch": bool(self._batch_images),
             "frame_count": len(items),
             "files": [name for _index, name, _image in items],
+            "exposure_us": list(self._exposure_us),
             "strip_width": int(self.roi_w.value()),
             "min_peak_distance": int(self.peak_dist.value()),
             "min_peak_ratio_percent": int(self.peak_ratio.value()),
             "threshold_percent": int(self.thresh.value()),
             "lower_threshold_percent": int(self.lower_thresh.value()),
             "center_mode": str(self.center_mode.currentData()),
+            "refine": {
+                "enabled": bool(self.sg_enable.isChecked()),
+                "method": str(self.sg_method.currentData()),
+                "window": int(self.sg_window.value()),
+                "order": int(self.sg_order.value()),
+                "sigma": (
+                    None
+                    if str(self.sg_method.currentData()) != "gaussian"
+                    else float(self.sg_sigma.value())
+                ),
+                "sigma_mode": "from_window" if str(self.sg_method.currentData()) == "gaussian" else None,
+            },
             "line_y_mode": "sum" if self._line_sum_mode() else "profile",
             "distance_stats": None
             if self._distance_stats is None
@@ -1407,6 +1796,24 @@ class SpotPanel(QWidget):
                 "count": int(self._distance_stats[2]),
                 "average_um": float(self._distance_stats[0] * 3.45),
                 "std_um": float(self._distance_stats[1] * 3.45),
+            },
+            "y1_stats": None
+            if self._y1_stats is None
+            else {
+                "average_px": float(self._y1_stats[0]),
+                "std_px": float(self._y1_stats[1]),
+                "count": int(self._y1_stats[2]),
+                "average_um": float(self._y1_stats[0] * 3.45),
+                "std_um": float(self._y1_stats[1] * 3.45),
+            },
+            "y2_stats": None
+            if self._y2_stats is None
+            else {
+                "average_px": float(self._y2_stats[0]),
+                "std_px": float(self._y2_stats[1]),
+                "count": int(self._y2_stats[2]),
+                "average_um": float(self._y2_stats[0] * 3.45),
+                "std_um": float(self._y2_stats[1] * 3.45),
             },
             "log": bool(self.log_check.isChecked()),
             "abs": self._abs_enabled(),
@@ -1444,8 +1851,73 @@ class SpotPanel(QWidget):
         self.export_bar.setFormat(text)
         QApplication.processEvents()
 
+    def _sync_lower_thresh_row(self) -> None:
+        peak_mode = str(self.center_mode.currentData()) == "peak"
+        self.lower_thresh.setVisible(not peak_mode)
+        self.lower_thresh.setEnabled(not peak_mode)
+        self.show_lower_thresh.setVisible(not peak_mode)
+        self.lower_thresh_placeholder.setVisible(peak_mode)
+        if self._lower_thresh_label is not None:
+            # Keep label geometry; only clear text so the form row does not collapse.
+            self._lower_thresh_label.setText("" if peak_mode else "下門檻")
+        self._draw_threshold()
+
     def _on_center_mode_changed(self, _index: int) -> None:
         self._manual_profile = False
+        self._sync_lower_thresh_row()
+        self._sync_savgol_controls()
+        self._refresh_spots()
+        self._refresh_distance_list()
+
+    def _refine_active(self) -> bool:
+        if not bool(self.sg_enable.isChecked()):
+            return False
+        method = str(self.sg_method.currentData() or "none")
+        return method not in ("", "none", "off")
+
+    def _sync_savgol_controls(self) -> None:
+        peak_mode = str(self.center_mode.currentData()) == "peak"
+        self.sg_box.setEnabled(peak_mode)
+        # Keep every row visible; only enable the knobs that the method uses.
+        method = str(self.sg_method.currentData() or "none")
+        enabled = peak_mode and bool(self.sg_enable.isChecked())
+        self.sg_method.setEnabled(peak_mode)
+        self.sg_window.setEnabled(
+            enabled and method in ("savgol", "gaussian", "quadratic")
+        )
+        self.sg_order.setEnabled(enabled and method == "savgol")
+        # sigma is display-only for Gaussian (derived from window); never editable.
+        self.sg_sigma.setEnabled(False)
+        if method == "gaussian":
+            from analysis.gaussian_peaks import sigma_from_window
+
+            self.sg_sigma.blockSignals(True)
+            self.sg_sigma.setValue(sigma_from_window(int(self.sg_window.value())))
+            self.sg_sigma.blockSignals(False)
+        self.sg_order.setMaximum(max(1, int(self.sg_window.value()) - 1))
+
+    def _on_savgol_window_changed(self, value: int) -> None:
+        if self._roi_sync:
+            return
+        odd = int(value)
+        if odd % 2 == 0:
+            odd = min(int(self.sg_window.maximum()), odd + 1)
+            self.sg_window.blockSignals(True)
+            self.sg_window.setValue(odd)
+            self.sg_window.blockSignals(False)
+        self.sg_order.setMaximum(max(1, odd - 1))
+        if int(self.sg_order.value()) >= odd:
+            self.sg_order.blockSignals(True)
+            self.sg_order.setValue(odd - 1)
+            self.sg_order.blockSignals(False)
+        self._on_savgol_changed()
+
+    def _on_savgol_changed(self, *_args) -> None:
+        self._sync_savgol_controls()
+        if self._roi_sync or self.image is None:
+            return
+        if str(self.center_mode.currentData()) != "peak":
+            return
         self._refresh_spots()
         self._refresh_distance_list()
 
@@ -1462,16 +1934,30 @@ class SpotPanel(QWidget):
         try:
             items = self._export_items()
             count = len(items)
-            rows: list[tuple[str, str, str]] = []
+            rows: list[tuple[str, str, str, str]] = []
             distances: list[float] = []
+            y1_values: list[float] = []
+            y2_values: list[float] = []
+            peak_mode = str(self.center_mode.currentData()) == "peak"
             for step, (index, _name, image) in enumerate(items):
                 self._set_progress(step, count, f"距離 {step + 1} / {count}")
                 spots, _origin = self._measure_image(image)
                 cells = self._distance_cells(index, spots)
                 rows.append(cells)
-                if cells[1] != "--":
-                    distances.append(float(cells[1]))
+                if cells[3] != "--":
+                    distances.append(float(cells[3]))
+                if peak_mode:
+                    if cells[1] != "--":
+                        y1_values.append(float(cells[1]))
+                    if cells[2] != "--":
+                        y2_values.append(float(cells[2]))
             self._distance_stats = self._compute_distance_stats(distances)
+            if peak_mode:
+                self._y1_stats = self._compute_distance_stats(y1_values)
+                self._y2_stats = self._compute_distance_stats(y2_values)
+            else:
+                self._y1_stats = None
+                self._y2_stats = None
             self.distance_table.blockSignals(True)
             self.distance_table.fill(rows)
             current = int(self.batch_index.value()) if self._batch_images else 0
@@ -1495,13 +1981,23 @@ class SpotPanel(QWidget):
             std = 0.0
         return mean, std, int(values.size)
 
-    def _distance_cells(self, index: int, spots: dict) -> tuple[str, str, str]:
+    def _distance_cells(self, index: int, spots: dict) -> tuple[str, str, str, str]:
         upper = spots.get("upper")
         lower = spots.get("lower")
+        y1 = "--" if upper is None else f"{float(upper[1]):.2f}"
+        y2 = "--" if lower is None else f"{float(lower[1]):.2f}"
         if upper is None or lower is None:
-            return str(index), "--", "--"
-        distance = float(np.hypot(float(lower[0]) - float(upper[0]), float(lower[1]) - float(upper[1])))
-        return str(index), f"{distance:.2f}", f"{distance * 3.45:.2f}"
+            return str(index), y1, y2, "--"
+        if str(self.center_mode.currentData()) == "peak":
+            distance = abs(float(lower[1]) - float(upper[1]))
+        else:
+            distance = float(
+                np.hypot(
+                    float(lower[0]) - float(upper[0]),
+                    float(lower[1]) - float(upper[1]),
+                )
+            )
+        return str(index), y1, y2, f"{distance:.2f}"
 
     def _shown_image(self, image: np.ndarray) -> np.ndarray:
         shown = apply_abs_then_color_scale(
@@ -1529,7 +2025,14 @@ class SpotPanel(QWidget):
             raise RuntimeError("熱圖沒有寫入。")
         path.write_bytes(encoded.tobytes())
 
-    def _spot_row(self, frame: int, name: str, spots: dict) -> list[str]:
+    def _spot_row(
+        self,
+        frame: int,
+        name: str,
+        spots: dict,
+        export_folder: str = "",
+        exposure_us: str = "",
+    ) -> list[str]:
         upper = spots.get("upper")
         lower = spots.get("lower")
         upper_x, upper_y = self._point_cells(upper)
@@ -1543,6 +2046,8 @@ class SpotPanel(QWidget):
         return [
             str(frame),
             name,
+            export_folder,
+            exposure_us,
             str(int(self.roi_w.value())),
             str(int(self.peak_dist.value())),
             str(int(self.peak_ratio.value())),
@@ -1644,7 +2149,8 @@ class SpotPanel(QWidget):
 
     @staticmethod
     def _write_table(path: Path, header: list[str], rows: list[list[str]]) -> None:
-        with path.open("w", newline="", encoding="utf-8") as handle:
+        # utf-8-sig so Excel keeps Chinese folder / spot names readable.
+        with path.open("w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.writer(handle)
             writer.writerow(header)
             writer.writerows(rows)
@@ -1685,30 +2191,76 @@ class SpotPanel(QWidget):
             )
         return self._format_px_um(dist)
 
+    def _stats_pair_text(
+        self,
+        stats: tuple[float, float, int] | None,
+    ) -> tuple[str, str]:
+        if stats is None:
+            return "—", "—"
+        mean, std, _count = stats
+        return self._format_px_um(mean), self._format_px_um(std)
+
     def _distance_stats_values(self) -> tuple[str, str, str]:
         stats = self._distance_stats
         if stats is None:
-            return "—", "—", ""
+            note = ""
+            if str(self.center_mode.currentData()) == "peak":
+                parts = []
+                if self._y1_stats is not None:
+                    parts.append(f"y1 {self._y1_stats[2]} 筆")
+                if self._y2_stats is not None:
+                    parts.append(f"y2 {self._y2_stats[2]} 筆")
+                if parts:
+                    note = "統計 " + "、".join(parts)
+            return "—", "—", note
         mean, std, count = stats
         note = f"統計 {count} 筆有效距離"
+        if str(self.center_mode.currentData()) == "peak":
+            extras = []
+            if self._y1_stats is not None:
+                extras.append(f"y1 {self._y1_stats[2]} 筆")
+            if self._y2_stats is not None:
+                extras.append(f"y2 {self._y2_stats[2]} 筆")
+            if extras:
+                note += "；" + "、".join(extras)
         return self._format_px_um(mean), self._format_px_um(std), note
 
     def _draw_threshold(self, _checked: bool | None = None) -> None:
         spots = self.spots or {}
-        mask = spots.get("mask")
-        if (
-            self.image is None
-            or mask is None
-            or not self.show_thresh.isChecked()
-            or not np.any(mask)
-        ):
+        upper_mask = spots.get("mask")
+        lower_mask = spots.get("lower_mask")
+        show_upper = bool(self.show_thresh.isChecked())
+        show_lower = bool(
+            self.show_lower_thresh.isChecked()
+            and self.show_lower_thresh.isVisible()
+            and str(self.center_mode.currentData()) != "peak"
+        )
+        if self.image is None:
             self.mask_item.clear()
             return
-        rgba = np.zeros((mask.shape[0], mask.shape[1], 4), dtype=np.uint8)
-        rgba[mask, 0] = 255
-        rgba[mask, 1] = 255
-        rgba[mask, 2] = 255
-        rgba[mask, 3] = 110
+        height, width = self.image.shape
+        rgba = np.zeros((height, width, 4), dtype=np.uint8)
+        drew = False
+        if show_upper and upper_mask is not None and np.any(upper_mask):
+            mask = np.asarray(upper_mask, dtype=bool)
+            if mask.shape == (height, width):
+                rgba[mask, 0] = 255
+                rgba[mask, 1] = 255
+                rgba[mask, 2] = 255
+                rgba[mask, 3] = 110
+                drew = True
+        if show_lower and lower_mask is not None and np.any(lower_mask):
+            mask = np.asarray(lower_mask, dtype=bool)
+            if mask.shape == (height, width):
+                # Cyan for lower blob so it stays distinct from upper white.
+                rgba[mask, 0] = 0
+                rgba[mask, 1] = 220
+                rgba[mask, 2] = 255
+                rgba[mask, 3] = 120
+                drew = True
+        if not drew:
+            self.mask_item.clear()
+            return
         self.mask_item.setImage(rgba.transpose(1, 0, 2), autoLevels=False)
 
     def _ensure_crosshair(self) -> tuple[int, int] | None:
@@ -1736,7 +2288,8 @@ class SpotPanel(QWidget):
         if self.image is None:
             return
         height, width = self.image.shape
-        positions = np.arange(height, dtype=float) + 0.5
+        # Y plot uses pixel-index coordinates (same numbers as 結果 / 距離表).
+        positions = np.arange(height, dtype=float)
         spots = self.spots or {}
         cross = self._ensure_crosshair()
         if cross is None:
@@ -1774,7 +2327,7 @@ class SpotPanel(QWidget):
         self.profile_values = shown
         self.raw_strip_sum = self._raw_strip(spots, height, self.image)
         self.curve_y.setData(shown, positions)
-        self.marker_y.setData([float(shown[cy])], [cy + 0.5])
+        self.marker_y.setData([float(shown[cy])], [float(cy)])
         self.plot_y.setLabel("bottom", self._strip_caption())
         self.plot_y.setTitle("Y 加總" if self._y_is_sum() else "Y 剖面")
         upper = spots.get("upper")
@@ -1782,19 +2335,198 @@ class SpotPanel(QWidget):
         if upper is None:
             self.marker_upper.setData([], [])
         else:
-            index = int(np.clip(round(upper[1]), 0, height - 1))
-            self.marker_upper.setData([float(shown[index])], [index + 0.5])
+            uy = float(upper[1])
+            self.marker_upper.setData(
+                [self._sample_profile_value(shown, uy)],
+                [uy],
+            )
         if lower is None:
             self.marker_lower.setData([], [])
         else:
-            index = int(np.clip(round(lower[1]), 0, height - 1))
-            self.marker_lower.setData([float(shown[index])], [index + 0.5])
-        if not self._manual_x:
+            ly = float(lower[1])
+            # Prefer refine-curve intensity so × sits on the blue peak when enabled.
+            lower_val = self._sample_profile_value(shown, ly)
+            meta = spots.get("savgol") if isinstance(spots, dict) else None
+            if (
+                self._refine_active()
+                and isinstance(meta, dict)
+                and meta.get("peak_value") is not None
+            ):
+                peak_linear = float(meta["peak_value"])
+                if self._abs_enabled():
+                    peak_linear = abs(peak_linear)
+                lower_val = float(self._display_values(np.asarray([peak_linear]))[0])
+            self.marker_lower.setData([lower_val], [ly])
+        valley_y = spots.get("valley_y")
+        if valley_y is None or not np.isfinite(float(valley_y)):
+            self.valley_line.hide()
+        else:
+            self.valley_line.setPos(float(valley_y))
+            self.valley_line.show()
+        self._draw_savgol_overlay(spots, height)
+        if not self._manual_x and not self._hold_profile_limits:
             self._fit_profile_intensity(self.plot_x, row, "y")
+        if not self._hold_profile_px_x:
             self.plot_x.setXRange(0, width, padding=0)
-        if not self._manual_profile:
+        if not self._manual_profile and not self._hold_profile_limits:
             self._fit_profile_intensity(self.plot_y, shown, "x")
+        if not self._hold_profile_px_y:
             self.plot_y.setYRange(0, height, padding=0)
+        self._hold_profile_limits = True
+
+    @staticmethod
+    def _sample_profile_value(values: np.ndarray, y: float) -> float:
+        """Linear interpolate a vertical profile at continuous row ``y``."""
+        data = np.asarray(values, dtype=np.float64)
+        n = int(data.size)
+        if n < 1 or not np.isfinite(float(y)):
+            return 0.0
+        if n == 1:
+            value = float(data[0])
+            return 0.0 if not np.isfinite(value) else value
+        y = float(np.clip(y, 0.0, float(n - 1)))
+        lo = int(np.floor(y))
+        hi = min(lo + 1, n - 1)
+        t = y - float(lo)
+        v0 = float(data[lo])
+        v1 = float(data[hi])
+        if not np.isfinite(v0):
+            v0 = 0.0
+        if not np.isfinite(v1):
+            v1 = 0.0
+        return v0 * (1.0 - t) + v1 * t
+
+    def _draw_savgol_overlay(self, spots: dict, height: int) -> None:
+        """Show refine window band + dense sub-pixel curve / peak on Y-sum."""
+        meta = spots.get("savgol") if isinstance(spots, dict) else None
+        show = (
+            str(self.center_mode.currentData()) == "peak"
+            and self._y_is_sum()
+            and self._refine_active()
+            and isinstance(meta, dict)
+            and meta.get("smooth") is not None
+        )
+        if not show:
+            self.curve_sg.setData([], [])
+            self.marker_sg.setData([], [])
+            self.sg_region.hide()
+            return
+        lo = int(meta.get("lo", -1))
+        hi = int(meta.get("hi", -1))
+        smooth = np.asarray(meta.get("smooth"), dtype=np.float64)
+        if lo < 0 or hi < lo or smooth.size < 1:
+            self.curve_sg.setData([], [])
+            self.marker_sg.setData([], [])
+            self.sg_region.hide()
+            return
+        lo = int(np.clip(lo, 0, height - 1))
+        hi = int(np.clip(hi, 0, height - 1))
+        count = min(int(smooth.size), hi - lo + 1)
+        if count < 1:
+            self.curve_sg.setData([], [])
+            self.marker_sg.setData([], [])
+            self.sg_region.hide()
+            return
+        linear = np.asarray(smooth[:count], dtype=np.float64)
+        coeff = meta.get("poly_coeff")
+        fine_idx, fine_linear = self._dense_refine_samples(
+            linear,
+            coeff,
+            x_mid=meta.get("poly_x_mid"),
+            x_scale=meta.get("poly_x_scale"),
+        )
+        if self._abs_enabled():
+            fine_linear = np.abs(fine_linear)
+        fine_val = self._display_values(fine_linear)
+        # Same index coordinates as 結果 Y（例如 317.75），不要 +0.5。
+        fine_y = fine_idx + float(lo)
+        lower = spots.get("lower") if isinstance(spots, dict) else None
+        if lower is not None and np.isfinite(float(lower[1])):
+            peak_y = float(lower[1])
+            local = peak_y - float(lo)
+            if -0.5 <= local <= float(count - 1) + 0.5:
+                local_c = float(np.clip(local, 0.0, float(count - 1)))
+                peak_linear = self._refine_peak_intensity(meta, linear, coeff, local_c)
+                if self._abs_enabled():
+                    peak_linear = abs(peak_linear)
+                peak_val = float(self._display_values(np.asarray([peak_linear], dtype=float))[0])
+                # Keep the polyline on the smooth dense curve (no artificial spike).
+                if fine_idx.size:
+                    nearest = int(np.argmin(np.abs(fine_idx - local_c)))
+                    fine_idx[nearest] = local_c
+                    fine_val[nearest] = peak_val
+                    fine_y[nearest] = peak_y
+                    order = np.argsort(fine_idx)
+                    fine_val = fine_val[order]
+                    fine_y = fine_y[order]
+                self.marker_sg.setData([peak_val], [peak_y])
+            else:
+                self.marker_sg.setData([], [])
+        else:
+            self.marker_sg.setData([], [])
+        self.curve_sg.setData(fine_val, fine_y)
+        self.sg_region.setRegion((float(lo) - 0.5, float(hi) + 0.5))
+        self.sg_region.show()
+
+    @staticmethod
+    def _dense_refine_samples(
+        linear: np.ndarray,
+        coeff,
+        *,
+        x_mid: float | None = None,
+        x_scale: float | None = None,
+        step: float = 0.01,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build a sub-pixel dense curve from integer refine samples or poly coeffs."""
+        values = np.asarray(linear, dtype=np.float64)
+        count = int(values.size)
+        idx = np.arange(count, dtype=float)
+        if count < 1:
+            return np.zeros(0, dtype=float), np.zeros(0, dtype=float)
+        if count == 1:
+            return idx.copy(), values.copy()
+        fine_idx = np.arange(0.0, float(count - 1) + 0.5 * step, step)
+        fine_idx = fine_idx[fine_idx <= float(count - 1) + 1e-12]
+        if coeff is not None and len(coeff) >= 2:
+            mid = 0.0 if x_mid is None else float(x_mid)
+            scale = 1.0 if x_scale is None or float(x_scale) == 0.0 else float(x_scale)
+            xn = (fine_idx - mid) / scale
+            fine = np.asarray(np.polyval(np.asarray(coeff, dtype=float), xn), dtype=np.float64)
+            return fine_idx, fine
+        if count >= 4:
+            try:
+                from scipy.interpolate import CubicSpline
+
+                spline = CubicSpline(idx, values, bc_type="natural")
+                return fine_idx, np.asarray(spline(fine_idx), dtype=np.float64)
+            except Exception:
+                pass
+        return fine_idx, np.interp(fine_idx, idx, values).astype(np.float64)
+
+    @staticmethod
+    def _refine_peak_intensity(meta: dict, linear: np.ndarray, coeff, local_c: float) -> float:
+        if meta.get("peak_value") is not None:
+            return float(meta["peak_value"])
+        if coeff is not None and len(coeff) >= 2:
+            mid = meta.get("poly_x_mid")
+            scale = meta.get("poly_x_scale")
+            mid_f = 0.0 if mid is None else float(mid)
+            scale_f = 1.0 if scale is None or float(scale) == 0.0 else float(scale)
+            xn = (float(local_c) - mid_f) / scale_f
+            return float(np.polyval(np.asarray(coeff, dtype=float), xn))
+        values = np.asarray(linear, dtype=np.float64)
+        count = int(values.size)
+        if count < 1:
+            return 0.0
+        if count >= 4:
+            try:
+                from scipy.interpolate import CubicSpline
+
+                spline = CubicSpline(np.arange(count, dtype=float), values, bc_type="natural")
+                return float(spline(float(local_c)))
+            except Exception:
+                pass
+        return float(np.interp(float(local_c), np.arange(count, dtype=float), values))
 
     def _fit_profile_intensity(self, plot, values: np.ndarray, axis: str) -> None:
         finite = values[np.isfinite(values)]
@@ -1844,12 +2576,14 @@ class SpotPanel(QWidget):
                 lo = hi - span
             else:
                 hi = lo + span
+        self._hold_color_levels = True
         self._set_color_levels(lo, hi)
 
     def _on_hist_levels_changed(self, *_args) -> None:
         if self._color_updating:
             return
         lo, hi = self.hist.getLevels()
+        self._hold_color_levels = True
         self._color_updating = True
         try:
             self.color_min.blockSignals(True)
@@ -2010,21 +2744,24 @@ class SpotPanel(QWidget):
                 height, width = self.image.shape
                 if 0 <= x < width and 0 <= y < height:
                     self.cross_xy = (x, y)
-                    self._manual_profile = False
-                    self._manual_x = False
                     self._draw_profile()
             return
         if self.plot_y.sceneBoundingRect().contains(pos):
             self._manual_profile = False
+            self._hold_profile_limits = False
+            self._hold_profile_px_y = False
             self._draw_profile()
             return
         if self.plot_x.sceneBoundingRect().contains(pos):
             self._manual_x = False
+            self._hold_profile_limits = False
+            self._hold_profile_px_x = False
             self._draw_profile()
             return
         if self.hist.sceneBoundingRect().contains(pos):
             shown = self._display_values(self._view_image())
             self._set_color_levels(*self._level_span(shown))
+            self._hold_color_levels = True
             return
         if self.plot.sceneBoundingRect().contains(pos):
             height, width = self.image.shape
@@ -2089,6 +2826,7 @@ class SpotPanel(QWidget):
             hi = float(value)
         if lo >= hi:
             return
+        self._hold_profile_limits = True
         if which == "x":
             self._manual_x = True
             plot.setYRange(lo, hi, padding=0)
@@ -2113,11 +2851,11 @@ class SpotWindow(QMainWindow):
         layout.addWidget(self.panel)
         self.setCentralWidget(root)
 
-    def set_source_folder(self, root: Path | None) -> None:
-        self.panel.set_source_folder(root)
+    def set_source_folder(self, root: Path | None, *, spot_key: str | None = None) -> None:
+        self.panel.set_source_folder(root, spot_key=spot_key)
 
-    def set_image(self, image: np.ndarray) -> None:
-        self.panel.set_image(image)
+    def set_image(self, image: np.ndarray, *, file_label: str = "") -> None:
+        self.panel.set_image(image, file_label=file_label)
 
     def set_batch(self, images: list[np.ndarray], labels: list[str]) -> None:
         self.panel.set_batch(images, labels)
